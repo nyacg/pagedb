@@ -45,11 +45,19 @@ export class BuilderBox extends DurableObject<Env> {
     return { started: true, base };
   }
 
+  /** The outbound route belongs to the object instance: after any reset (e.g. a deploy) the
+   *  running container's uploads have nowhere to go until it's registered again. */
+  async reattach() {
+    const c = this.ctx.container;
+    if (!c?.running) return { running: false };
+    await c.interceptOutboundHttp("r2.internal", (this.ctx.exports as any).R2Put({ props: {} }));
+    this.ctx.waitUntil(c.monitor().catch(() => {}));
+    await this.ctx.storage.setAlarm(Date.now() + 5_000);
+    return { running: true, reattached: true };
+  }
+
   async alarm() {
-    if (this.ctx.container?.running) {
-      this.ctx.waitUntil(this.ctx.container.monitor().catch(() => {}));
-      await this.ctx.storage.setAlarm(Date.now() + 5_000);
-    }
+    await this.reattach();
   }
 
   async stop() {
@@ -59,6 +67,14 @@ export class BuilderBox extends DurableObject<Env> {
 
   async info() {
     return { running: !!this.ctx.container?.running, base: this.ctx.storage.kv.get("base") };
+  }
+
+  async logs() {
+    // Tail of the build log, read through the container's own exec.
+    const c = this.ctx.container as any;
+    if (!c?.running || typeof c.exec !== "function") return { error: "not running or no exec" };
+    const r = await c.exec(["sh", "-c", "tail -5 /data/build.log; ls /data/out/parts | wc -l; df -h /data | tail -1"]);
+    return { out: typeof r?.stdout === "string" ? r.stdout : JSON.stringify(r) };
   }
 }
 
@@ -74,6 +90,19 @@ export default {
       const s = await env.BUCKET.get(`db/${db}/build-status.json`);
       return Response.json({ box: await box.info(), status: s ? await s.json() : null });
     }
+    if (url.pathname === "/count") {
+      // Parts that have actually landed in R2 for a base (and their total size).
+      const prefix = `db/${db}/base/${url.searchParams.get("base")}/`;
+      let n = 0, bytes = 0, cursor: string | undefined, last = "";
+      do {
+        const page = await env.BUCKET.list({ prefix, cursor });
+        for (const o of page.objects) (n++, (bytes += o.size), (last = o.key));
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return Response.json({ parts: n, gb: +(bytes / 1e9).toFixed(2), last });
+    }
+    if (url.pathname === "/reattach" && req.method === "POST") return Response.json(await box.reattach().catch((e) => ({ error: String(e?.message ?? e) })));
+    if (url.pathname === "/logs") return Response.json(await box.logs().catch((e) => ({ error: String(e?.message ?? e) })));
     if (url.pathname === "/stop" && req.method === "POST") return Response.json(await box.stop());
     if (url.pathname === "/promote" && req.method === "POST") {
       const base = url.searchParams.get("base");
