@@ -23,7 +23,7 @@ async function ssr(req: Request, env: Env, url: URL): Promise<Response> {
   let html = await page.text();
   const project = /^p\d{4}$/.test(url.searchParams.get("project") ?? "") ? url.searchParams.get("project")! : "p0003";
   const view = url.searchParams.get("view") ?? "list";
-  let boot: Record<string, unknown> = { project, db: DEMO_DB, obj: DEMO_OBJ };
+  let boot: Record<string, unknown> = { project, db: DEMO_DB, obj: DEMO_OBJ, build: env.CF_VERSION_METADATA?.id };
   if (view === "list" && !url.searchParams.get("q")) {
     const t0 = Date.now();
     try {

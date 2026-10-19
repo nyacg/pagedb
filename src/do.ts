@@ -19,6 +19,8 @@ export interface Env {
   ASSETS: Fetcher;
   /** Signs and verifies leases (signed queries): see src/lease.ts. */
   LEASE_SECRET?: string;
+  /** This deploy's version (the Worker passes its id to sockets, so stale pages can reload). */
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** RAM tier size in 64 KiB pages (default 512 = 32 MiB, the DO budget). */
   RAM_PAGES?: string;
   /** In a container: R2 through a Worker's public route (with a bearer token). */
@@ -130,6 +132,19 @@ export class DbObject extends DurableObject<Env> {
     // Live subscriptions, so they survive hibernation: (socket id, client query id) → AST.
     this.sql.exec("CREATE TABLE IF NOT EXISTS subs (cid TEXT NOT NULL, id TEXT NOT NULL, q TEXT NOT NULL, PRIMARY KEY (cid, id))");
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
+    // Sockets survive deploys (hibernation), so a page can keep running a client older than this
+    // code. Tell those pages which build is current; they reload.
+    const build = env.CF_VERSION_METADATA?.id;
+    if (build) {
+      for (const ws of ctx.getWebSockets()) {
+        const a = ws.deserializeAttachment() as { cid: string; admin?: boolean; build?: string };
+        if (a.build === build) continue;
+        ws.serializeAttachment({ ...a, build });
+        try {
+          ws.send(JSON.stringify({ t: "hello", build }));
+        } catch {}
+      }
+    }
   }
 
   /** Start the engine (once per object lifetime); returns how long that took if it started. */
@@ -359,9 +374,10 @@ export class DbObject extends DurableObject<Env> {
     this.ctx.acceptWebSocket(server);
     // Set by the Worker only (it strips this header from client requests): an admin socket may
     // subscribe raw ASTs (benchmarks); everyone else must present leases.
-    server.serializeAttachment({ cid, admin: req.headers.get("x-pagedb-admin") === "1" });
+    const build = this.env.CF_VERSION_METADATA?.id;
+    server.serializeAttachment({ cid, admin: req.headers.get("x-pagedb-admin") === "1", build });
     await this.ensure(db);
-    server.send(JSON.stringify({ t: "hello", version: this.engine!.overlayStats().version }));
+    server.send(JSON.stringify({ t: "hello", version: this.engine!.overlayStats().version, build }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -582,7 +598,7 @@ export class DbObject extends DurableObject<Env> {
   async info() {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
-    return { db: this.db, base: this.base, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length };
+    return { db: this.db, base: this.base, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
   }
 }
 

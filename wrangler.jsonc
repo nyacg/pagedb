@@ -10,6 +10,7 @@
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
   "triggers": { "crons": ["0 9 * * *"] },
   // The public demo: the 100 GB base, one long-lived object (its city cache and SQLite stay warm).
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g" },
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }]
 }

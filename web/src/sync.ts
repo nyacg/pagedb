@@ -84,6 +84,12 @@ export class Sync {
   lastWrite?: { name: string; ms: number; serverMs: number };
 
   private leases = new Map<string, Lease>();
+  private leasing = new Map<string, Promise<void>>();
+  /** Subscriptions already re-leased once after a refusal (a lease can expire in flight). */
+  private retried = new Set<string>();
+  /** Called when the server runs a newer deploy than the one this page was loaded from. */
+  onStale?: () => void;
+  build?: string;
 
   constructor(private url: string, seed: Lease[] = []) {
     for (const l of seed) if (l.token) this.leases.set(l.key, l);
@@ -142,16 +148,21 @@ export class Sync {
       const l = this.leases.get(k);
       return l?.token && (l.exp ?? 0) - Date.now() > 5000;
     };
-    const missing = [...new Map(list.filter((x) => !fresh(x.key)).map((x) => [x.key, x.ref])).values()];
-    if (missing.length) {
-      try {
-        const res = await fetch("/api/lease", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ list: missing }) });
-        const body = (await res.json()) as { leases?: Lease[] };
-        for (const l of body.leases ?? []) this.leases.set(l.key, l);
-      } catch (e) {
-        console.warn("lease request failed", e);
-      }
+    // One request for every lease not already fresh or on its way; then wait for all of them.
+    const missing = new Map(list.filter((x) => !fresh(x.key) && !this.leasing.has(x.key)).map((x) => [x.key, x.ref]));
+    if (missing.size) {
+      const req = fetch("/api/lease", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ list: [...missing.values()] }) })
+        .then((res) => res.json() as Promise<{ leases?: Lease[] }>)
+        .then((body) => {
+          for (const l of body.leases ?? []) this.leases.set(l.key, l);
+        })
+        .catch((e) => console.warn("lease request failed", e))
+        .finally(() => {
+          for (const k of missing.keys()) this.leasing.delete(k);
+        });
+      for (const k of missing.keys()) this.leasing.set(k, req);
     }
+    await Promise.all(new Set(list.map((x) => this.leasing.get(x.key)).filter(Boolean)));
     const ready = list.filter((x) => this.subs.get(x.id) === x && this.leases.get(x.key)?.token);
     for (const x of list) {
       const l = this.leases.get(x.key);
@@ -198,7 +209,10 @@ export class Sync {
   }
 
   private onMessage(m: any) {
-    if (m.t === "hello") this.version = Math.max(this.version, m.version ?? 0);
+    if (m.t === "hello") {
+      this.version = Math.max(this.version, m.version ?? 0);
+      if (this.build && m.build && m.build !== this.build) this.onStale?.();
+    }
     if (m.t === "reset") {
       // The demo was reset to its base: start every subscription over.
       this.version = m.version;
@@ -214,6 +228,7 @@ export class Sync {
       s.ready = true;
       s.stats = m.stats;
       s.firstMs = performance.now() - s.sentAt;
+      this.retried.delete(s.key);
       this.version = Math.max(this.version, m.version ?? 0);
     }
     if (m.t === "snaps") {
@@ -234,7 +249,15 @@ export class Sync {
       this.version = Math.max(this.version, m.version);
       this.gc();
     }
-    if (m.t === "error") console.warn("query error", m.id, m.message);
+    if (m.t === "error") {
+      const s = this.subs.get(m.id);
+      if (s && /lease|expired|signature/.test(m.message ?? "") && !this.retried.has(s.key)) {
+        // Refused lease (expired in flight, or the signing key rotated): get a new one, once.
+        this.retried.add(s.key);
+        this.leases.delete(s.key);
+        this.send(s);
+      } else console.warn("query error", m.id, m.message);
+    }
     this.emit();
   }
 

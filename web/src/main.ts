@@ -3,7 +3,7 @@ import { Sync, type Row } from "./sync";
 
 declare global {
   interface Window {
-    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any; leases?: any[] };
+    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any; leases?: any[]; build?: string };
   }
 }
 
@@ -56,6 +56,18 @@ if (!me || !/^u\d{5}$/.test(me)) {
   localStorage.setItem("pagedb.user", me);
 }
 const sync = new Sync(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/socket`, boot.leases ?? []);
+// After a deploy, an open page may be running a client the server no longer speaks to (it would
+// look live but get nothing). Reload it, once nothing is in flight and nobody is typing.
+sync.build = boot.build;
+sync.onStale = () => {
+  // (At most once a minute, so two versions serving side by side can't cause a reload loop.)
+  if (Date.now() - Number(sessionStorage.getItem("pagedb-reloaded") ?? 0) < 60_000) return;
+  const tryReload = () => {
+    if (!sync.pendingOps().length && !document.activeElement?.matches("input, textarea, select")) (sessionStorage.setItem("pagedb-reloaded", String(Date.now())), location.reload());
+    else setTimeout(tryReload, 2000);
+  };
+  tryReload();
+};
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const initials = (n?: string) => (n ?? "?").split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
@@ -321,22 +333,56 @@ function filtersView() {
   </div>`;
 }
 
+/** Only touch a region whose markup changed: rebuilding it would replace inputs mid-typing. */
+const shown = new Map<string, string>();
+function put(sel: string, html: string) {
+  if (shown.get(sel) === html) return;
+  shown.set(sel, html);
+  $(sel).innerHTML = html;
+}
+
+/** A selector that finds "the same" field after its region is rebuilt. */
+function fieldKey(el: Element): string | null {
+  const tag = el.tagName.toLowerCase();
+  const own = [...el.attributes].find((a) => a.name.startsWith("data-"));
+  if (own) return `${tag}[${own.name}="${CSS.escape(own.value)}"]`;
+  const form = el.closest("form");
+  const fa = form && [...form.attributes].find((a) => a.name.startsWith("data-"));
+  const name = (el as HTMLInputElement).name;
+  return fa ? `form[${fa.name}="${CSS.escape(fa.value)}"] ${tag}${name ? `[name="${CSS.escape(name)}"]` : ""}` : null;
+}
+
 function render() {
+  // If a live update rebuilds the field being typed in, carry over its text, focus and caret.
+  const active = document.activeElement as HTMLInputElement | null;
+  const typing = active?.matches("input, textarea") ? { el: active, key: fieldKey(active), value: active.value, a: active.selectionStart, b: active.selectionEnd } : null;
+  renderRegions();
+  if (typing?.key && !typing.el.isConnected) {
+    const el = document.querySelector(typing.key) as HTMLInputElement | null;
+    if (el) {
+      el.value = typing.value;
+      el.focus();
+      if (typing.a !== null) el.setSelectionRange(typing.a, typing.b);
+    }
+  }
+}
+
+function renderRegions() {
   const project = sync.view("project")[0];
   const meRow = sync.view("me")[0];
   const count = sync.count("count", (p) => (p.insert?.projectId === state.project ? 1 : 0) - (p.remove ? 1 : 0));
-  $("#side-project").innerHTML = `<span class="pk">${esc(project?.key ?? "…")}</span> ${esc(project?.name ?? state.project)} <span class="caret">▾</span>`;
-  $("#me").innerHTML = `${avatar(meRow)} <span>${esc(meRow?.name ?? me)}</span>`;
+  put("#side-project", `<span class="pk">${esc(project?.key ?? "…")}</span> ${esc(project?.name ?? state.project)} <span class="caret">▾</span>`);
+  put("#me", `${avatar(meRow)} <span>${esc(meRow?.name ?? me)}</span>`);
   for (const v of ["list", "board", "activity"]) $(`[data-view="${v}"]`).classList.toggle("on", state.view === v);
-  $("#head").innerHTML = `<h1>${state.view === "activity" ? "Activity" : esc(project?.name ?? "Issues")}</h1>
+  put("#head", `<h1>${state.view === "activity" ? "Activity" : esc(project?.name ?? "Issues")}</h1>
     <span class="count">${state.view === "activity" ? "across every project" : count !== undefined ? `${count.toLocaleString()} issues` : ""}</span>
-    <span class="grow"></span>${state.view !== "activity" ? `<button class="primary" data-new>New issue</button>` : ""}`;
-  $("#filters").innerHTML = state.view === "activity" ? "" : filtersView();
-  $("#view").innerHTML = state.view === "list" ? listView() : state.view === "board" ? boardView() : activityView();
-  $("#detail").innerHTML = detailView();
-  $("#pop").innerHTML = popoverView();
-  $("#hud").innerHTML = hudView();
-  $("#create").innerHTML = state.creating ? createView() : "";
+    <span class="grow"></span>${state.view !== "activity" ? `<button class="primary" data-new>New issue</button>` : ""}`);
+  put("#filters", state.view === "activity" ? "" : filtersView());
+  put("#view", state.view === "list" ? listView() : state.view === "board" ? boardView() : activityView());
+  put("#detail", detailView());
+  put("#pop", popoverView());
+  put("#hud", hudView());
+  put("#create", state.creating ? createView() : "");
   const ps = document.querySelector("[data-popsearch]") as HTMLInputElement | null;
   if (ps && document.activeElement !== ps) {
     ps.focus();
@@ -588,7 +634,7 @@ $("#view").addEventListener("scroll", () => {
   if (state.view !== "list") return;
   const v = $("#view");
   if (v.scrollTop + v.clientHeight > v.scrollHeight - 1200) loadMore();
-  requestAnimationFrame(() => ($("#view").innerHTML = listView()));
+  requestAnimationFrame(() => put("#view", listView()));
 });
 
 // For tests and the curious: the loaded list as data.
