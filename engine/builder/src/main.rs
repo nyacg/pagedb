@@ -87,6 +87,18 @@ fn build_tree(sink: &mut PartSink, tree: u16, entries: &mut dyn FnMut(&mut dyn F
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("oracle") {
+        // Expected results for a project, straight from the generator (spot-checks a deployed base).
+        let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+        let mut cfg = Config::with_projects(arg("--projects").unwrap().parse().unwrap());
+        cfg.comments_per_issue = arg("--comments").map(|v| v.parse().unwrap()).unwrap_or(5.0);
+        let p: u32 = arg("--project").unwrap().parse().unwrap();
+        let n = gen::issue_count(&cfg, p);
+        let newest: Vec<String> = (0..5).map(|k| gen::issue_id(p, n - 1 - k)).collect();
+        let first = gen::issue(&cfg, p, n - 1);
+        println!(r#"{{"count":{n},"newest":{:?},"title":{:?},"comments":{}}}"#, newest, first.row[pagedb_core::catalog::issue::TITLE].as_str().unwrap(), first.comments);
+        return;
+    }
     if args.get(1).map(String::as_str) != Some("build") {
         eprintln!("usage: pagedb-builder build --projects N [--issues 10000] [--comments 5.0] [--feed 500000] --out DIR");
         std::process::exit(2);

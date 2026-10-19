@@ -11,7 +11,7 @@ It's our take on [r2db](https://demo.r2db.dev), rebuilt from its public behaviou
 with benchmarks against it. The engine is Rust: WebAssembly inside the Durable Object, and native
 for the dataset builder. The Durable Object shell, sync protocol and UI are TypeScript.
 
-- Demo (Linear-style tracker): https://pagedb.do-pool-lab.workers.dev
+- Demo (Linear-style tracker on the 100 GB base): https://pagedb.do-pool-lab.workers.dev
 - How it works: https://pagedb.do-pool-lab.workers.dev/how
 - The same object in a container: https://pagedb-node.do-pool-lab.workers.dev/api/…
 
@@ -27,6 +27,7 @@ for the dataset builder. The Durable Object shell, sync protocol and UI are Type
 | First live result over the socket (same laptop) | 114–223 ms | 371–1,015 ms |
 | Your own edit | instant (optimistic UI) | after the server round trip |
 | Fan-out, 1,000 sockets, 5 writes/s (laptop ↔ Cloudflare) | p50 255 ms, p99 684 ms; **container: 128 / 296 ms** | — |
+| 100 GB base (27.1 M issues), every demo query | 1 fault round; warm 35–49 ms; results match the generator | — |
 | Builder | 96 GB, 27.1 M issues, 1.47 M pages in 28 min on one Cloudflare vCPU | offline |
 
 Details: `bench/results/*.md`.

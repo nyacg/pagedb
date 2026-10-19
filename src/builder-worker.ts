@@ -114,6 +114,21 @@ export default {
       } while (cursor);
       return Response.json({ parts: n, gb: +(bytes / 1e9).toFixed(2), last });
     }
+    if (url.pathname === "/delete-base" && req.method === "POST") {
+      // Remove an abandoned base's parts. Refuses the base the live manifest points at.
+      const base = url.searchParams.get("base") ?? "";
+      if (!/^b[a-z0-9]+$/.test(base)) return new Response("bad base", { status: 400 });
+      const live = await env.BUCKET.get(`db/${db}/manifest.json`);
+      if (live && (JSON.parse(await live.text()) as { base?: string }).base === base) return new Response("that base is live", { status: 409 });
+      let deleted = 0, cursor: string | undefined;
+      do {
+        const page = await env.BUCKET.list({ prefix: `db/${db}/base/${base}/`, cursor, limit: 1000 });
+        if (page.objects.length) await env.BUCKET.delete(page.objects.map((o) => o.key));
+        deleted += page.objects.length;
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return Response.json({ deleted });
+    }
     if (url.pathname === "/reattach" && req.method === "POST") return Response.json(await box.reattach().catch((e) => ({ error: String(e?.message ?? e) })));
     if (url.pathname === "/logs") return Response.json(await box.logs().catch((e) => ({ error: String(e?.message ?? e) })));
     if (url.pathname === "/stop" && req.method === "POST") return Response.json(await box.stop());

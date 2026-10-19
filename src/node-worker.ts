@@ -39,8 +39,11 @@ export class R2Bridge extends WorkerEntrypoint<Env> {
   }
 }
 
+const IDLE_MS = 10 * 60_000;
+
 export class PageNode extends DurableObject<Env> {
   private ready?: Promise<void>;
+  private lastRequest = Date.now();
 
   private async ensure() {
     const c = this.ctx.container!;
@@ -74,15 +77,23 @@ export class PageNode extends DurableObject<Env> {
     return this.ready;
   }
 
+  /** Keep the container alive while it's used; stop it after IDLE_MS without requests
+   *  (open WebSockets count as use). */
   async alarm() {
-    if (this.ctx.container?.running) {
-      await this.ensure();
-      await this.ctx.storage.setAlarm(Date.now() + 10_000);
+    const c = this.ctx.container;
+    if (!c?.running) return;
+    if (Date.now() - this.lastRequest > IDLE_MS && this.ctx.getWebSockets().length === 0) {
+      c.destroy();
+      this.ready = undefined;
+      return;
     }
+    await this.ensure();
+    await this.ctx.storage.setAlarm(Date.now() + 10_000);
   }
 
   override async fetch(req: Request): Promise<Response> {
     const t0 = Date.now();
+    this.lastRequest = t0;
     await this.ensure();
     const res = await this.ctx.container!.getTcpPort(PORT).fetch(req.url.replace("https:", "http:"), req);
     if (res.webSocket) return res;

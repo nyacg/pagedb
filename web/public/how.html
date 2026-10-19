@@ -59,7 +59,7 @@
   <tr><td>Your own edit visible</td><td class="n win">instant (optimistic)</td><td class="n">after the server round trip</td></tr>
   <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
 </table>
-<p style="font-size:13px">r2db numbers are from their published source comments and our measurements of their public demo. Larger bases (10 GB, 100 GB) are being built; the read path doesn't change with size (one leaf round), only how often a page is already cached.</p>
+<p style="font-size:13px">r2db numbers are from their published source comments and our measurements of their public demo. The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
 
 <h2>5 · The same object in a container</h2>
 <p>The database object is ordinary Durable Object code, so it also runs inside <b>workerd in a Cloudflare Container</b> (4 vCPU, 12 GiB). There it gets a 6 GiB page tier instead of 32 MiB and a dedicated CPU. Measured on the 10 GB base: warm queries are the same (~45 ms from a laptop), and fan-out to 1,000 sockets is about twice as fast (write → every tab: p50 <b>128 ms</b> vs 255 ms; p99 296 ms vs 684 ms). The trade-offs: a container takes at most 4,096 connections, its cold start takes seconds, and it reaches R2 through a bridge.</p>
