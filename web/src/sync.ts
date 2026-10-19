@@ -139,6 +139,12 @@ export class Sync {
 
   private onMessage(m: any) {
     if (m.t === "hello") this.version = Math.max(this.version, m.version ?? 0);
+    if (m.t === "reset") {
+      // The demo was reset to its base: start every subscription over.
+      this.version = m.version;
+      this.pending = [];
+      for (const s of this.subs.values()) this.send(s);
+    }
     if (m.t === "snap") {
       const s = this.subs.get(m.id);
       if (!s) return;

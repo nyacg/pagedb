@@ -13,9 +13,57 @@ import { decodeRecords, encodeRecords, type OvRecord } from "./overlay-codec";
 
 export interface Env {
   DB: DurableObjectNamespace<DbObject>;
-  BUCKET: R2Bucket;
+  /** R2 on Cloudflare; inside a container (workerd) a fetcher to the R2 bridge instead. */
+  BUCKET: R2Bucket | Fetcher;
   ASSETS: Fetcher;
+  /** RAM tier size in 64 KiB pages (default 512 = 32 MiB, the DO budget). */
+  RAM_PAGES?: string;
+  /** In a container: R2 through a Worker's public route (with a bearer token). */
+  R2_URL?: string;
+  R2_TOKEN?: string;
+  /** Set in the container's workerd config: BUCKET is the R2 bridge, not an R2 binding. */
+  R2_BRIDGE?: string;
+  /** Concurrent page fetches (6 in a DO; fewer in a container, see node-worker.ts). */
+  FETCH_CONCURRENCY?: string;
   ADMIN_TOKEN?: string;
+}
+
+/** The slice of R2 we use, over a real binding or (in a container) the R2 bridge. */
+interface Blob {
+  get(key: string, opts?: { range?: { offset: number; length: number } }): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; text(): Promise<string> } | null>;
+}
+function blobStore(b: R2Bucket | Fetcher, bridge?: string, viaUrl?: string, token?: string): Blob {
+  // The container says so explicitly (R2_BRIDGE): feature detection can't tell, because a
+  // workerd service binding answers *any* property with a JS-RPC stub.
+  if (!bridge) return b as R2Bucket;
+  return {
+    async get(key, opts) {
+      const q = new URLSearchParams({ key });
+      if (opts?.range) (q.set("offset", String(opts.range.offset)), q.set("length", String(opts.range.length)));
+      // Global fetch (the worker's globalOutbound): from a Durable Object inside workerd, a
+      // fetch through the network-service binding never reaches the container's intercept.
+      const res = viaUrl ? await fetch(`${viaUrl}?${q}`, { headers: { authorization: `Bearer ${token}` } }) : await fetch(`http://r2.internal/get?${q}`);
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error(`r2 bridge: ${res.status}`);
+      return res;
+    },
+  };
+}
+
+/** Cloudflare's Cache API, or nothing (workerd opens a cache but throws on use). Probed once. */
+let cacheProbe: Promise<Cache | null> | undefined;
+function openCache(): Promise<Cache | null> {
+  cacheProbe ??= (async () => {
+    try {
+      if (typeof caches === "undefined") return null;
+      const c = await caches.open("pagedb");
+      await c.match("https://pagedb.cache/probe");
+      return c;
+    } catch {
+      return null;
+    }
+  })();
+  return cacheProbe;
 }
 
 const PAGES_PER_PART = 64;
@@ -44,8 +92,9 @@ export interface QueryStats {
 class Gate {
   private active = 0;
   private queue: (() => void)[] = [];
+  constructor(private limit = CONCURRENCY) {}
   async run<T>(f: () => Promise<T>): Promise<T> {
-    if (this.active >= CONCURRENCY) await new Promise<void>((r) => this.queue.push(r));
+    if (this.active >= this.limit) await new Promise<void>((r) => this.queue.push(r));
     this.active++;
     try {
       return await f();
@@ -58,7 +107,7 @@ class Gate {
 
 export class DbObject extends DurableObject<Env> {
   private sql: SqlStorage;
-  private gate = new Gate();
+  private gate: Gate;
   /** Chunks being fetched right now: concurrent faults on the same chunk share one GET. */
   private inflight = new Map<number, Promise<ArrayBuffer>>();
   private live: Live = { subs: new Map(), pidOf: new Map() };
@@ -70,6 +119,7 @@ export class DbObject extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.gate = new Gate(Number(env.FETCH_CONCURRENCY ?? CONCURRENCY));
     this.sql = ctx.storage.sql;
     this.sql.exec("CREATE TABLE IF NOT EXISTS pages (id INTEGER PRIMARY KEY, data BLOB NOT NULL)");
     // Writes since the base: durable here on acknowledgement (like any DO write).
@@ -86,12 +136,12 @@ export class DbObject extends DurableObject<Env> {
     let manifest = this.ctx.storage.kv.get<string>(`manifest:${db}`);
     if (!manifest) {
       // The manifest is the one mutable object; the colo cache holds it briefly.
-      const cache = await caches.open("pagedb");
+      const cache = await openCache();
       const url = `https://pagedb.cache/db/${db}/manifest.json${this.salt ? `?s=${this.salt}` : ""}`;
-      const hit = await cache.match(url);
+      const hit = await cache?.match(url);
       if (hit) manifest = await hit.text();
       else {
-        const obj = await this.env.BUCKET.get(`db/${db}/manifest.json`);
+        const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(`db/${db}/manifest.json`);
         if (!obj) throw new Error(`no database ${db}`);
         manifest = await obj.text();
         this.cachePuts.push([url, new TextEncoder().encode(manifest).buffer as ArrayBuffer, 60]);
@@ -107,7 +157,7 @@ export class DbObject extends DurableObject<Env> {
       return true;
     });
     engine.init(manifest);
-    engine.setRamBudget(512); // 32 MiB
+    engine.setRamBudget(Number(this.env.RAM_PAGES ?? 512)); // 512 = 32 MiB (a DO); GBs in a container
     const recs: OvRecord[] = this.sql
       .exec<{ tree: number; key: ArrayBuffer; val: ArrayBuffer | null; delta: number }>("SELECT tree, key, val, delta FROM ovl")
       .toArray()
@@ -134,12 +184,31 @@ export class DbObject extends DurableObject<Env> {
 
   private cachePuts: [string, ArrayBuffer, number?][] = [];
 
+  /**
+   * Storage writes that aren't needed for correctness of the reply (page-cache inserts,
+   * subscription records) run *after* the reply has gone out. A Durable Object holds every
+   * outgoing message until earlier writes are durable (the output gate), so writing first
+   * would make a warm read wait on a disk commit.
+   */
+  private later: (() => void)[] = [];
+  private persistLater(f: () => void) {
+    this.later.push(f);
+    if (this.later.length === 1)
+      setTimeout(() => {
+        const fs = this.later.splice(0);
+        this.ctx.storage.transactionSync(() => {
+          for (const f of fs) f();
+        });
+      }, 0);
+  }
+
   /** Fill the colo cache after the answer has gone out (puts would compete for connections). */
   private flushCachePuts() {
     const puts = this.cachePuts.splice(0);
     if (!puts.length) return;
     void (async () => {
-      const cache = await caches.open("pagedb");
+      const cache = await openCache();
+      if (!cache) return;
       for (const [url, buf, ttl] of puts) {
         await cache.put(url, new Response(buf, { headers: { "cache-control": ttl ? `public, max-age=${ttl}` : "public, max-age=31536000, immutable" } })).catch(() => {});
       }
@@ -192,7 +261,7 @@ export class DbObject extends DurableObject<Env> {
           const id = first + i;
           const page = new Uint8Array(bytes, i * PAGE, PAGE);
           if ((all || wanted.has(id)) && !this.engine!.putPage(id, page)) throw new Error(`page ${id} failed its checksum`);
-          this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page);
+          this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page));
         }
       }),
     );
@@ -203,9 +272,9 @@ export class DbObject extends DurableObject<Env> {
     const offset = ((chunk * PAGES_PER_CHUNK) % PAGES_PER_PART) * PAGE;
     const key = `db/${this.db}/base/${this.base}/part-${String(part).padStart(6, "0")}`;
     const cacheUrl = `https://pagedb.cache/${key}/${offset}${this.salt ? `?s=${this.salt}` : ""}`;
-    const cache = await caches.open("pagedb");
+    const cache = await openCache();
     const c0 = performance.now();
-    const hit = await cache.match(cacheUrl);
+    const hit = await cache?.match(cacheUrl);
     if (hit) {
       stats.cacheHits++;
       const buf = await hit.arrayBuffer();
@@ -214,13 +283,13 @@ export class DbObject extends DurableObject<Env> {
       return buf;
     }
     const r0 = performance.now();
-    const obj = await this.env.BUCKET.get(key, { range: { offset, length: PAGES_PER_CHUNK * PAGE } });
+    const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(key, { range: { offset, length: PAGES_PER_CHUNK * PAGE } });
     if (!obj) throw new Error(`missing ${key}`);
     const buf = await obj.arrayBuffer();
     stats.r2Ms.push(+(performance.now() - r0).toFixed(1));
     stats.r2Gets++;
     stats.bytes += buf.byteLength;
-    this.cachePuts.push([cacheUrl, buf.slice(0)]);
+    if (cache) this.cachePuts.push([cacheUrl, buf.slice(0)]);
     return buf;
   }
 
@@ -272,7 +341,7 @@ export class DbObject extends DurableObject<Env> {
   async fetch(req: Request): Promise<Response> {
     if (req.headers.get("upgrade") !== "websocket") return new Response("expected a WebSocket", { status: 426 });
     const db = new URL(req.url).searchParams.get("db") ?? "db1g";
-    this.ctx.storage.kv.put("db", db);
+    if (this.ctx.storage.kv.get("db") !== db) this.persistLater(() => this.ctx.storage.kv.put("db", db));
     const { 0: client, 1: server } = new WebSocketPair();
     const cid = crypto.randomUUID();
     this.ctx.acceptWebSocket(server);
@@ -305,10 +374,11 @@ export class DbObject extends DurableObject<Env> {
         const r = JSON.parse(Engine.text(out)) as { pid: number; rows?: unknown[]; complete?: boolean; count?: number };
         this.untrack(cid, m.id);
         this.track(cid, m.id, r.pid);
-        this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, m.id, q);
         stats.totalMs = performance.now() - t0;
         const version = this.engine!.overlayStats().version;
         ws.send(JSON.stringify({ t: "snap", id: m.id, version, rows: r.rows, complete: r.complete, count: r.count, stats: round(stats) }));
+        const sid = m.id;
+        this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, sid, q));
       } catch (e) {
         ws.send(JSON.stringify({ t: "error", id: m.id, message: String((e as Error).message ?? e) }));
       }
@@ -353,9 +423,9 @@ export class DbObject extends DurableObject<Env> {
     for (const d of done) {
       this.untrack(cid, d.id);
       this.track(cid, d.id, d.r.pid);
-      this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, d.id, d.q);
     }
     ws.send(JSON.stringify({ t: "snaps", version, stats: round(stats), list: done.map((d) => ({ id: d.id, rows: d.r.rows, complete: d.r.complete, count: d.r.count })) }));
+    for (const d of done) this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, d.id, d.q));
   }
 
   async webSocketClose(ws: WebSocket, code: number) {
@@ -420,12 +490,59 @@ export class DbObject extends DurableObject<Env> {
     return { version: result.version, changes: result.changes, ms: +(performance.now() - t0).toFixed(1), rounds: stats.rounds };
   }
 
+  /**
+   * Nightly reset of a public demo: the base is immutable, so resetting is dropping the overlay.
+   * Every live partition is rebuilt from scratch and open tabs are told to resubscribe.
+   */
+  async resetOverlay(db: string) {
+    const before = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n;
+    this.sql.exec("DELETE FROM ovl");
+    const version = (this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0) + 1;
+    this.ctx.storage.kv.put(`version:${db}`, version);
+    this.engine = undefined; // next use reloads the (now empty) overlay
+    this.live = { subs: new Map(), pidOf: new Map() };
+    this.sql.exec("DELETE FROM subs");
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(JSON.stringify({ t: "reset", version }));
+      } catch {}
+    }
+    return { cleared: before, version };
+  }
+
   /** Drop the SQLite page tier and the engine (cold benchmarks). */
   async reset() {
     this.sql.exec("DELETE FROM pages");
     this.ctx.storage.kv.delete(`manifest:${this.db}`);
     this.engine = undefined;
     return { ok: true };
+  }
+
+  /** Container debugging: sequential inline fetches vs blobStore, to isolate failures. */
+  async debugFetch(key: string, len: number, _n: number) {
+    const out: string[] = [];
+    const url = (i: number) => `http://r2.internal/get?key=${encodeURIComponent(key)}&offset=${i * len}&length=${len}`;
+    for (let i = 0; i < 3; i++) {
+      try {
+        const r = await fetch(url(i));
+        out.push(`inline#${i} ${r.status}:${(await r.arrayBuffer()).byteLength}`);
+      } catch (e) {
+        out.push(`inline#${i} throws ${String((e as Error).message ?? e)}`);
+      }
+    }
+    const store = blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN);
+    out.push(`isR2=${typeof (this.env.BUCKET as any).createMultipartUpload} r2url=${this.env.R2_URL ?? "-"}`);
+    for (let i = 0; i < 3; i++) {
+      let stage = "get";
+      try {
+        const o = await store.get(key, { range: { offset: i * len, length: len } });
+        stage = "body";
+        out.push(`store#${i} ok:${(await o!.arrayBuffer()).byteLength}`);
+      } catch (e) {
+        out.push(`store#${i} ${stage} throws ${String((e as Error).message ?? e)} ${String((e as Error).stack ?? "").split("\n").slice(1, 3).join(" | ")}`);
+      }
+    }
+    return out;
   }
 
   /** Evict this object from memory, keeping its storage (measures wake from hibernation). */

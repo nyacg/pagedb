@@ -83,7 +83,14 @@ export default {
     const url = new URL(req.url);
     if (!env.ADMIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.ADMIN_TOKEN}`) return new Response("unauthorized", { status: 401 });
     const db = url.searchParams.get("db") ?? "db100g";
-    const box = env.BOX.getByName(db);
+    // (RPC return types are deep; a narrow view keeps the checker fast.)
+    const box = env.BOX.getByName(db) as unknown as {
+      start(db: string, p: number, c: number): Promise<unknown>;
+      info(): Promise<unknown>;
+      stop(): Promise<unknown>;
+      reattach(): Promise<unknown>;
+      logs(): Promise<unknown>;
+    };
     if (url.pathname === "/start" && req.method === "POST")
       return Response.json(await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8)));
     if (url.pathname === "/status") {

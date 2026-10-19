@@ -70,18 +70,23 @@ export default {
         if (!admin(req, env)) return new Response("unauthorized", { status: 401 });
         if (url.pathname.startsWith("/api/admin/r2/") && req.method === "PUT") {
           const key = decodeURIComponent(url.pathname.slice("/api/admin/r2/".length));
-          await env.BUCKET.put(key, req.body);
+          await (env.BUCKET as R2Bucket).put(key, req.body);
           return Response.json({ ok: true, key });
         }
         const db = url.searchParams.get("db") ?? "db1g";
         const stub = env.DB.getByName(url.searchParams.get("obj") ?? db);
         if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
+        if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));
       }
       return env.ASSETS.fetch(req);
     } catch (e) {
       return Response.json({ error: String((e as Error).message ?? e) }, { status: 500 });
     }
+  },
+  /** 09:00 UTC: the public demo goes back to the published base (two writes, not 100 GB). */
+  async scheduled(_c: ScheduledController, env: Env) {
+    await (env.DB.getByName(DEMO_OBJ) as unknown as { resetOverlay(db: string): Promise<unknown> }).resetOverlay(DEMO_DB);
   },
 } satisfies ExportedHandler<Env>;

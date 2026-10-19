@@ -1,0 +1,12 @@
+{
+  "name": "pagedb-node",
+  "main": "src/node-worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["enable_ctx_exports"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "containers": [{ "class_name": "PageNode", "scheduling_policy": "durable_object", "images": { "node": { "dockerfile": "./Dockerfile.node" } } }],
+  "durable_objects": { "bindings": [{ "name": "NODE", "class_name": "PageNode" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PageNode"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }]
+}

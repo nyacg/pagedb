@@ -7,7 +7,8 @@
     "test:engine": "cd engine && cargo test --release",
     "typecheck": "tsc --noEmit",
     "deploy": "npm run wasm && npm run web && wrangler deploy",
-    "web": "node web/build.mjs"
+    "web": "node web/build.mjs",
+    "deploy:node": "npm run wasm && node node/build.mjs && wrangler deploy -c wrangler.node.jsonc"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261015.1",
