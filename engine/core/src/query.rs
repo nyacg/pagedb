@@ -18,7 +18,7 @@
 //! (the query family's parameters); the remaining key columns must give the requested order.
 //! Anything without a supporting index is refused, so no query can scan the whole database.
 
-use crate::catalog::{self, Index, IndexValue, Table};
+use crate::catalog::{ColType, Index, IndexValue, Schema, TableId, TreeId};
 use crate::codec::{encode_key_part, json_cell, json_str, prefix_end, Cell, RowRef, Value};
 use crate::merged;
 use crate::tree::{Ctx, Miss, Range, TreeRoot};
@@ -28,19 +28,22 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Filter {
     Eq(usize, Value),
+    NotNull(usize),
     In(usize, Vec<Value>),
     /// Lowercased needle; matches if the column contains it, case-insensitively.
     ILike(usize, String),
-    HasTag(String),
-    /// Issue has a comment whose body contains this (lowercased) needle. Needs page reads, so
-    /// it's checked after the row's own filters (see `comments_match`).
-    CommentILike(String),
+    /// List column contains this element.
+    HasItem(usize, String),
+    /// The row has a child (through a relation) whose column contains this (lowercased) needle:
+    /// `children` is the child index leading with the fk. Needs page reads, so it's checked
+    /// after the row's own filters (see `children_match`).
+    ChildILike { children: TreeId, col: usize, needle: String },
 }
 
 #[derive(Clone, Debug)]
 pub enum RelKind {
     /// Child row whose primary key = parent[col].
-    One { table: Table, parent_col: usize },
+    One { table: TableId, parent_col: usize },
     /// Child rows of `plan` whose first key column = parent[col].
     Many { plan: Box<Plan>, parent_col: usize },
     /// A maintained count column on the parent.
@@ -55,7 +58,8 @@ pub struct Related {
 
 #[derive(Clone, Debug)]
 pub struct Plan {
-    pub table: Table,
+    pub schema: &'static Schema,
+    pub table: TableId,
     pub index: &'static Index,
     /// Values of the index's leading key columns (the family parameters).
     pub prefix: Vec<Value>,
@@ -149,9 +153,11 @@ fn flatten<'a>(w: &'a J, out: &mut Vec<&'a J>) -> Result<(), String> {
     }
 }
 
-pub fn compile(ast: &J) -> Result<Plan, String> {
-    let table = Table::from_name(ast.get("table").and_then(J::as_str).ok_or("missing table")?).ok_or("unknown table")?;
-    let col = |name: &str| table.col(name).ok_or_else(|| format!("unknown column {}.{name}", table.name()));
+pub fn compile(schema: &'static Schema, ast: &J) -> Result<Plan, String> {
+    let tname = ast.get("table").and_then(J::as_str).ok_or("missing table")?;
+    let table = schema.table_named(tname).ok_or_else(|| format!("unknown table {tname}"))?;
+    let tdef = schema.table(table);
+    let col = |name: &str| tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"));
 
     // Conditions.
     let mut conds = Vec::new();
@@ -159,11 +165,11 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
         flatten(w, &mut conds)?;
     }
     let mut eqs: Vec<(usize, Value)> = Vec::new();
-    let mut tags: Vec<String> = Vec::new();
+    let mut tags: Vec<(usize, String)> = Vec::new();
     let mut filters: Vec<Filter> = Vec::new();
     for c in conds {
         if c.get("type").and_then(J::as_str) == Some("correlatedSubquery") {
-            filters.extend(comment_exists(table, c)?);
+            filters.extend(child_exists(schema, table, c)?);
             continue;
         }
         let op = c.get("op").and_then(J::as_str).ok_or("condition without op")?;
@@ -172,16 +178,17 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
         let ci = col(name)?;
         match op {
             "=" => eqs.push((ci, json_to_value(lit))),
+            "IS NOT" if lit.is_null() => filters.push(Filter::NotNull(ci)),
             "IN" => filters.push(Filter::In(ci, lit.as_array().ok_or("IN needs an array")?.iter().map(json_to_value).collect())),
             "ILIKE" => {
                 let s = lit.as_str().ok_or("ILIKE needs a string")?;
                 filters.push(Filter::ILike(ci, s.trim_matches('%').to_lowercase()));
             }
             "HAS" => {
-                if table != Table::Issue || ci != catalog::issue::TAGS {
-                    return Err("HAS is only supported on issue.tags".into());
+                if tdef.columns[ci].ty != ColType::List {
+                    return Err(format!("HAS needs a list column ({name} isn't one)"));
                 }
-                tags.push(lit.as_str().ok_or("HAS needs a string")?.to_string());
+                tags.push((ci, lit.as_str().ok_or("HAS needs a string")?.to_string()));
             }
             other => return Err(format!("unsupported operator {other}")),
         }
@@ -200,13 +207,20 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
 
     // Index choice: most equality columns as prefix, then the rest must give `order`.
     let mut best: Option<(usize, &'static Index, bool)> = None;
-    for ix in catalog::indexes_of(table) {
+    for ix in schema.indexes_of(table) {
         if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) {
             continue;
         }
+        // A partial index serves only queries that exclude the rows it leaves out.
+        if let Some(c) = ix.not_null {
+            let required = filters.iter().any(|f| matches!(f, Filter::NotNull(n) if *n == c)) || eqs.iter().any(|(e, v)| *e == c && *v != Value::Null);
+            if !required {
+                continue;
+            }
+        }
         let mut p = 0;
-        for &(c, _) in ix.key {
-            let usable = if Some(c) == ix.multi { !tags.is_empty() } else { eqs.iter().any(|(e, _)| *e == c) };
+        for &(c, _) in &ix.key {
+            let usable = if Some(c) == ix.multi { tags.iter().any(|(tc, _)| *tc == c) } else { eqs.iter().any(|(e, _)| *e == c) };
             if !usable {
                 break;
             }
@@ -245,14 +259,15 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
             best = Some((p, ix, reverse.unwrap_or(false)));
         }
     }
-    let (p, index, reverse) = best.ok_or_else(|| format!("no index on {} supports this filter and order", table.name()))?;
+    let (p, index, reverse) = best.ok_or_else(|| format!("no index on {tname} supports this filter and order"))?;
 
     let mut prefix = Vec::with_capacity(p);
-    let mut used_tag = false;
+    let mut used_tag = None;
     for &(c, _) in &index.key[..p] {
         if Some(c) == index.multi {
-            prefix.push(Value::Str(tags[0].clone()));
-            used_tag = true;
+            let i = tags.iter().position(|(tc, _)| *tc == c).unwrap();
+            prefix.push(Value::Str(tags[i].1.clone()));
+            used_tag = Some(i);
         } else {
             let (_, v) = eqs.iter().find(|(e, _)| *e == c).unwrap();
             prefix.push(v.clone());
@@ -263,22 +278,22 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
             filters.push(Filter::Eq(*c, v.clone()));
         }
     }
-    for (i, t) in tags.iter().enumerate() {
-        if !(used_tag && i == 0) {
-            filters.push(Filter::HasTag(t.clone()));
+    for (i, (c, t)) in tags.iter().enumerate() {
+        if used_tag != Some(i) {
+            filters.push(Filter::HasItem(*c, t.clone()));
         }
     }
 
     let one = ast.get("one").and_then(J::as_bool).unwrap_or(false);
     let limit = if one { 1 } else { ast.get("limit").and_then(J::as_u64).unwrap_or(100).min(MAX_LIMIT as u64) as usize };
     let count = ast.get("aggregate").and_then(J::as_str) == Some("count");
-    if count && filters.iter().any(|f| matches!(f, Filter::CommentILike(_))) {
-        return Err("comment search can't be counted".into());
+    if count && filters.iter().any(|f| matches!(f, Filter::ChildILike { .. })) {
+        return Err("a search over related rows can't be counted".into());
     }
 
     let mut related = Vec::new();
     for r in ast.get("related").and_then(J::as_array).map(|v| v.as_slice()).unwrap_or(&[]) {
-        related.push(compile_related(table, r)?);
+        related.push(compile_related(schema, table, r)?);
     }
     // Keyset bounds: {"start":{"row":{…}}} (exclusive), {"end":{"row":{…}}} (inclusive). The row
     // gives the values of the index columns after the prefix (the order columns + primary key).
@@ -287,58 +302,64 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
         let row = b.get("row").and_then(J::as_object).ok_or_else(|| format!("{name} needs a row"))?;
         let mut k = Vec::new();
         for &(c, desc) in &index.key[p..] {
-            let col = table.columns()[c];
+            let col = tdef.columns[c].name.as_str();
             let v = row.get(col).ok_or_else(|| format!("{name}.row needs {col}"))?;
             encode_key_part(&mut k, &json_to_value(v), desc);
         }
         Ok(Some(k))
     };
     let (start, end) = (bound("start")?, bound("end")?);
-    Ok(Plan { table, index, prefix, reverse, filters, limit, one, count, related, start, end })
+    Ok(Plan { schema, table, index, prefix, reverse, filters, limit, one, count, related, start, end })
 }
 
-/// `EXISTS (comment of this issue whose body ILIKE …)`: the only correlated subquery supported.
-fn comment_exists(table: Table, c: &J) -> Result<Vec<Filter>, String> {
-    let bad = || "only EXISTS (issue → comment, body ILIKE) is supported".to_string();
+/// `EXISTS (child row through a relation whose text column ILIKE …)`, e.g. issues with a
+/// comment mentioning a word. The correlation must be a declared relation (parent pk → fk).
+fn child_exists(schema: &'static Schema, table: TableId, c: &J) -> Result<Vec<Filter>, String> {
+    let bad = || "EXISTS needs a relation (parent id → child fk) and ILIKE conditions on the child".to_string();
     let rel = c.get("related").ok_or_else(bad)?;
     let corr = rel.get("correlation").ok_or_else(bad)?;
     let field = |k: &str| corr.get(k).and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str);
     let sub = rel.get("subquery").ok_or_else(bad)?;
-    if c.get("op").and_then(J::as_str) != Some("EXISTS")
-        || table != Table::Issue
-        || field("parentField") != Some("id")
-        || field("childField") != Some("issueId")
-        || sub.get("table").and_then(J::as_str) != Some("comment")
-    {
+    let child = schema.table_named(sub.get("table").and_then(J::as_str).ok_or_else(bad)?).ok_or_else(bad)?;
+    let fk = schema.table(child).col(field("childField").ok_or_else(bad)?).ok_or_else(bad)?;
+    if c.get("op").and_then(J::as_str) != Some("EXISTS") || schema.table(table).col(field("parentField").unwrap_or("")) != Some(0) {
         return Err(bad());
     }
+    let children = schema.relation(table, child, fk).and_then(|r| r.children).ok_or_else(bad)?;
     let mut conds = Vec::new();
     flatten(sub.get("where").ok_or_else(bad)?, &mut conds)?;
     conds
         .into_iter()
         .map(|w| {
-            let ok = w.get("op").and_then(J::as_str) == Some("ILIKE") && w.get("left").and_then(col_name) == Some("body");
-            let lit = w.get("right").and_then(literal).and_then(J::as_str).filter(|_| ok).ok_or_else(bad)?;
-            Ok(Filter::CommentILike(lit.trim_matches('%').to_lowercase()))
+            let col = w.get("left").and_then(col_name).and_then(|n| schema.table(child).col(n)).filter(|_| w.get("op").and_then(J::as_str) == Some("ILIKE"));
+            let lit = w.get("right").and_then(literal).and_then(J::as_str);
+            match (col, lit) {
+                (Some(col), Some(lit)) => Ok(Filter::ChildILike { children, col, needle: lit.trim_matches('%').to_lowercase() }),
+                _ => Err(bad()),
+            }
         })
         .collect()
 }
 
-fn compile_related(parent: Table, r: &J) -> Result<Related, String> {
+fn compile_related(schema: &'static Schema, parent: TableId, r: &J) -> Result<Related, String> {
     let alias = r.get("alias").or_else(|| r.get("subquery").and_then(|s| s.get("alias"))).and_then(J::as_str).ok_or("related needs an alias")?.to_string();
     let corr = r.get("correlation").ok_or("related needs a correlation")?;
     let pf = corr.get("parentField").and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str).ok_or("parentField")?;
     let cf = corr.get("childField").and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str).ok_or("childField")?;
     let sub = r.get("subquery").ok_or("related needs a subquery")?;
-    let child = Table::from_name(sub.get("table").and_then(J::as_str).ok_or("subquery table")?).ok_or("unknown subquery table")?;
-    let parent_col = parent.col(pf).ok_or_else(|| format!("unknown column {}.{pf}", parent.name()))?;
+    let cname = sub.get("table").and_then(J::as_str).ok_or("subquery table")?;
+    let child = schema.table_named(cname).ok_or_else(|| format!("unknown table {cname}"))?;
+    let pdef = schema.table(parent);
+    let parent_col = pdef.col(pf).ok_or_else(|| format!("unknown column {}.{pf}", pdef.name))?;
+    let child_col = schema.table(child).col(cf).ok_or_else(|| format!("unknown column {cname}.{cf}"))?;
     if sub.get("aggregate").and_then(J::as_str) == Some("count") {
-        if parent == Table::Issue && child == Table::Comment && cf == "issueId" && pf == "id" {
-            return Ok(Related { alias, kind: RelKind::CountColumn(catalog::issue::COMMENTS) });
-        }
-        return Err("count is only maintained for issue → comment".into());
+        // Only maintained counts: a relation's count column on the parent.
+        return match schema.relation(parent, child, child_col).and_then(|rel| rel.count).filter(|_| parent_col == 0) {
+            Some(c) => Ok(Related { alias, kind: RelKind::CountColumn(c) }),
+            None => Err(format!("no maintained count of {cname} per {}", pdef.name)),
+        };
     }
-    if child.col(cf) == Some(0) && catalog::primary_of(child).key.len() == 1 {
+    if child_col == 0 {
         return Ok(Related { alias, kind: RelKind::One { table: child, parent_col } });
     }
     // Many: compile the subquery with the correlation as an equality.
@@ -349,25 +370,37 @@ fn compile_related(parent: Table, r: &J) -> Result<Related, String> {
         None => eq,
     };
     sub2["where"] = w;
-    let plan = compile(&sub2)?;
-    if plan.prefix.is_empty() || plan.index.key[0].0 != child.col(cf).unwrap() {
-        return Err(format!("no index on {} leads with {cf}", child.name()));
+    let plan = compile(schema, &sub2)?;
+    if plan.prefix.is_empty() || plan.index.key[0].0 != child_col {
+        return Err(format!("no index on {cname} leads with {cf}"));
     }
     Ok(Related { alias, kind: RelKind::Many { plan: Box::new(plan), parent_col } })
 }
 
 // ------------------------------------------------------------------ execute
 
-/// Roots of the trees, from the manifest.
-#[derive(Clone, Default)]
-pub struct Roots(pub HashMap<u16, TreeRoot>);
+/// A base: its schema and the roots of its trees, from the manifest.
+#[derive(Clone)]
+pub struct Roots {
+    pub trees: HashMap<u16, TreeRoot>,
+    pub schema: &'static Schema,
+}
 
 impl Roots {
-    pub fn get(&self, tree: u16) -> TreeRoot {
-        self.0.get(&tree).copied().unwrap_or(TreeRoot::empty(tree))
+    pub fn new(schema: &'static Schema, trees: HashMap<u16, TreeRoot>) -> Roots {
+        Roots { trees, schema }
     }
 
+    pub fn get(&self, tree: u16) -> TreeRoot {
+        self.trees.get(&tree).copied().unwrap_or(TreeRoot::empty(tree))
+    }
+
+    /// Bases built before manifests carried a schema are issue trackers.
     pub fn from_manifest(m: &J) -> Result<Roots, String> {
+        let schema = match m.get("schema") {
+            Some(j) => Schema::from_json(j)?.leak(),
+            None => crate::catalog::tracker(),
+        };
         let mut out = HashMap::new();
         for t in m.get("trees").and_then(J::as_array).ok_or("manifest without trees")? {
             let tree = t.get("tree").and_then(J::as_u64).ok_or("tree id")? as u16;
@@ -382,7 +415,7 @@ impl Roots {
                 },
             );
         }
-        Ok(Roots(out))
+        Ok(Roots { trees: out, schema })
     }
 }
 
@@ -415,38 +448,69 @@ pub fn row_matches(plan: &Plan, row: RowRef) -> bool {
 fn filter_matches(f: &Filter, row: RowRef) -> bool {
     match f {
         Filter::Eq(c, v) => row.get(*c).eq_value(v),
+        Filter::NotNull(c) => !matches!(row.get(*c), crate::codec::Cell::Null),
         Filter::In(c, vs) => {
             let cell = row.get(*c);
             vs.iter().any(|v| cell.eq_value(v))
         }
         Filter::ILike(c, needle) => contains_ci(row.get(*c).str(), needle),
-        Filter::HasTag(t) => row.get(catalog::issue::TAGS).str().contains(&format!("\"{t}\"")),
-        Filter::CommentILike(_) => true, // checked by comments_match
+        Filter::HasItem(c, t) => row.get(*c).str().contains(&format!("\"{t}\"")),
+        Filter::ChildILike { .. } => true, // checked by children_match
     }
 }
 
-pub fn has_comment_filter(plan: &Plan) -> bool {
-    plan.filters.iter().any(|f| matches!(f, Filter::CommentILike(_)))
+pub fn has_child_filter(plan: &Plan) -> bool {
+    plan.filters.iter().any(|f| matches!(f, Filter::ChildILike { .. }))
 }
 
-/// Comment search for one issue row: every needle must occur in some comment of the issue.
-pub fn comments_match(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Result<bool, Miss> {
-    let needles: Vec<&str> = plan.filters.iter().filter_map(|f| if let Filter::CommentILike(n) = f { Some(n.as_str()) } else { None }).collect();
-    if needles.is_empty() {
-        return Ok(true);
-    }
-    let ix = catalog::index_named("comment_by_issue").unwrap();
-    let lo = prefix_key(ix, &[Value::from(row.get(catalog::issue::ID).str())]);
-    let hi = prefix_end(&lo);
-    let mut found = vec![false; needles.len()];
-    merged::scan(ctx, &roots.get(ix.tree), &Range { lo: &lo, hi: &hi }, false, 256, &mut |_, v| {
-        let body = RowRef(v).get(catalog::comment::BODY).str();
-        for (i, n) in needles.iter().enumerate() {
-            found[i] = found[i] || contains_ci(body, n);
+/// Searches over a row's children (e.g. issues by comment text): every needle must occur in
+/// some child of the row, through its relation's child index.
+pub fn children_match(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Result<bool, Miss> {
+    let mut by_index: Vec<(TreeId, Vec<(usize, &str)>)> = Vec::new();
+    for f in &plan.filters {
+        if let Filter::ChildILike { children, col, needle } = f {
+            match by_index.iter_mut().find(|(t, _)| t == children) {
+                Some((_, v)) => v.push((*col, needle.as_str())),
+                None => by_index.push((*children, vec![(*col, needle.as_str())])),
+            }
         }
-        !found.iter().all(|f| *f)
-    })?;
-    Ok(found.iter().all(|f| *f))
+    }
+    for (tree, needles) in by_index {
+        let ix = plan.schema.index(tree);
+        let lo = prefix_key(ix, &[Value::from(row.get(0).str())]);
+        let hi = prefix_end(&lo);
+        let mut found = vec![false; needles.len()];
+        merged::scan(ctx, &roots.get(tree), &Range { lo: &lo, hi: &hi }, false, 256, &mut |_, v| {
+            for (i, (col, n)) in needles.iter().enumerate() {
+                found[i] = found[i] || contains_ci(RowRef(v).get(*col).str(), n);
+            }
+            !found.iter().all(|f| *f)
+        })?;
+        if !found.iter().all(|f| *f) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Current row by primary key (through the overlay), following a pointer primary index to
+/// the covering index that holds the full row.
+pub fn read_row(ctx: &Ctx, roots: &Roots, table: TableId, id: &str) -> Result<Option<Vec<Value>>, Miss> {
+    let s = roots.schema;
+    let p = s.primary_of(table);
+    let Some(v) = merged::get(ctx, &roots.get(p.tree), &s.pk_key(table, id))? else { return Ok(None) };
+    match (&p.value, p.row_index) {
+        (IndexValue::Cols(cols), Some(ri)) => {
+            let ptr = RowRef(&v).to_values();
+            let mut row = vec![Value::Null; s.table(table).columns.len()];
+            for (i, &c) in cols.iter().enumerate() {
+                row[c] = ptr[i].clone();
+            }
+            let ix = s.index(ri);
+            Ok(merged::get(ctx, &roots.get(ri), &crate::catalog::index_key(ix, &row, None))?.map(|v| RowRef(&v).to_values()))
+        }
+        _ => Ok(Some(RowRef(&v).to_values())),
+    }
 }
 
 /// Matching rows of `plan` in [lo, hi), in scan order: up to `need`, plus whether more exist.
@@ -456,7 +520,7 @@ pub fn comments_match(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Res
 /// been checked so far, up to COMMENT_BATCH, so a word in no comment of a 10k-issue project
 /// costs ~3 rounds.
 pub fn collect(ctx: &Ctx, roots: &Roots, plan: &Plan, lo: &[u8], hi: &[u8], need: usize) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Miss> {
-    let deep = has_comment_filter(plan);
+    let deep = has_child_filter(plan);
     let hint = if plan.filters.is_empty() { need + 1 } else { SCAN_BUDGET };
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let (mut more, mut unknown, mut known) = (false, 0usize, 0usize);
@@ -465,7 +529,7 @@ pub fn collect(ctx: &Ctx, roots: &Roots, plan: &Plan, lo: &[u8], hi: &[u8], need
             return true;
         }
         if deep {
-            match comments_match(ctx, roots, plan, RowRef(v)) {
+            match children_match(ctx, roots, plan, RowRef(v)) {
                 Ok(m) => {
                     known += 1;
                     if !m {
@@ -575,15 +639,16 @@ pub fn render(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Result<Stri
     Ok(out)
 }
 
-fn render_into(out: &mut String, ctx: &Ctx, roots: &Roots, table: Table, related: &[Related], row: RowRef) -> Result<(), Miss> {
+fn render_into(out: &mut String, ctx: &Ctx, roots: &Roots, table: TableId, related: &[Related], row: RowRef) -> Result<(), Miss> {
+    let tdef = roots.schema.table(table);
     out.push('{');
-    for (i, (name, cell)) in table.columns().iter().zip(row.cells()).enumerate() {
+    for (i, (col, cell)) in tdef.columns.iter().zip(row.cells()).enumerate() {
         if i > 0 {
             out.push(',');
         }
-        json_str(out, name);
+        json_str(out, &col.name);
         out.push(':');
-        if table == Table::Issue && i == catalog::issue::TAGS {
+        if col.ty == ColType::List {
             out.push_str(match cell {
                 Cell::Str(s) if s.starts_with('[') => s,
                 _ => "[]",
@@ -600,9 +665,8 @@ fn render_into(out: &mut String, ctx: &Ctx, roots: &Roots, table: Table, related
         match &r.kind {
             RelKind::CountColumn(c) => json_cell(out, row.get(*c)),
             RelKind::One { table: child, parent_col } => {
-                let key = catalog::pk_key(*child, row.get(*parent_col).str());
-                match merged::get(ctx, &roots.get(catalog::primary_of(*child).tree), &key) {
-                    Ok(Some(v)) => render_into(out, ctx, roots, *child, &[], RowRef(&v))?,
+                match read_row(ctx, roots, *child, row.get(*parent_col).str()) {
+                    Ok(Some(vals)) => render_into(out, ctx, roots, *child, &[], RowRef(&crate::codec::encode_row(&vals)))?,
                     Ok(None) => out.push_str("null"),
                     Err(Miss) => {
                         missed = true;

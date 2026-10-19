@@ -8,9 +8,9 @@
 //! whole write — overlay and every partition — has computed without faulting. So a push can't
 //! leave a half-updated window behind; the shell resolves the pages and retries the batch.
 
-use crate::catalog::{self, index_entries, Table};
+use crate::catalog::index_entries;
 use crate::codec::{RowRef, Value};
-use crate::query::{comments_match, execute, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
+use crate::query::{children_match, execute, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
 use crate::tree::{Ctx, Miss};
 use crate::write::RowChange;
 use std::rc::Rc;
@@ -69,7 +69,7 @@ fn key_in(ctx: &Ctx, roots: &Roots, plan: &Plan, row: &[Value]) -> Result<Option
             vals[pos].as_str().unwrap_or_default().to_string()
         });
         if row_in_partition(plan, r, elem.as_deref()) && plan.in_range(&k) {
-            return Ok(if comments_match(ctx, roots, plan, r)? { Some(k) } else { None });
+            return Ok(if children_match(ctx, roots, plan, r)? { Some(k) } else { None });
         }
     }
     Ok(None)
@@ -183,7 +183,7 @@ pub fn compute(ctx: &Ctx, roots: &Roots, part: &Partition, changes: &[RowChange]
                         if !w.iter().any(|(_, p)| *p == pk) || ops.iter().any(|o| matches!(o, DeltaOp::Add { pk: p, .. } | DeltaOp::Edit { pk: p, .. } if *p == pk)) {
                             continue;
                         }
-                        match crate::write::read_row(ctx, roots, plan.table, &pk) {
+                        match crate::query::read_row(ctx, roots, plan.table, &pk) {
                             Ok(Some(row)) => match render_row(ctx, roots, plan, &row) {
                                 Ok(json) => ops.push(DeltaOp::Edit { pk, json }),
                                 Err(Miss) => missed = true,
@@ -213,9 +213,4 @@ pub fn window_matches_fresh(ctx: &Ctx, roots: &Roots, plan: &Plan, state: &State
         }
         _ => false,
     })
-}
-
-#[allow(dead_code)]
-fn _uses(_: Table) {
-    let _ = catalog::INDEXES;
 }

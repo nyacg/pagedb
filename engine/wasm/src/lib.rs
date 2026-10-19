@@ -1,4 +1,6 @@
 //! WASM boundary for the Durable Object shell. Raw exports/imports, no bindgen.
+//! (Only built for wasm32: natively, its exported `write` would clash with libc's.)
+#![cfg(target_arch = "wasm32")]
 //!
 //! Calls never block. Each call returns a status; the payload is left in the output buffer
 //! (`out_ptr`/`out_len`):
@@ -295,7 +297,7 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
             Ok(a) => a,
             Err(e) => return Some(Err(format!("bad query JSON: {e}"))),
         };
-        Some(compile(&ast).map(|p| {
+        Some(compile(db.roots.schema, &ast).map(|p| {
             let p = Rc::new(p);
             if db.plans.len() > 4096 {
                 db.plans.clear();
@@ -341,7 +343,7 @@ fn plan_for(db: &mut Db, text: &str) -> Result<Rc<pagedb_core::query::Plan>, Str
         return Ok(p.clone());
     }
     let ast: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("bad query JSON: {e}"))?;
-    let p = Rc::new(pagedb_core::query::compile(&ast)?);
+    let p = Rc::new(pagedb_core::query::compile(db.roots.schema, &ast)?);
     db.plans.insert(text.to_string(), p.clone());
     Ok(p)
 }
@@ -502,14 +504,14 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
         Ok(v) => v,
         Err(e) => return error(format!("bad ops JSON: {e}")),
     };
-    let ops = match parse_ops(&ops_json) {
-        Ok(o) => o,
-        Err(e) => return error(e),
-    };
     let guard = DB.with(|d| d.as_ptr());
     let db = match (*guard).as_mut() {
         Some(db) => db,
         None => return error("engine not initialized"),
+    };
+    let ops = match parse_ops(db.roots.schema, &ops_json) {
+        Ok(o) => o,
+        Err(e) => return error(e),
     };
     let store = Tiers;
     let (writes, results, changes) = {

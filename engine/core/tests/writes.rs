@@ -5,7 +5,7 @@
 //!   3. list/count results equal an oracle that applies the same mutations to plain rows.
 
 use pagedb_core::build::{self, MemDb};
-use pagedb_core::catalog::{comment, issue, tags_json, STATUSES};
+use pagedb_core::catalog::{comment, issue, tags_json, tracker, STATUSES};
 use pagedb_core::codec::Value;
 use pagedb_core::gen::{Config, Rng};
 use pagedb_core::ivm::{self, DeltaOp, Partition, State};
@@ -101,7 +101,7 @@ impl Model {
                     if let Some(row) = self.issues.get_mut(id) {
                         let mut title = None;
                         for (k, v) in o["set"].as_object().unwrap() {
-                            let c = pagedb_core::catalog::Table::Issue.col(k).unwrap();
+                            let c = tracker().table(pagedb_core::catalog::t::ISSUE).col(k).unwrap();
                             row[c] = if c == issue::TAGS { Value::from(tags_json(&sorted_tags(v))) } else { pagedb_core::query::json_to_value(v) };
                             if c == issue::TITLE {
                                 title = Some(row[c].clone());
@@ -227,7 +227,7 @@ fn writes_and_live_queries_stay_consistent() {
         asts.push(json!({"table":"issue","where":eq("projectId", json!("p0000")),"orderBy":order,"limit":15,"start":{"row":key(&newest[29])}}));
     }
     // Hydrate partitions (and a client model per partition).
-    let plans: Vec<Rc<Plan>> = asts.iter().map(|q| Rc::new(compile(q).unwrap())).collect();
+    let plans: Vec<Rc<Plan>> = asts.iter().map(|q| Rc::new(compile(tracker(), q).unwrap())).collect();
     let mut parts: Vec<Partition> = Vec::new();
     let mut clients: Vec<BTreeMap<String, String>> = Vec::new();
     let mut client_counts: Vec<u64> = Vec::new();
@@ -260,7 +260,7 @@ fn writes_and_live_queries_stay_consistent() {
             store.resident.borrow_mut().clear(); // cache dropped: everything faults again
         }
         let ops_json = random_ops(&mut r, &model, step, &mut clock);
-        let ops = parse_ops(&ops_json).unwrap();
+        let ops = parse_ops(tracker(), &ops_json).unwrap();
         ops_total += ops.len();
         // Pure: plan + every partition's compute. Retry on Miss; commit only a clean pass.
         let committed = loop {

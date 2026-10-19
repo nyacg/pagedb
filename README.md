@@ -75,6 +75,29 @@ Details: `bench/results/*.md`.
      project (~20–35 MB, read as a few large ranged GETs). Once a project's comments are in the
      object it's instant. Live: adding or deleting a matching comment moves the issue in or out.
 
+## Schemas and datasets
+
+A base carries its schema in `manifest.json`: tables (typed columns, column 0 is the primary
+key), indexes and relations, as JSON (`engine/core/src/catalog.rs` documents the format; the
+tracker's is `TRACKER_JSON`). Bases built before schemas existed get the tracker's.
+
+- **Indexes**: key columns (`-col` descending), covering by default; `truncate` for previews,
+  `cols` + `rowIndex` for pointer primaries, `multi` for list columns (one entry per element),
+  `where: {notNull}` for partial indexes (used only by queries that say `IS NOT NULL`),
+  `baseLimit` to keep only the first n keys in the base.
+- **Relations** (parent → child by `fk`) are maintained by the engine: counts, a touched
+  timestamp, columns copied from the parent (kept in sync), cascading deletes. Queries use them
+  for related counts and `EXISTS` searches over children.
+
+Any dataset becomes a base with the generic builder: newline-delimited JSON per table in,
+parts + manifest out (external sort, LZ4 spill runs, bounded memory):
+
+```sh
+pagedb-builder ingest --schema schema.json --input story=stories.ndjson --input comment=- --mem 6000 --out DIR
+```
+
+It produces byte-identical output to the tracker's hand-written builder for the same rows.
+
 ## Layout
 
 ```

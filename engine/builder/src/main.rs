@@ -8,82 +8,19 @@
 //! one temp file per tag (appending projects in order keeps each file sorted); the feed index
 //! keeps the newest `feed_base` comments with a heap.
 
-use pagedb_core::catalog::{self, index_entries, Table};
+use pagedb_core::catalog::{self, index_entries, tracker};
 use pagedb_core::codec::Value;
 use pagedb_core::gen::{self, Config};
-use pagedb_core::page::{PageId, PAGES_PER_PART, PAGE_SIZE};
-use pagedb_core::tree::{PageSink, TreeBuilder, TreeRoot};
+use pagedb_core::page::{PAGES_PER_PART, PAGE_SIZE};
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
-/// Writes pages into sequential part files of PAGES_PER_PART pages each.
-struct PartSink {
-    dir: PathBuf,
-    next: PageId,
-    part: Option<BufWriter<File>>,
-    crcs: Vec<u32>,
-    part_hasher: Vec<u8>, // small running digest input: page crcs of the current part
-}
-
-impl PartSink {
-    fn new(dir: &Path) -> Self {
-        fs::create_dir_all(dir.join("parts")).unwrap();
-        Self { dir: dir.to_path_buf(), next: 0, part: None, crcs: Vec::new(), part_hasher: Vec::new() }
-    }
-
-    fn part_path(&self, n: u64) -> PathBuf {
-        self.dir.join("parts").join(format!("part-{n:06}"))
-    }
-
-    fn close_part(&mut self) {
-        if let Some(mut w) = self.part.take() {
-            w.flush().unwrap();
-            self.crcs.push(pagedb_core::page::crc32(&self.part_hasher));
-            self.part_hasher.clear();
-        }
-    }
-
-    fn finish(mut self) -> (u64, Vec<u32>) {
-        self.close_part();
-        (self.next, self.crcs)
-    }
-}
-
-impl PageSink for PartSink {
-    fn write(&mut self, page: Vec<u8>) -> PageId {
-        assert_eq!(page.len(), PAGE_SIZE);
-        let id = self.next;
-        if id % PAGES_PER_PART == 0 {
-            self.close_part();
-            self.part = Some(BufWriter::with_capacity(1 << 20, File::create(self.part_path(id / PAGES_PER_PART)).unwrap()));
-        }
-        self.part.as_mut().unwrap().write_all(&page).unwrap();
-        self.part_hasher.extend_from_slice(&page[8..12]); // the page's own crc
-        self.next += 1;
-        id
-    }
-}
-
-struct Built {
-    pending: Option<pagedb_core::tree::PendingTree>,
-    root: TreeRoot,
-    name: &'static str,
-    first_page: PageId,
-    pages: u64,
-    secs: f64,
-}
-
-fn build_tree(sink: &mut PartSink, tree: u16, entries: &mut dyn FnMut(&mut dyn FnMut(&[u8], &[u8]))) -> Built {
-    let t0 = Instant::now();
-    let first_page = sink.next;
-    let mut b = TreeBuilder::new(tree);
-    entries(&mut |k, v| b.push(sink, k, v));
-    let pending = b.finish_leaves(sink);
-    Built { pending: Some(pending), root: TreeRoot::empty(tree), name: catalog::index(tree).name, first_page, pages: sink.next - first_page, secs: t0.elapsed().as_secs_f64() }
-}
+mod ingest;
+mod sink;
+use sink::{build_tree, Built, PartSink};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -99,8 +36,42 @@ fn main() {
         println!(r#"{{"count":{n},"newest":{:?},"title":{:?},"comments":{}}}"#, newest, first.row[pagedb_core::catalog::issue::TITLE].as_str().unwrap(), first.comments);
         return;
     }
+    if args.get(1).map(String::as_str) == Some("export") {
+        // The generated tracker as JSON lines per table (to check `ingest` against `build`).
+        let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+        let mut cfg = Config::with_projects(arg("--projects").map(|v| v.parse().unwrap()).unwrap_or(2));
+        if let Some(v) = arg("--issues") {
+            cfg.issues_per_project = v.parse().unwrap();
+        }
+        let out = PathBuf::from(arg("--out").expect("--out DIR"));
+        fs::create_dir_all(&out).unwrap();
+        let s = tracker();
+        let all = pagedb_core::build::rows(&cfg);
+        for (t, rows) in [(0, &all.projects), (1, &all.users), (2, &all.issues), (3, &all.comments)] {
+            let mut w = BufWriter::new(File::create(out.join(format!("{}.ndjson", s.table(t).name))).unwrap());
+            for row in rows {
+                let mut o = serde_json::Map::new();
+                for (c, v) in s.table(t).columns.iter().zip(row) {
+                    let j = match (c.ty, v) {
+                        (catalog::ColType::List, _) => serde_json::Value::from(catalog::parse_list(v)),
+                        (_, Value::Null) => serde_json::Value::Null,
+                        (_, Value::Num(n)) => serde_json::json!(n),
+                        (_, Value::Bool(b)) => serde_json::Value::Bool(*b),
+                        (_, Value::Str(x)) => serde_json::Value::from(x.as_str()),
+                    };
+                    o.insert(c.name.clone(), j);
+                }
+                writeln!(w, "{}", serde_json::Value::Object(o)).unwrap();
+            }
+        }
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("ingest") {
+        ingest::run(&args[2..]);
+        return;
+    }
     if args.get(1).map(String::as_str) != Some("build") {
-        eprintln!("usage: pagedb-builder build --projects N [--issues 10000] [--comments 5.0] [--feed 500000] --out DIR");
+        eprintln!("usage: pagedb-builder build --projects N [--issues 10000] [--comments 5.0] [--feed 500000] --out DIR\n       pagedb-builder ingest --schema schema.json --input table=rows.ndjson … --out DIR");
         std::process::exit(2);
     }
     let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
@@ -124,7 +95,7 @@ fn main() {
     let started = Instant::now();
     let mut sink = PartSink::new(&out);
     let mut built: Vec<Built> = Vec::new();
-    let ix = |name: &str| catalog::index_named(name).unwrap();
+    let ix = |name: &str| tracker().index_named(name).unwrap();
     let emit_row = |ix_: &catalog::Index, row: &[Value], f: &mut dyn FnMut(&[u8], &[u8])| {
         for (k, v) in index_entries(ix_, row) {
             f(&k, &v);
@@ -132,7 +103,7 @@ fn main() {
     };
 
     // 3: issue_by_id — ids sort by (project, seq).
-    built.push(build_tree(&mut sink, 3, &mut |f| {
+    built.push(build_tree(&mut sink, 3, &tracker().index(3).name, &mut |f| {
         for p in 0..cfg.projects {
             for s in 0..gen::issue_count(&cfg, p) {
                 emit_row(ix("issue_by_id"), &gen::issue(&cfg, p, s).row, f);
@@ -140,7 +111,7 @@ fn main() {
         }
     }));
     // 4: (projectId, createdAt desc, id) — newest first within each project.
-    built.push(build_tree(&mut sink, 4, &mut |f| {
+    built.push(build_tree(&mut sink, 4, &tracker().index(4).name, &mut |f| {
         for p in 0..cfg.projects {
             for s in (0..gen::issue_count(&cfg, p)).rev() {
                 emit_row(ix("issue_by_project_created"), &gen::issue(&cfg, p, s).row, f);
@@ -154,7 +125,7 @@ fn main() {
     let vocab = gen::tag_vocab();
     let mut tag_files: Vec<BufWriter<File>> =
         vocab.iter().map(|t| BufWriter::with_capacity(1 << 20, File::create(tag_dir.join(t)).unwrap())).collect();
-    built.push(build_tree(&mut sink, 5, &mut |f| {
+    built.push(build_tree(&mut sink, 5, &tracker().index(5).name, &mut |f| {
         let by_status = ix("issue_by_project_status_created");
         let by_tag = ix("issue_by_tag");
         for p in 0..cfg.projects {
@@ -186,7 +157,7 @@ fn main() {
         w.flush().unwrap();
     }
     drop(tag_files);
-    built.push(build_tree(&mut sink, 6, &mut |f| {
+    built.push(build_tree(&mut sink, 6, &tracker().index(6).name, &mut |f| {
         for t in &vocab {
             let mut r = BufReader::with_capacity(1 << 20, File::open(tag_dir.join(t)).unwrap());
             let mut len = [0u8; 4];
@@ -204,7 +175,7 @@ fn main() {
     // 7: comment_by_issue, and 9: comment_by_id share the (project, issue, j) order.
     // Feed candidates are collected on the way (newest feed_base comments by createdAt).
     let mut feed: BinaryHeap<std::cmp::Reverse<(u64, u32, u32, u32)>> = BinaryHeap::new();
-    built.push(build_tree(&mut sink, 7, &mut |f| {
+    built.push(build_tree(&mut sink, 7, &tracker().index(7).name, &mut |f| {
         let by_issue = ix("comment_by_issue");
         for p in 0..cfg.projects {
             for s in 0..gen::issue_count(&cfg, p) {
@@ -225,7 +196,7 @@ fn main() {
     }));
     // 8: comment_by_created (newest first), from the heap.
     let mut newest: Vec<(u64, u32, u32, u32)> = feed.into_iter().map(|r| r.0).collect();
-    built.push(build_tree(&mut sink, 8, &mut |f| {
+    built.push(build_tree(&mut sink, 8, &tracker().index(8).name, &mut |f| {
         let by_created = ix("comment_by_created");
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = newest
             .drain(..)
@@ -239,7 +210,7 @@ fn main() {
             f(k, v);
         }
     }));
-    built.push(build_tree(&mut sink, 9, &mut |f| {
+    built.push(build_tree(&mut sink, 9, &tracker().index(9).name, &mut |f| {
         let by_id = ix("comment_by_id");
         for p in 0..cfg.projects {
             for s in 0..gen::issue_count(&cfg, p) {
@@ -255,12 +226,12 @@ fn main() {
     // (branch) pages of every tree. Contiguous, so it costs one or two ranged GETs.
     let pinned_from = sink.next;
     // 1, 2: small tables.
-    built.push(build_tree(&mut sink, 1, &mut |f| {
+    built.push(build_tree(&mut sink, 1, &tracker().index(1).name, &mut |f| {
         for p in 0..cfg.projects {
             emit_row(ix("project_by_id"), &gen::project_row(&cfg, p), f);
         }
     }));
-    built.push(build_tree(&mut sink, 2, &mut |f| {
+    built.push(build_tree(&mut sink, 2, &tracker().index(2).name, &mut |f| {
         for u in 0..cfg.users {
             emit_row(ix("user_by_id"), &gen::user_row(&cfg, u), f);
         }
@@ -296,7 +267,7 @@ fn main() {
     let parts = crcs.len();
     let crc_list: Vec<String> = crcs.iter().map(|c| c.to_string()).collect();
     let manifest = format!(
-        r#"{{"version":1,"pageSize":{PAGE_SIZE},"pagesPerPart":{PAGES_PER_PART},"pages":{pages},"pinnedFrom":{pinned_from},"parts":{parts},"bytes":{},"issues":{issues},"gen":{{"seed":{},"projects":{},"issuesPerProject":{},"users":{},"commentsPerIssue":{},"feedBase":{}}},"tables":{{"project":1,"user":2,"issue":3,"comment":9}},"trees":[{trees}],"partCrcs":[{}]}}"#,
+        r#"{{"version":1,"pageSize":{PAGE_SIZE},"pagesPerPart":{PAGES_PER_PART},"pages":{pages},"pinnedFrom":{pinned_from},"parts":{parts},"bytes":{},"issues":{issues},"gen":{{"seed":{},"projects":{},"issuesPerProject":{},"users":{},"commentsPerIssue":{},"feedBase":{}}},"tables":{{"project":1,"user":2,"issue":3,"comment":9}},"schema":{},"trees":[{trees}],"partCrcs":[{}]}}"#,
         pages * PAGE_SIZE as u64,
         cfg.seed,
         cfg.projects,
@@ -304,10 +275,10 @@ fn main() {
         cfg.users,
         cfg.comments_per_issue,
         cfg.feed_base,
+        tracker().json,
         crc_list.join(",")
     );
     fs::write(out.join("manifest.json"), manifest).unwrap();
-    let _ = Table::Issue;
     eprintln!(
         "{} issues, {} pages, {} parts, {:.2} GB in {:.1}s",
         issues,
