@@ -11,7 +11,7 @@
 use crate::catalog::{self, index_entries, Table};
 use crate::codec::{RowRef, Value};
 use crate::merged;
-use crate::query::{execute, prefix_key, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
+use crate::query::{execute, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
 use crate::tree::{Ctx, Miss, Range};
 use crate::write::RowChange;
 use std::rc::Rc;
@@ -68,7 +68,7 @@ fn key_in(plan: &Plan, row: &[Value]) -> Option<Vec<u8>> {
             let pos = ix.key.iter().position(|(c, _)| Some(*c) == ix.multi).unwrap();
             vals[pos].as_str().unwrap_or_default().to_string()
         });
-        if row_in_partition(plan, r, elem.as_deref()) {
+        if row_in_partition(plan, r, elem.as_deref()) && plan.in_range(&k) {
             return Some(k);
         }
     }
@@ -140,8 +140,7 @@ pub fn compute(ctx: &Ctx, roots: &Roots, part: &Partition, changes: &[RowChange]
             // Refill a window that lost rows.
             if w.len() < plan.limit && !complete {
                 let root = roots.get(plan.index.tree);
-                let lo_prefix = prefix_key(plan.index, &plan.prefix);
-                let hi_prefix = if lo_prefix.is_empty() { Vec::new() } else { crate::codec::prefix_end(&lo_prefix) };
+                let (lo_prefix, hi_prefix) = plan.scan_range();
                 // Continue strictly after the last key in scan order.
                 let (lo, hi) = match (w.last(), plan.reverse) {
                     (None, _) => (lo_prefix.clone(), hi_prefix.clone()),

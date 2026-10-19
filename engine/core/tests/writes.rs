@@ -208,8 +208,18 @@ fn writes_and_live_queries_stay_consistent() {
         comments: rows.comments.iter().map(|r| (r[0].as_str().unwrap().to_string(), r.clone())).collect(),
     };
     let mut overlay = Overlay::default();
+    // Infinite-scroll pages over p0000: (10th, 30th] bounded, and an open "next 15" after the 30th.
+    let mut asts = queries();
+    {
+        let newest = model.list("p0000", |_| true, 40);
+        let key = |id: &str| { let r = &model.issues[id]; json!({"createdAt": r[issue::CREATED].as_num().unwrap(), "id": id}) };
+        let order = json!([["createdAt","desc"],["id","asc"]]);
+        asts.push(json!({"table":"issue","where":eq("projectId", json!("p0000")),"orderBy":order,"limit":1000,
+            "start":{"row":key(&newest[9])},"end":{"row":key(&newest[29])}}));
+        asts.push(json!({"table":"issue","where":eq("projectId", json!("p0000")),"orderBy":order,"limit":15,"start":{"row":key(&newest[29])}}));
+    }
     // Hydrate partitions (and a client model per partition).
-    let plans: Vec<Rc<Plan>> = queries().iter().map(|q| Rc::new(compile(q).unwrap())).collect();
+    let plans: Vec<Rc<Plan>> = asts.iter().map(|q| Rc::new(compile(q).unwrap())).collect();
     let mut parts: Vec<Partition> = Vec::new();
     let mut clients: Vec<BTreeMap<String, String>> = Vec::new();
     let mut client_counts: Vec<u64> = Vec::new();
@@ -297,11 +307,11 @@ fn writes_and_live_queries_stay_consistent() {
         store.resident.borrow_mut().extend(0..db.pages.len() as PageId);
         let ctx = Ctx::with_view(&store, &view);
         for (i, part) in parts.iter().enumerate() {
-            assert!(ivm::window_matches_fresh(&ctx, &db.roots, &part.plan, &part.state).unwrap(), "step {step}: partition {i} window drifted\n{}", queries()[i]);
+            assert!(ivm::window_matches_fresh(&ctx, &db.roots, &part.plan, &part.state).unwrap(), "step {step}: partition {i} window drifted\n{}", asts[i]);
             match execute(&ctx, &db.roots, &part.plan).unwrap() {
                 Output::Rows { hits, .. } => {
                     let fresh: BTreeMap<String, String> = hits.into_iter().map(|h| (h.pk, h.json)).collect();
-                    assert_eq!(clients[i], fresh, "step {step}: client of partition {i} drifted\n{}", queries()[i]);
+                    assert_eq!(clients[i], fresh, "step {step}: client of partition {i} drifted\n{}", asts[i]);
                 }
                 Output::Count(n) => assert_eq!(client_counts[i], n, "step {step}: count {i}"),
             }

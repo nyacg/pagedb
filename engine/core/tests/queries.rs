@@ -171,3 +171,58 @@ fn refuses_unindexed_queries() {
     assert!(compile(&json!({"table":"issue","orderBy":[["title","asc"]]})).is_err());
     assert!(compile(&json!({"table":"comment","where":eq("authorId", json!("u00001")),"orderBy":[["body","asc"]]})).is_err());
 }
+
+#[test]
+fn keyset_pages_cover_the_list_exactly() {
+    let (db, rows) = setup();
+    let p = "p0002";
+    for (order, filter, expected) in [
+        (json!([["createdAt","desc"],["id","asc"]]), None, oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p, usize::MAX)),
+        (json!([["createdAt","asc"],["id","desc"]]), None, {
+            let mut v = oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p, usize::MAX);
+            v.reverse();
+            v
+        }),
+        (json!([["createdAt","desc"],["id","asc"]]), Some(cond("ILIKE","title",json!("%sync%"))), oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p && s(&r[issue::TITLE]).to_lowercase().contains("sync"), usize::MAX)),
+        (json!([["createdAt","desc"],["id","asc"]]), Some(cond("HAS","tags",json!("api"))), oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p && s(&r[issue::TAGS]).contains("\"api\""), usize::MAX)),
+    ] {
+        let mut got: Vec<String> = Vec::new();
+        let mut start: Option<J> = None;
+        loop {
+            let mut conds = vec![eq("projectId", json!(p))];
+            if let Some(f) = &filter {
+                conds.push(f.clone());
+            }
+            let mut ast = json!({"table":"issue","where":{"type":"and","conditions":conds},"orderBy":order,"limit":37});
+            if let Some(st) = &start {
+                ast["start"] = json!({"row": st});
+            }
+            let (out, _, _) = run(&db, &ast);
+            let Output::Rows { hits, complete } = out else { panic!() };
+            for h in &hits {
+                got.push(h.pk.clone());
+            }
+            if complete || hits.is_empty() {
+                break;
+            }
+            // The next page starts after this page's last row (its createdAt + id).
+            let last: J = serde_json::from_str(&hits.last().unwrap().json).unwrap();
+            start = Some(json!({"createdAt": last["createdAt"], "id": last["id"]}));
+        }
+        assert_eq!(got.len(), expected.len(), "order {order} filter {filter:?}");
+        assert_eq!(got, expected, "order {order} filter {filter:?}");
+        // A bounded page (start, end] returns exactly the rows between.
+        if expected.len() > 60 {
+            let row_of = |id: &str| rows.issues.iter().find(|r| s(&r[issue::ID]) == id).unwrap();
+            let (a, b) = (row_of(&expected[9]), row_of(&expected[49]));
+            let mut conds = vec![eq("projectId", json!(p))];
+            if let Some(f) = &filter {
+                conds.push(f.clone());
+            }
+            let ast = json!({"table":"issue","where":{"type":"and","conditions":conds},"orderBy":order,"limit":1000,
+                "start":{"row":{"createdAt": n(&a[issue::CREATED]), "id": s(&a[issue::ID])}},
+                "end":{"row":{"createdAt": n(&b[issue::CREATED]), "id": s(&b[issue::ID])}}});
+            assert_eq!(ids(&run(&db, &ast).0), expected[10..50].to_vec());
+        }
+    }
+}
