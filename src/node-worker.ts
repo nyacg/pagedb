@@ -114,6 +114,12 @@ export default {
       return obj ? new Response(obj.body) : new Response("not found", { status: 404 });
     }
     if (!url.pathname.startsWith("/api/")) return new Response("pagedb-node: /api/query, /api/socket, /api/write", { status: 404 });
-    return env.NODE.getByName(url.searchParams.get("node") ?? "node-1").fetch(req);
+    // Benchmarks only: every call is admin (raw ASTs and row ops), so every call needs the token.
+    const ok = !!env.NODE_TOKEN && (req.headers.get("authorization") === `Bearer ${env.NODE_TOKEN}` || url.searchParams.get("token") === env.NODE_TOKEN);
+    if (!ok) return new Response("unauthorized", { status: 401 });
+    const headers = new Headers(req.headers);
+    headers.set("x-pagedb-admin", "1");
+    url.searchParams.delete("token");
+    return env.NODE.getByName(url.searchParams.get("node") ?? "node-1").fetch(new Request(url, { method: req.method, headers, body: req.body }));
   },
 };

@@ -3,7 +3,7 @@ import { Sync, type Row } from "./sync";
 
 declare global {
   interface Window {
-    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any };
+    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any; leases?: any[] };
   }
 }
 
@@ -12,15 +12,7 @@ const STATUS_LABEL: Record<string, string> = { backlog: "Backlog", todo: "Todo",
 const PRIORITIES = ["urgent", "high", "medium", "low"];
 const PRI_LABEL: Record<string, string> = { urgent: "Urgent", high: "High", medium: "Medium", low: "Low" };
 
-// ---------------------------------------------------------------- queries (mirror src/app.ts)
-const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
-const cond = (op: string, c: string, v: unknown) => ({ type: "simple", op, left: { type: "column", name: c }, right: { type: "literal", value: v } });
-const ORDER = [["createdAt", "desc"], ["id", "asc"]];
-const CARD = [
-  { alias: "project", correlation: { parentField: ["projectId"], childField: ["id"] }, subquery: { table: "project" } },
-  { alias: "owner", correlation: { parentField: ["ownerId"], childField: ["id"] }, subquery: { table: "user" } },
-  { alias: "commentCount", correlation: { parentField: ["id"], childField: ["issueId"] }, subquery: { table: "comment", aggregate: "count" } },
-];
+// ---------------------------------------------------------------- queries (named; the Worker signs the AST)
 interface Filter {
   status: string[];
   priority: string[];
@@ -32,42 +24,17 @@ interface Filter {
 type Cursor = { createdAt: number; id: string };
 const PAGE = 50;
 
-function issuesQuery(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
-  const c: unknown[] = [eq("projectId", project)];
-  const st = status ? [status] : f.status;
-  if (st.length === 1) c.push(eq("status", st[0]));
-  else if (st.length) c.push(cond("IN", "status", st));
-  if (f.priority.length) c.push(cond("IN", "priority", f.priority));
-  if (f.owner) c.push(eq("ownerId", f.owner));
-  if (f.tag) c.push(cond("HAS", "tags", f.tag));
-  if (f.title) c.push(cond("ILIKE", "title", `%${f.title}%`));
-  const q: Record<string, unknown> = { table: "issue", where: c.length === 1 ? c[0] : { type: "and", conditions: c }, orderBy: ORDER, limit, related: CARD };
-  if (bounds.start) q.start = { row: bounds.start };
-  if (bounds.end) q.end = { row: bounds.end };
-  return q;
+/** What a list/board subscription asks the Worker to lease (src/app.ts builds the AST). */
+function issuesRef(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
+  const filter = {
+    status: f.status.length ? f.status : undefined,
+    priority: f.priority.length ? f.priority : undefined,
+    owner: f.owner,
+    tag: f.tag,
+    title: f.title,
+  };
+  return { name: "issues", args: { project, filter, limit, status, start: bounds.start, end: bounds.end } };
 }
-const countQuery = (project: string, status?: string) => ({
-  table: "issue",
-  where: status ? { type: "and", conditions: [eq("projectId", project), eq("status", status)] } : eq("projectId", project),
-  aggregate: "count",
-});
-const detailQuery = (id: string) => ({
-  table: "issue",
-  where: eq("id", id),
-  one: true,
-  related: [
-    ...CARD,
-    {
-      alias: "comments",
-      correlation: { parentField: ["id"], childField: ["issueId"] },
-      subquery: { table: "comment", orderBy: [["createdAt", "asc"], ["id", "asc"]], limit: 200, related: [{ alias: "author", correlation: { parentField: ["authorId"], childField: ["id"] }, subquery: { table: "user" } }] },
-    },
-  ],
-});
-const feedQuery = () => ({ table: "comment", orderBy: ORDER, limit: 30, related: [{ alias: "author", correlation: { parentField: ["authorId"], childField: ["id"] }, subquery: { table: "user" } }] });
-const projectsQuery = (s: string) => ({ table: "project", where: s ? cond("ILIKE", "name", `%${s}%`) : undefined, orderBy: [["id", "asc"]], limit: 60 });
-const usersQuery = (s: string) => ({ table: "user", where: s ? cond("ILIKE", "name", `%${s}%`) : undefined, orderBy: [["id", "asc"]], limit: 12 });
-const userQuery = (id: string) => ({ table: "user", where: eq("id", id), one: true });
 
 // ---------------------------------------------------------------- state
 const boot = window.__BOOT ?? { project: "p0003", db: "db1g", obj: "demo" };
@@ -88,7 +55,7 @@ if (!me || !/^u\d{5}$/.test(me)) {
   me = `u${String(Math.floor(Math.random() * 5000)).padStart(5, "0")}`;
   localStorage.setItem("pagedb.user", me);
 }
-const sync = new Sync(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/socket?db=${boot.db}&obj=${boot.obj}`);
+const sync = new Sync(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/socket`, boot.leases ?? []);
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const initials = (n?: string) => (n ?? "?").split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
@@ -125,37 +92,37 @@ function url() {
 // ---------------------------------------------------------------- subscriptions per view
 function subscribeView() {
   const keep = new Set(["me", "project", "count"]);
-  sync.sub("me", userQuery(me!));
-  sync.sub("project", { table: "project", where: eq("id", state.project), one: true });
-  sync.sub("count", countQuery(state.project), boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
+  sync.sub("me", { name: "user", args: { id: me } });
+  sync.sub("project", { name: "project", args: { id: state.project } });
+  sync.sub("count", { name: "count", args: { project: state.project } }, boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
   if (state.view === "list") {
     const seed = boot.project === state.project && boot.list && !hasFilter() ? { rows: boot.list.rows } : undefined;
     state.pages.forEach((pg, i) => {
       const last = i === state.pages.length - 1;
-      sync.sub(`list:${i}`, issuesQuery(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
+      sync.sub(`list:${i}`, issuesRef(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
       keep.add(`list:${i}`);
     });
   } else if (state.view === "board") {
     for (const st of STATUSES) {
       if (state.filter.status.length && !state.filter.status.includes(st)) continue;
-      sync.sub(`col:${st}`, issuesQuery(state.project, state.filter, 25, st));
-      sync.sub(`n:${st}`, countQuery(state.project, st));
+      sync.sub(`col:${st}`, issuesRef(state.project, state.filter, 25, st));
+      sync.sub(`n:${st}`, { name: "count", args: { project: state.project, status: st } });
       keep.add(`col:${st}`).add(`n:${st}`);
     }
   } else {
-    sync.sub("feed", feedQuery());
+    sync.sub("feed", { name: "feed" });
     keep.add("feed");
   }
   if (state.issue) {
-    sync.sub("detail", detailQuery(state.issue));
+    sync.sub("detail", { name: "detail", args: { id: state.issue } });
     keep.add("detail");
   }
   if (state.popover?.kind === "project") {
-    sync.sub("pick", projectsQuery(state.popover.search ?? ""));
+    sync.sub("pick", { name: "projects", args: { search: state.popover.search || undefined } });
     keep.add("pick");
   }
   if (state.popover?.kind === "owner" || state.popover?.kind === "filter-owner") {
-    sync.sub("pick", usersQuery(state.popover.search ?? ""));
+    sync.sub("pick", { name: "users", args: { search: state.popover.search || undefined } });
     keep.add("pick");
   }
   for (const s of sync.all()) if (!keep.has(s.id)) sync.unsub(s.id);
@@ -321,6 +288,7 @@ function hudView() {
   const pages = sync.all().filter((s) => s.id.startsWith("list:"));
   const subs = sync.all().filter((s) => !["me", "pick"].includes(s.id) && (!s.id.startsWith("list:") || s === pages[0] || s === pages.at(-1)));
   const label = (s: { id: string; q: any }) => {
+    if (!s.q) return s.id;
     const w = JSON.stringify(s.q.where ?? {});
     if (s.q.aggregate) return `count(${s.q.table})${w.includes("status") ? ` · ${s.id.replace("n:", "")}` : ""}`;
     if (s.id === "detail") return "issue + thread";

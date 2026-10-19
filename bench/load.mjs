@@ -4,6 +4,8 @@
 import WebSocket from "ws";
 const arg = (k, d) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : d; };
 const BASE = arg("base", "https://pagedb.do-pool-lab.workers.dev");
+const TOKEN = (await import("node:fs")).readFileSync(".env", "utf8").match(BASE.includes("pagedb-node") ? /NODE_TOKEN=(\S+)/ : /ADMIN_TOKEN=(\S+)/)[1];
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 const DB = arg("db", "db1g"), N = +arg("sockets", 200), RATE = +arg("rate", 5), SECS = +arg("secs", 30), P = arg("project", "p0003");
 const OBJ = arg("obj", `load-${Date.now().toString(36)}`);
 const NODE = arg("node", ""); // pagedb-node: which container
@@ -17,7 +19,7 @@ const sockets = [];
 const t0 = performance.now();
 for (let i = 0; i < N; i += 50) {
   await Promise.all(Array.from({ length: Math.min(50, N - i) }, () => new Promise((res, rej) => {
-    const ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=${DB}&obj=${OBJ}${nq}`, { perMessageDeflate: false });
+    const ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=${DB}&obj=${OBJ}${nq}&token=${TOKEN}`, { perMessageDeflate: false });
     ws.on("open", () => { ws.send(JSON.stringify({ t: "subs", list: [{ id: "l", q: LIST }, { id: "c", q: COUNT }] })); });
     ws.on("message", (d) => {
       const m = JSON.parse(String(d));
@@ -30,7 +32,7 @@ for (let i = 0; i < N; i += 50) {
 }
 console.log(`${N} sockets subscribed in ${Math.round(performance.now() - t0)} ms (object ${OBJ})`);
 // Issue ids in the window: newest 50 of the project.
-const snap = await (await fetch(`${BASE}/api/query${NODE ? `?node=${NODE}` : ""}`, { method: "POST", body: JSON.stringify({ db: DB, obj: OBJ, ast: LIST }) })).json();
+const snap = await (await fetch(`${BASE}/api/query${NODE ? `?node=${NODE}` : ""}`, { method: "POST", headers: AUTH, body: JSON.stringify({ db: DB, obj: OBJ, ast: LIST }) })).json();
 const ids = snap.result.rows.map((r) => r.id);
 const statuses = ["backlog", "todo", "in-progress", "review", "done"];
 const writeMs = [];
@@ -40,7 +42,7 @@ while (performance.now() < end) {
   const t = performance.now();
   const ops = { ops: [{ op: "update", table: "issue", id: ids[w % ids.length], set: { status: statuses[w % 5], updatedAt: Date.now() } }] };
   w++;
-  fetch(`${BASE}/api/write${NODE ? `?node=${NODE}` : ""}`, { method: "POST", body: JSON.stringify({ db: DB, obj: OBJ, ops }) }).then(async (r) => {
+  fetch(`${BASE}/api/write${NODE ? `?node=${NODE}` : ""}`, { method: "POST", headers: AUTH, body: JSON.stringify({ db: DB, obj: OBJ, ops }) }).then(async (r) => {
     const b = await r.json();
     writeMs.push(b.ms);
     sent.set(b.version, t);

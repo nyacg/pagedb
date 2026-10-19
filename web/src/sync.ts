@@ -16,8 +16,37 @@ export interface SubStats {
   bytes: number;
 }
 
+/** A named query: what the page asks for. The Worker turns it into a signed AST (a lease). */
+export interface QueryRef {
+  name: string;
+  args?: Record<string, unknown>;
+}
+
+interface Lease {
+  key: string;
+  token?: string;
+  exp?: number;
+  ast?: any;
+  error?: string;
+}
+
+/** Stable JSON (sorted keys), identical to src/lease.ts's canon(): the lease cache key. */
+export function canon(x: unknown): string {
+  if (Array.isArray(x)) return `[${x.map(canon).join(",")}]`;
+  if (x && typeof x === "object") {
+    return `{${Object.keys(x as object)
+      .filter((k) => (x as Record<string, unknown>)[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canon((x as Record<string, unknown>)[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(x);
+}
+
 export interface Sub {
   id: string;
+  ref: QueryRef;
+  /** The AST, once leased (for display). */
   q: any;
   key: string;
   rows: Map<string, Row>;
@@ -54,7 +83,10 @@ export class Sync {
   state: "connecting" | "live" | "offline" = "connecting";
   lastWrite?: { name: string; ms: number; serverMs: number };
 
-  constructor(private url: string) {
+  private leases = new Map<string, Lease>();
+
+  constructor(private url: string, seed: Lease[] = []) {
+    for (const l of seed) if (l.token) this.leases.set(l.key, l);
     this.connect();
     setInterval(() => this.gc(), 500);
   }
@@ -93,23 +125,51 @@ export class Sync {
   }
 
   private outbox: Sub[] = [];
-  /** Subscriptions made in the same tick go out as one message (one fault round server-side). */
+  /**
+   * Subscriptions made in the same tick go out as one message (one fault round server-side),
+   * each with its lease. Missing or nearly expired leases are fetched first, in one request.
+   */
   private send(s: Sub) {
     s.sentAt = performance.now();
     this.outbox.push(s);
-    if (this.outbox.length === 1)
-      queueMicrotask(() => {
-        const list = this.outbox.splice(0).filter((x) => this.subs.get(x.id) === x);
-        if (list.length && this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: "subs", list: list.map((x) => ({ id: x.id, q: x.q })) }));
-      });
+    if (this.outbox.length === 1) queueMicrotask(() => void this.flush());
   }
 
-  /** Subscribe (or re-point) `id` at query `q`. Returns the live subscription. */
-  sub(id: string, q: any, seed?: { rows?: Row[]; count?: number }): Sub {
-    const key = JSON.stringify(q);
+  private async flush() {
+    const list = this.outbox.splice(0).filter((x) => this.subs.get(x.id) === x);
+    if (!list.length) return;
+    const fresh = (k: string) => {
+      const l = this.leases.get(k);
+      return l?.token && (l.exp ?? 0) - Date.now() > 5000;
+    };
+    const missing = [...new Map(list.filter((x) => !fresh(x.key)).map((x) => [x.key, x.ref])).values()];
+    if (missing.length) {
+      try {
+        const res = await fetch("/api/lease", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ list: missing }) });
+        const body = (await res.json()) as { leases?: Lease[] };
+        for (const l of body.leases ?? []) this.leases.set(l.key, l);
+      } catch (e) {
+        console.warn("lease request failed", e);
+      }
+    }
+    const ready = list.filter((x) => this.subs.get(x.id) === x && this.leases.get(x.key)?.token);
+    for (const x of list) {
+      const l = this.leases.get(x.key);
+      if (l?.error) console.warn("query refused:", x.ref, l.error);
+      if (l?.ast) x.q = l.ast;
+    }
+    if (ready.length && this.ws?.readyState === WebSocket.OPEN)
+      this.ws.send(JSON.stringify({ t: "subs", list: ready.map((x) => ({ id: x.id, lease: this.leases.get(x.key)!.token })) }));
+    this.emit();
+  }
+
+  /** Subscribe (or re-point) `id` at a named query. Returns the live subscription. */
+  sub(id: string, ref: QueryRef, seed?: { rows?: Row[]; count?: number }): Sub {
+    const r: QueryRef = { name: ref.name, args: ref.args ?? {} };
+    const key = canon(r);
     const cur = this.subs.get(id);
     if (cur && cur.key === key) return cur;
-    const s: Sub = { id, q, key, rows: new Map(), ready: false, updates: 0, sentAt: performance.now() };
+    const s: Sub = { id, ref: r, q: this.leases.get(key)?.ast, key, rows: new Map(), ready: false, updates: 0, sentAt: performance.now() };
     if (seed?.rows) {
       for (const r of seed.rows) s.rows.set(r.id, r);
       s.ready = true;

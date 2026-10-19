@@ -8,12 +8,14 @@ import assert from "node:assert/strict";
 import WebSocket from "ws";
 
 const BASE = process.env.BASE ?? "https://pagedb.do-pool-lab.workers.dev";
+const TOKEN = (await import("node:fs")).readFileSync(".env", "utf8").match(/ADMIN_TOKEN=(\S+)/)![1];
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 const OBJ = `hib-${Date.now().toString(36)}`;
 const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const LIST = { table: "issue", where: eq("projectId", "p0004"), orderBy: [["createdAt", "desc"], ["id", "asc"]], limit: 5 };
 
 test("a woken object pushes correct updates to sockets opened before it slept", { timeout: 120_000 }, async () => {
-  const ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=db1g&obj=${OBJ}`);
+  const ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=db1g&obj=${OBJ}&token=${TOKEN}`);
   const msgs: any[] = [];
   ws.on("message", (d) => msgs.push(JSON.parse(String(d))));
   await new Promise((r) => ws.on("open", r));
@@ -30,6 +32,7 @@ test("a woken object pushes correct updates to sockets opened before it slept", 
   assert.equal(info.sockets, 1, "socket should have stayed open");
   const res = await fetch(`${BASE}/api/write`, {
     method: "POST",
+    headers: AUTH,
     body: JSON.stringify({ db: "db1g", obj: OBJ, ops: { ops: [{ op: "update", table: "issue", id: victim, set: { status: "review", title: "Edited after hibernation" } }] } }),
   });
   const w = (await res.json()) as { version: number; error?: string };

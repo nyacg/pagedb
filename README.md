@@ -56,6 +56,15 @@ Details: `bench/results/*.md`.
    - A write's row changes produce add, remove and edit ops (and refills) per window. These are
      computed purely, with a retry on any page fault, so a push never half-applies.
    - Then the overlay and every window commit, and each socket gets one message.
+6. **Signed queries.** A page can only subscribe to the app's named queries.
+   - `POST /api/lease {list: [{name, args}]}`: the Worker validates the arguments, builds the AST
+     (`src/app.ts`) and signs it: HMAC-SHA256 over `{ast, db, obj, exp}`, valid for 60 s
+     (`src/lease.ts`).
+   - The socket sends `{t: "subs", list: [{id, lease}]}`. The object checks the signature, the
+     expiry and that the lease names its database. It then runs the signed AST, never one a client wrote.
+   - The first view's leases are in the server-rendered HTML, so the socket needs no lease round trip.
+   - Raw ASTs (`/api/query`, raw socket subscriptions) and raw row ops (`/api/write`) need the admin token.
+     Benchmarks and tests use it. Visitors always reach the demo object.
 
 ## Layout
 
@@ -67,6 +76,7 @@ engine/wasm      the engine as WebAssembly (raw exports, synchronous host import
 engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container)
 src/do.ts        DbObject: tiers, fault rounds, sockets, overlay persistence, hibernation
 src/app.ts       the tracker's named queries and validated mutators
+src/lease.ts     signed queries: lease signing and verification
 src/worker.ts    edge Worker: SSR first paint, /api/socket, /api/mutate, admin, nightly reset
 src/node-*.ts    the same DbObject in workerd in a Container (pagedb-node)
 web/             the tracker UI (optimistic sync client) and the how-it-works page
@@ -82,7 +92,7 @@ cargo run --release -p pagedb-builder -- build --projects 27 --out ../data/db1g 
 cd .. && npm i && npm run deploy                        # wasm + web + Worker
 node scripts/upload.mjs data/db1g db1g                  # base → R2 (or the builder container for 100 GB)
 node bench/query.mjs db1g && node bench/load.mjs --sockets 200
-node --import tsx --test test/live.test.ts test/hibernate.test.ts
+node --import tsx --test test/live.test.ts test/hibernate.test.ts test/lease.test.ts   # need ADMIN_TOKEN in .env
 ```
 
 ## Limits

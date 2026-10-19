@@ -6,7 +6,8 @@
  *   GET  /api/admin/info?db&obj
  */
 import { DbObject, type Env } from "./do";
-import { issuesQuery, countQuery, mutate } from "./app";
+import { issuesQuery, countQuery, mutate, namedQuery } from "./app";
+import { canon, signLease } from "./lease";
 export { DbObject };
 
 /** The demo's database and object (all visitors share one object, like r2db's demo).
@@ -30,10 +31,31 @@ async function ssr(req: Request, env: Env, url: URL): Promise<Response> {
       const stub = env.DB.getByName(DEMO_OBJ) as unknown as { query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number }; stats: unknown }> };
       const [list, count] = await Promise.all([stub.query(DEMO_DB, issuesQuery(project)), stub.query(DEMO_DB, countQuery(project))]);
       boot = { ...boot, list: list.result, count: count.result.count, ms: Date.now() - t0, stats: list.stats };
+      // The first view's subscriptions arrive pre-signed, so the socket needs no lease round trip.
+      if (env.LEASE_SECRET) {
+        boot.leases = await Promise.all(
+          [
+            { name: "issues", args: { project, filter: {}, limit: 50 } },
+            { name: "count", args: { project } },
+            { name: "project", args: { id: project } },
+          ].map((d) => lease(env, d)),
+        );
+      }
     } catch {}
   }
   html = html.replace("<!--BOOT-->", `<script>window.__BOOT=${JSON.stringify(boot).replace(/</g, "\\u003c")}</script>`);
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+}
+
+async function lease(env: Env, d: { name: string; args?: Record<string, unknown> }) {
+  const key = canon({ name: d.name, args: d.args ?? {} });
+  try {
+    const ast = namedQuery(d.name, d.args ?? {});
+    const { token, exp } = await signLease(env.LEASE_SECRET!, { ast, db: DEMO_DB, obj: DEMO_OBJ });
+    return { key, token, exp, ast };
+  } catch (e) {
+    return { key, error: (e as Error).message };
+  }
 }
 
 export default {
@@ -42,6 +64,14 @@ export default {
     DEMO_DB = (env as Env & { DEMO_DB?: string }).DEMO_DB ?? DEMO_DB;
     DEMO_OBJ = (env as Env & { DEMO_OBJ?: string }).DEMO_OBJ ?? DEMO_OBJ;
     try {
+      if (url.pathname === "/api/lease" && req.method === "POST") {
+        if (!env.LEASE_SECRET) return Response.json({ error: "leases are not configured" }, { status: 500 });
+        const { list } = (await req.json()) as { list: { name: string; args?: Record<string, unknown> }[] };
+        if (!Array.isArray(list) || list.length > 64) return Response.json({ error: "1 to 64 queries per request" }, { status: 400 });
+        return Response.json({ leases: await Promise.all(list.map((d) => lease(env, d))) });
+      }
+      // Raw queries and writes: admin only (pages use leases and named mutators).
+      if ((url.pathname === "/api/query" || url.pathname === "/api/write") && !admin(req, env)) return new Response("unauthorized", { status: 401 });
       if (url.pathname === "/api/query" && req.method === "POST") {
         const { db, ast, obj, salt } = (await req.json()) as { db: string; ast: unknown; obj?: string; salt?: string };
         return Response.json(await env.DB.getByName(obj ?? db).query(db, ast, { salt }));
@@ -60,8 +90,18 @@ export default {
       }
       if (url.pathname === "/" || url.pathname === "/index.html") return ssr(req, env, url);
       if (url.pathname === "/api/socket") {
-        const db = url.searchParams.get("db") ?? "db1g";
-        return env.DB.getByName(url.searchParams.get("obj") ?? db).fetch(req);
+        // Only the Worker decides who is admin; anything a client sends in this header is dropped.
+        const isAdmin = admin(req, env) || (!!env.ADMIN_TOKEN && url.searchParams.get("token") === env.ADMIN_TOKEN);
+        const headers = new Headers(req.headers);
+        headers.delete("x-pagedb-admin");
+        if (isAdmin) headers.set("x-pagedb-admin", "1");
+        // Visitors always reach the demo database; admins may name any object (benchmarks).
+        const db = isAdmin ? (url.searchParams.get("db") ?? DEMO_DB) : DEMO_DB;
+        const obj = isAdmin ? (url.searchParams.get("obj") ?? db) : DEMO_OBJ;
+        const u = new URL(req.url);
+        u.searchParams.set("db", db);
+        u.searchParams.delete("token");
+        return env.DB.getByName(obj).fetch(new Request(u, { headers, method: req.method }));
       }
       if (url.pathname === "/api/write" && req.method === "POST") {
         // Raw row ops (the demo app's named mutators build these; see app.ts later).
