@@ -2,3 +2,7 @@
 pub mod codec;
 pub mod page;
 pub mod tree;
+pub mod catalog;
+pub mod gen;
+pub mod query;
+pub mod build;

@@ -1,87 +1,297 @@
-//! pagedb builder. For now: `bench-tree <out-dir> <rows>` writes a synthetic issue-like tree as
-//! pages (pages.bin) plus root.json, for the WASM microbenchmarks (spike S0c).
+//! pagedb builder: generates the issue-tracker dataset and writes the immutable base as 4 MiB
+//! parts of 64 KiB pages, plus manifest.json.
+//!
+//!   pagedb-builder build --projects 27 --out ../data/db1g
+//!
+//! Every tree is streamed in key order, so memory stays flat as the dataset grows:
+//! per-project trees are generated project by project; the multi-valued tag index goes through
+//! one temp file per tag (appending projects in order keeps each file sorted); the feed index
+//! keeps the newest `feed_base` comments with a heap.
 
-use pagedb_core::codec::{encode_key, encode_row, Value};
-use pagedb_core::tree::{PageSink, TreeBuilder};
-use std::fs::File;
-use std::io::{BufWriter, Write};
+use pagedb_core::catalog::{self, index_entries, Table};
+use pagedb_core::codec::Value;
+use pagedb_core::gen::{self, Config};
+use pagedb_core::page::{PageId, PAGES_PER_PART, PAGE_SIZE};
+use pagedb_core::tree::{PageSink, TreeBuilder, TreeRoot};
+use std::collections::BinaryHeap;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-struct FileSink {
-    out: BufWriter<File>,
-    next: u64,
+/// Writes pages into sequential part files of PAGES_PER_PART pages each.
+struct PartSink {
+    dir: PathBuf,
+    next: PageId,
+    part: Option<BufWriter<File>>,
+    crcs: Vec<u32>,
+    part_hasher: Vec<u8>, // small running digest input: page crcs of the current part
 }
 
-impl PageSink for FileSink {
-    fn write(&mut self, page: Vec<u8>) -> u64 {
-        self.out.write_all(&page).unwrap();
+impl PartSink {
+    fn new(dir: &Path) -> Self {
+        fs::create_dir_all(dir.join("parts")).unwrap();
+        Self { dir: dir.to_path_buf(), next: 0, part: None, crcs: Vec::new(), part_hasher: Vec::new() }
+    }
+
+    fn part_path(&self, n: u64) -> PathBuf {
+        self.dir.join("parts").join(format!("part-{n:06}"))
+    }
+
+    fn close_part(&mut self) {
+        if let Some(mut w) = self.part.take() {
+            w.flush().unwrap();
+            self.crcs.push(pagedb_core::page::crc32(&self.part_hasher));
+            self.part_hasher.clear();
+        }
+    }
+
+    fn finish(mut self) -> (u64, Vec<u32>) {
+        self.close_part();
+        (self.next, self.crcs)
+    }
+}
+
+impl PageSink for PartSink {
+    fn write(&mut self, page: Vec<u8>) -> PageId {
+        assert_eq!(page.len(), PAGE_SIZE);
+        let id = self.next;
+        if id % PAGES_PER_PART == 0 {
+            self.close_part();
+            self.part = Some(BufWriter::with_capacity(1 << 20, File::create(self.part_path(id / PAGES_PER_PART)).unwrap()));
+        }
+        self.part.as_mut().unwrap().write_all(&page).unwrap();
+        self.part_hasher.extend_from_slice(&page[8..12]); // the page's own crc
         self.next += 1;
-        self.next - 1
+        id
     }
 }
 
-const WORDS: &[&str] = &[
-    "sync", "cursor", "page", "fault", "query", "board", "issue", "latency", "object", "durable", "cache", "socket",
-    "render", "filter", "index", "merge", "replica", "lease", "overlay", "branch", "leaf", "tier", "edge", "worker",
-];
+struct Built {
+    root: TreeRoot,
+    name: &'static str,
+    first_page: PageId,
+    pages: u64,
+    secs: f64,
+}
 
-fn rng(seed: u64) -> impl FnMut() -> u64 {
-    let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
-    move || {
-        s = s.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
+fn build_tree(sink: &mut PartSink, tree: u16, entries: &mut dyn FnMut(&mut dyn FnMut(&[u8], &[u8]))) -> Built {
+    let t0 = Instant::now();
+    let first_page = sink.next;
+    let mut b = TreeBuilder::new(tree);
+    entries(&mut |k, v| b.push(sink, k, v));
+    let root = b.finish(sink);
+    Built { root, name: catalog::index(tree).name, first_page, pages: sink.next - first_page, secs: t0.elapsed().as_secs_f64() }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("bench-tree") => {
-            let dir = &args[2];
-            let n: usize = args[3].parse().unwrap();
-            std::fs::create_dir_all(dir).unwrap();
-            let mut sink = FileSink { out: BufWriter::new(File::create(format!("{dir}/pages.bin")).unwrap()), next: 0 };
-            let mut b = TreeBuilder::new(1);
-            let mut r = rng(42);
-            // issue_by_project_created: (projectId, createdAt desc, id) → full row
-            let projects = (n / 10_000).max(1);
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n);
-            for i in 0..n {
-                let p = format!("proj-{:06}", i % projects);
-                let created = 1.7e12 - (i as f64) * 61_000.0;
-                let id = format!("iss-{:08}", i);
-                let title: Vec<&str> = (0..6).map(|_| WORDS[(r() % WORDS.len() as u64) as usize]).collect();
-                let row = vec![
-                    Value::from(id.clone()),
-                    Value::from(p.clone()),
-                    Value::from(title.join(" ")),
-                    Value::from(["backlog", "todo", "in-progress", "review", "done"][(r() % 5) as usize]),
-                    Value::from(["urgent", "high", "medium", "low"][(r() % 4) as usize]),
-                    Value::from(format!("user-{:05}", r() % 5000)),
-                    Value::Num(created),
-                    Value::Num(created + 1000.0),
-                ];
-                let key = encode_key(&[Value::from(p), Value::Num(created), Value::from(id)], &[false, true, false]);
-                rows.push((key, encode_row(&row)));
-            }
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-            for (k, v) in &rows {
-                b.push(&mut sink, k, v);
-            }
-            let root = b.finish(&mut sink);
-            sink.out.flush().unwrap();
-            std::fs::write(
-                format!("{dir}/root.json"),
-                format!(
-                    r#"{{"root":{},"height":{},"rows":{},"pages":{},"projects":{}}}"#,
-                    root.root, root.height, root.rows, sink.next, projects
-                ),
-            )
-            .unwrap();
-            println!("{} rows → {} pages, height {}, root {}", root.rows, sink.next, root.height, root.root);
-        }
-        _ => eprintln!("usage: pagedb-builder bench-tree <out-dir> <rows>"),
+    if args.get(1).map(String::as_str) != Some("build") {
+        eprintln!("usage: pagedb-builder build --projects N [--issues 10000] [--comments 5.0] [--feed 500000] --out DIR");
+        std::process::exit(2);
     }
+    let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+    let mut cfg = Config::with_projects(arg("--projects").map(|v| v.parse().unwrap()).unwrap_or(27));
+    if let Some(v) = arg("--issues") {
+        cfg.issues_per_project = v.parse().unwrap();
+    }
+    if let Some(v) = arg("--comments") {
+        cfg.comments_per_issue = v.parse().unwrap();
+    }
+    if let Some(v) = arg("--feed") {
+        cfg.feed_base = v.parse().unwrap();
+    }
+    if let Some(v) = arg("--users") {
+        cfg.users = v.parse().unwrap();
+    }
+    let out = PathBuf::from(arg("--out").expect("--out DIR"));
+    if out.join("parts").exists() {
+        fs::remove_dir_all(out.join("parts")).unwrap();
+    }
+    let started = Instant::now();
+    let mut sink = PartSink::new(&out);
+    let mut built: Vec<Built> = Vec::new();
+    let ix = |name: &str| catalog::index_named(name).unwrap();
+    let emit_row = |ix_: &catalog::Index, row: &[Value], f: &mut dyn FnMut(&[u8], &[u8])| {
+        for (k, v) in index_entries(ix_, row) {
+            f(&k, &v);
+        }
+    };
+
+    // 1, 2: small tables.
+    built.push(build_tree(&mut sink, 1, &mut |f| {
+        for p in 0..cfg.projects {
+            emit_row(ix("project_by_id"), &gen::project_row(&cfg, p), f);
+        }
+    }));
+    built.push(build_tree(&mut sink, 2, &mut |f| {
+        for u in 0..cfg.users {
+            emit_row(ix("user_by_id"), &gen::user_row(&cfg, u), f);
+        }
+    }));
+    // 3: issue_by_id — ids sort by (project, seq).
+    built.push(build_tree(&mut sink, 3, &mut |f| {
+        for p in 0..cfg.projects {
+            for s in 0..gen::issue_count(&cfg, p) {
+                emit_row(ix("issue_by_id"), &gen::issue(&cfg, p, s).row, f);
+            }
+        }
+    }));
+    // 4: (projectId, createdAt desc, id) — newest first within each project.
+    built.push(build_tree(&mut sink, 4, &mut |f| {
+        for p in 0..cfg.projects {
+            for s in (0..gen::issue_count(&cfg, p)).rev() {
+                emit_row(ix("issue_by_project_created"), &gen::issue(&cfg, p, s).row, f);
+            }
+        }
+    }));
+    // 5: (projectId, status, createdAt desc, id) — sort one project at a time.
+    // 6 (tags) is fed from the same pass via per-tag temp files.
+    let tag_dir = out.join("tmp-tags");
+    fs::create_dir_all(&tag_dir).unwrap();
+    let vocab = gen::tag_vocab();
+    let mut tag_files: Vec<BufWriter<File>> =
+        vocab.iter().map(|t| BufWriter::with_capacity(1 << 20, File::create(tag_dir.join(t)).unwrap())).collect();
+    built.push(build_tree(&mut sink, 5, &mut |f| {
+        let by_status = ix("issue_by_project_status_created");
+        let by_tag = ix("issue_by_tag");
+        for p in 0..cfg.projects {
+            let n = gen::issue_count(&cfg, p);
+            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n as usize);
+            for s in (0..n).rev() {
+                let row = gen::issue(&cfg, p, s).row;
+                entries.extend(index_entries(by_status, &row));
+                // index_entries emits one entry per tag, in sorted, de-duplicated tag order.
+                let mut tags = catalog::parse_tags(&row[catalog::issue::TAGS]);
+                tags.sort();
+                tags.dedup();
+                for ((k, v), t) in index_entries(by_tag, &row).into_iter().zip(tags) {
+                    let i = vocab.binary_search(&t).unwrap();
+                    let w = &mut tag_files[i];
+                    w.write_all(&(k.len() as u32).to_le_bytes()).unwrap();
+                    w.write_all(&k).unwrap();
+                    w.write_all(&(v.len() as u32).to_le_bytes()).unwrap();
+                    w.write_all(&v).unwrap();
+                }
+            }
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for (k, v) in &entries {
+                f(k, v);
+            }
+        }
+    }));
+    for w in &mut tag_files {
+        w.flush().unwrap();
+    }
+    drop(tag_files);
+    built.push(build_tree(&mut sink, 6, &mut |f| {
+        for t in &vocab {
+            let mut r = BufReader::with_capacity(1 << 20, File::open(tag_dir.join(t)).unwrap());
+            let mut len = [0u8; 4];
+            while r.read_exact(&mut len).is_ok() {
+                let mut k = vec![0u8; u32::from_le_bytes(len) as usize];
+                r.read_exact(&mut k).unwrap();
+                r.read_exact(&mut len).unwrap();
+                let mut v = vec![0u8; u32::from_le_bytes(len) as usize];
+                r.read_exact(&mut v).unwrap();
+                f(&k, &v);
+            }
+        }
+    }));
+    fs::remove_dir_all(&tag_dir).unwrap();
+    // 7: comment_by_issue, and 9: comment_by_id share the (project, issue, j) order.
+    // Feed candidates are collected on the way (newest feed_base comments by createdAt).
+    let mut feed: BinaryHeap<std::cmp::Reverse<(u64, u32, u32, u32)>> = BinaryHeap::new();
+    built.push(build_tree(&mut sink, 7, &mut |f| {
+        let by_issue = ix("comment_by_issue");
+        for p in 0..cfg.projects {
+            for s in 0..gen::issue_count(&cfg, p) {
+                let is = gen::issue(&cfg, p, s);
+                for j in 0..is.comments {
+                    let c = gen::comment(&cfg, p, s, j, &is.row);
+                    let t = c[catalog::comment::CREATED].as_num().unwrap() as u64;
+                    if feed.len() < cfg.feed_base {
+                        feed.push(std::cmp::Reverse((t, p, s, j)));
+                    } else if feed.peek().map(|m| m.0 .0 < t).unwrap_or(false) {
+                        feed.pop();
+                        feed.push(std::cmp::Reverse((t, p, s, j)));
+                    }
+                    emit_row(by_issue, &c, f);
+                }
+            }
+        }
+    }));
+    // 8: comment_by_created (newest first), from the heap.
+    let mut newest: Vec<(u64, u32, u32, u32)> = feed.into_iter().map(|r| r.0).collect();
+    built.push(build_tree(&mut sink, 8, &mut |f| {
+        let by_created = ix("comment_by_created");
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = newest
+            .drain(..)
+            .map(|(_, p, s, j)| {
+                let is = gen::issue(&cfg, p, s);
+                index_entries(by_created, &gen::comment(&cfg, p, s, j, &is.row)).pop().unwrap()
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (k, v) in &entries {
+            f(k, v);
+        }
+    }));
+    built.push(build_tree(&mut sink, 9, &mut |f| {
+        let by_id = ix("comment_by_id");
+        for p in 0..cfg.projects {
+            for s in 0..gen::issue_count(&cfg, p) {
+                let is = gen::issue(&cfg, p, s);
+                for j in 0..is.comments {
+                    emit_row(by_id, &gen::comment(&cfg, p, s, j, &is.row), f);
+                }
+            }
+        }
+    }));
+
+    let (pages, crcs) = sink.finish();
+    let issues: u64 = (0..cfg.projects).map(|p| gen::issue_count(&cfg, p) as u64).sum();
+    let mut trees = String::new();
+    for (i, b) in built.iter().enumerate() {
+        if i > 0 {
+            trees.push(',');
+        }
+        trees.push_str(&format!(
+            r#"{{"tree":{},"name":"{}","root":{},"height":{},"rows":{},"firstPage":{},"pages":{},"leafPages":{}}}"#,
+            b.root.tree, b.name, b.root.root, b.root.height, b.root.rows, b.first_page, b.pages, b.root.leaves
+        ));
+        eprintln!(
+            "{:>2} {:<32} rows {:>11}  pages {:>8} ({:>8.1} MB)  height {}  {:>6.1}s",
+            b.root.tree,
+            b.name,
+            b.root.rows,
+            b.pages,
+            b.pages as f64 * PAGE_SIZE as f64 / 1e6,
+            b.root.height,
+            b.secs
+        );
+    }
+    let parts = crcs.len();
+    let crc_list: Vec<String> = crcs.iter().map(|c| c.to_string()).collect();
+    let manifest = format!(
+        r#"{{"version":1,"pageSize":{PAGE_SIZE},"pagesPerPart":{PAGES_PER_PART},"pages":{pages},"parts":{parts},"bytes":{},"issues":{issues},"gen":{{"seed":{},"projects":{},"issuesPerProject":{},"users":{},"commentsPerIssue":{},"feedBase":{}}},"tables":{{"project":1,"user":2,"issue":3,"comment":9}},"trees":[{trees}],"partCrcs":[{}]}}"#,
+        pages * PAGE_SIZE as u64,
+        cfg.seed,
+        cfg.projects,
+        cfg.issues_per_project,
+        cfg.users,
+        cfg.comments_per_issue,
+        cfg.feed_base,
+        crc_list.join(",")
+    );
+    fs::write(out.join("manifest.json"), manifest).unwrap();
+    let _ = Table::Issue;
+    eprintln!(
+        "{} issues, {} pages, {} parts, {:.2} GB in {:.1}s",
+        issues,
+        pages,
+        parts,
+        pages as f64 * PAGE_SIZE as f64 / 1e9,
+        started.elapsed().as_secs_f64()
+    );
 }

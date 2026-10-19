@@ -162,7 +162,7 @@ unsafe fn slice<'a>(ptr: *const u8, len: u32) -> &'a [u8] {
 }
 
 fn root_of(root_lo: u32, root_hi: u32, height: u32, rows: f64) -> TreeRoot {
-    TreeRoot { tree: 0, root: (root_hi as u64) << 32 | root_lo as u64, height: height as u8, rows: rows as u64 }
+    TreeRoot { tree: 0, leaves: 0, root: (root_hi as u64) << 32 | root_lo as u64, height: height as u8, rows: rows as u64 }
 }
 
 /// Point lookup; OK payload = the value bytes (empty if absent).

@@ -1,0 +1,478 @@
+//! Queries: a Zero-shaped AST compiled to an index plan, executed against the page store.
+//!
+//! ```json
+//! {"table":"issue",
+//!  "where":{"type":"and","conditions":[
+//!     {"type":"simple","op":"=","left":{"type":"column","name":"projectId"},"right":{"type":"literal","value":"p0007"}},
+//!     {"type":"simple","op":"IN","left":{"type":"column","name":"status"},"right":{"type":"literal","value":["todo","review"]}}]},
+//!  "orderBy":[["createdAt","desc"],["id","asc"]], "limit":50,
+//!  "related":[{"alias":"owner","correlation":{"parentField":["ownerId"],"childField":["id"]},"subquery":{"table":"user"}}]}
+//! ```
+//! Operators: `=`, `IN`, `ILIKE` (substring, `%v%`), `HAS` (tag membership). `aggregate:"count"`
+//! at the top level counts; on a related comment subquery it reads the maintained
+//! `commentCount` column. Equalities on an index's leading columns become the scan prefix
+//! (the query family's parameters); the remaining key columns must give the requested order.
+//! Anything without a supporting index is refused, so no query can scan the whole database.
+
+use crate::catalog::{self, Index, IndexValue, Table};
+use crate::codec::{encode_key_part, json_cell, json_str, prefix_end, Cell, RowRef, Value};
+use crate::tree::{self, Ctx, Miss, Range, TreeRoot};
+use serde_json::Value as J;
+use std::collections::HashMap;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Filter {
+    Eq(usize, Value),
+    In(usize, Vec<Value>),
+    /// Lowercased needle; matches if the column contains it, case-insensitively.
+    ILike(usize, String),
+    HasTag(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum RelKind {
+    /// Child row whose primary key = parent[col].
+    One { table: Table, parent_col: usize },
+    /// Child rows of `plan` whose first key column = parent[col].
+    Many { plan: Box<Plan>, parent_col: usize },
+    /// A maintained count column on the parent.
+    CountColumn(usize),
+}
+
+#[derive(Clone, Debug)]
+pub struct Related {
+    pub alias: String,
+    pub kind: RelKind,
+}
+
+#[derive(Clone, Debug)]
+pub struct Plan {
+    pub table: Table,
+    pub index: &'static Index,
+    /// Values of the index's leading key columns (the family parameters).
+    pub prefix: Vec<Value>,
+    pub reverse: bool,
+    pub filters: Vec<Filter>,
+    pub limit: usize,
+    pub one: bool,
+    pub count: bool,
+    pub related: Vec<Related>,
+}
+
+pub const MAX_LIMIT: usize = 1000;
+/// Rows a filtered scan may examine in one go (≈ one project).
+pub const SCAN_BUDGET: usize = 20_000;
+
+// ------------------------------------------------------------------ compile
+
+fn col_name(e: &J) -> Option<&str> {
+    if e.get("type")?.as_str()? == "column" {
+        e.get("name")?.as_str()
+    } else {
+        None
+    }
+}
+
+fn literal(e: &J) -> Option<&J> {
+    if e.get("type")?.as_str()? == "literal" {
+        e.get("value")
+    } else {
+        None
+    }
+}
+
+pub fn json_to_value(v: &J) -> Value {
+    match v {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => Value::Num(n.as_f64().unwrap_or(0.0)),
+        J::String(s) => Value::Str(s.clone()),
+        other => Value::Str(other.to_string()),
+    }
+}
+
+fn flatten<'a>(w: &'a J, out: &mut Vec<&'a J>) -> Result<(), String> {
+    match w.get("type").and_then(J::as_str) {
+        Some("and") => {
+            for c in w.get("conditions").and_then(J::as_array).ok_or("and without conditions")? {
+                flatten(c, out)?;
+            }
+            Ok(())
+        }
+        Some("simple") => {
+            out.push(w);
+            Ok(())
+        }
+        Some(t) => Err(format!("unsupported condition type {t}")),
+        None => Err("condition without type".into()),
+    }
+}
+
+pub fn compile(ast: &J) -> Result<Plan, String> {
+    let table = Table::from_name(ast.get("table").and_then(J::as_str).ok_or("missing table")?).ok_or("unknown table")?;
+    let col = |name: &str| table.col(name).ok_or_else(|| format!("unknown column {}.{name}", table.name()));
+
+    // Conditions.
+    let mut conds = Vec::new();
+    if let Some(w) = ast.get("where") {
+        flatten(w, &mut conds)?;
+    }
+    let mut eqs: Vec<(usize, Value)> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut filters: Vec<Filter> = Vec::new();
+    for c in conds {
+        let op = c.get("op").and_then(J::as_str).ok_or("condition without op")?;
+        let name = col_name(c.get("left").ok_or("no left")?).ok_or("left must be a column")?;
+        let lit = literal(c.get("right").ok_or("no right")?).ok_or("right must be a literal")?;
+        let ci = col(name)?;
+        match op {
+            "=" => eqs.push((ci, json_to_value(lit))),
+            "IN" => filters.push(Filter::In(ci, lit.as_array().ok_or("IN needs an array")?.iter().map(json_to_value).collect())),
+            "ILIKE" => {
+                let s = lit.as_str().ok_or("ILIKE needs a string")?;
+                filters.push(Filter::ILike(ci, s.trim_matches('%').to_lowercase()));
+            }
+            "HAS" => {
+                if table != Table::Issue || ci != catalog::issue::TAGS {
+                    return Err("HAS is only supported on issue.tags".into());
+                }
+                tags.push(lit.as_str().ok_or("HAS needs a string")?.to_string());
+            }
+            other => return Err(format!("unsupported operator {other}")),
+        }
+    }
+
+    // Requested order (default: primary key ascending).
+    let mut order: Vec<(usize, bool)> = Vec::new();
+    if let Some(ob) = ast.get("orderBy").and_then(J::as_array) {
+        for o in ob {
+            let pair = o.as_array().ok_or("orderBy entries are [column, dir]")?;
+            let c = col(pair.first().and_then(J::as_str).ok_or("orderBy column")?)?;
+            let desc = pair.get(1).and_then(J::as_str) == Some("desc");
+            order.push((c, desc));
+        }
+    }
+
+    // Index choice: most equality columns as prefix, then the rest must give `order`.
+    let mut best: Option<(usize, &'static Index, bool)> = None;
+    for ix in catalog::indexes_of(table) {
+        if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) {
+            continue;
+        }
+        let mut p = 0;
+        for &(c, _) in ix.key {
+            let usable = if Some(c) == ix.multi { !tags.is_empty() } else { eqs.iter().any(|(e, _)| *e == c) };
+            if !usable {
+                break;
+            }
+            p += 1;
+        }
+        if ix.multi.is_some() && p == 0 {
+            continue; // a multi-valued index is only usable with its element fixed
+        }
+        let rest = &ix.key[p..];
+        let order_rest: Vec<(usize, bool)> = order.iter().copied().filter(|(c, _)| !eqs.iter().any(|(e, _)| e == c)).collect();
+        if order_rest.len() > rest.len() {
+            continue;
+        }
+        let mut reverse = None;
+        let mut ok = true;
+        for (i, &(c, d)) in order_rest.iter().enumerate() {
+            if rest[i].0 != c {
+                ok = false;
+                break;
+            }
+            let flip = rest[i].1 != d;
+            match reverse {
+                None => reverse = Some(flip),
+                Some(r) if r != flip => ok = false,
+                _ => {}
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bp, bix, _)) => p > bp || (p == bp && ix.key.len() < bix.key.len()),
+        };
+        if better {
+            best = Some((p, ix, reverse.unwrap_or(false)));
+        }
+    }
+    let (p, index, reverse) = best.ok_or_else(|| format!("no index on {} supports this filter and order", table.name()))?;
+
+    let mut prefix = Vec::with_capacity(p);
+    let mut used_tag = false;
+    for &(c, _) in &index.key[..p] {
+        if Some(c) == index.multi {
+            prefix.push(Value::Str(tags[0].clone()));
+            used_tag = true;
+        } else {
+            let (_, v) = eqs.iter().find(|(e, _)| *e == c).unwrap();
+            prefix.push(v.clone());
+        }
+    }
+    for (c, v) in &eqs {
+        if !index.key[..p].iter().any(|(k, _)| k == c) {
+            filters.push(Filter::Eq(*c, v.clone()));
+        }
+    }
+    for (i, t) in tags.iter().enumerate() {
+        if !(used_tag && i == 0) {
+            filters.push(Filter::HasTag(t.clone()));
+        }
+    }
+
+    let one = ast.get("one").and_then(J::as_bool).unwrap_or(false);
+    let limit = if one { 1 } else { ast.get("limit").and_then(J::as_u64).unwrap_or(100).min(MAX_LIMIT as u64) as usize };
+    let count = ast.get("aggregate").and_then(J::as_str) == Some("count");
+
+    let mut related = Vec::new();
+    for r in ast.get("related").and_then(J::as_array).map(|v| v.as_slice()).unwrap_or(&[]) {
+        related.push(compile_related(table, r)?);
+    }
+    Ok(Plan { table, index, prefix, reverse, filters, limit, one, count, related })
+}
+
+fn compile_related(parent: Table, r: &J) -> Result<Related, String> {
+    let alias = r.get("alias").or_else(|| r.get("subquery").and_then(|s| s.get("alias"))).and_then(J::as_str).ok_or("related needs an alias")?.to_string();
+    let corr = r.get("correlation").ok_or("related needs a correlation")?;
+    let pf = corr.get("parentField").and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str).ok_or("parentField")?;
+    let cf = corr.get("childField").and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str).ok_or("childField")?;
+    let sub = r.get("subquery").ok_or("related needs a subquery")?;
+    let child = Table::from_name(sub.get("table").and_then(J::as_str).ok_or("subquery table")?).ok_or("unknown subquery table")?;
+    let parent_col = parent.col(pf).ok_or_else(|| format!("unknown column {}.{pf}", parent.name()))?;
+    if sub.get("aggregate").and_then(J::as_str) == Some("count") {
+        if parent == Table::Issue && child == Table::Comment && cf == "issueId" && pf == "id" {
+            return Ok(Related { alias, kind: RelKind::CountColumn(catalog::issue::COMMENTS) });
+        }
+        return Err("count is only maintained for issue → comment".into());
+    }
+    if child.col(cf) == Some(0) && catalog::primary_of(child).key.len() == 1 {
+        return Ok(Related { alias, kind: RelKind::One { table: child, parent_col } });
+    }
+    // Many: compile the subquery with the correlation as an equality.
+    let mut sub2 = sub.clone();
+    let eq = serde_json::json!({"type":"simple","op":"=","left":{"type":"column","name":cf},"right":{"type":"literal","value":null}});
+    let w = match sub.get("where") {
+        Some(w) => serde_json::json!({"type":"and","conditions":[eq, w]}),
+        None => eq,
+    };
+    sub2["where"] = w;
+    let plan = compile(&sub2)?;
+    if plan.prefix.is_empty() || plan.index.key[0].0 != child.col(cf).unwrap() {
+        return Err(format!("no index on {} leads with {cf}", child.name()));
+    }
+    Ok(Related { alias, kind: RelKind::Many { plan: Box::new(plan), parent_col } })
+}
+
+// ------------------------------------------------------------------ execute
+
+/// Roots of the trees, from the manifest.
+#[derive(Clone, Default)]
+pub struct Roots(pub HashMap<u16, TreeRoot>);
+
+impl Roots {
+    pub fn get(&self, tree: u16) -> TreeRoot {
+        self.0.get(&tree).copied().unwrap_or(TreeRoot::empty(tree))
+    }
+
+    pub fn from_manifest(m: &J) -> Result<Roots, String> {
+        let mut out = HashMap::new();
+        for t in m.get("trees").and_then(J::as_array).ok_or("manifest without trees")? {
+            let tree = t.get("tree").and_then(J::as_u64).ok_or("tree id")? as u16;
+            out.insert(
+                tree,
+                TreeRoot {
+                    tree,
+                    leaves: t.get("leafPages").and_then(J::as_u64).unwrap_or(0),
+                    root: t.get("root").and_then(J::as_u64).ok_or("root")?,
+                    height: t.get("height").and_then(J::as_u64).ok_or("height")? as u8,
+                    rows: t.get("rows").and_then(J::as_u64).unwrap_or(0),
+                },
+            );
+        }
+        Ok(Roots(out))
+    }
+}
+
+/// One result row: its index key (window position), primary key, and rendered JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hit {
+    pub key: Vec<u8>,
+    pub pk: String,
+    pub json: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Output {
+    Rows { hits: Vec<Hit>, complete: bool },
+    Count(u64),
+}
+
+pub fn prefix_key(ix: &Index, prefix: &[Value]) -> Vec<u8> {
+    let mut k = Vec::new();
+    for (i, v) in prefix.iter().enumerate() {
+        encode_key_part(&mut k, v, ix.key[i].1);
+    }
+    k
+}
+
+pub fn row_matches(plan: &Plan, row: RowRef) -> bool {
+    plan.filters.iter().all(|f| filter_matches(f, row))
+}
+
+fn filter_matches(f: &Filter, row: RowRef) -> bool {
+    match f {
+        Filter::Eq(c, v) => row.get(*c).eq_value(v),
+        Filter::In(c, vs) => {
+            let cell = row.get(*c);
+            vs.iter().any(|v| cell.eq_value(v))
+        }
+        Filter::ILike(c, needle) => contains_ci(row.get(*c).str(), needle),
+        Filter::HasTag(t) => row.get(catalog::issue::TAGS).str().contains(&format!("\"{t}\"")),
+    }
+}
+
+fn contains_ci(hay: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if hay.is_ascii() && needle_lower.is_ascii() {
+        let (h, n) = (hay.as_bytes(), needle_lower.as_bytes());
+        return h.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b));
+    }
+    hay.to_lowercase().contains(needle_lower)
+}
+
+/// Does this row belong to the plan's family partition (prefix) and pass its filters?
+pub fn row_in_partition(plan: &Plan, row: RowRef, multi_elem: Option<&str>) -> bool {
+    for (i, v) in plan.prefix.iter().enumerate() {
+        let c = plan.index.key[i].0;
+        let ok = if Some(c) == plan.index.multi { multi_elem.map(|t| Value::Str(t.into()) == *v).unwrap_or(false) } else { row.get(c).eq_value(v) };
+        if !ok {
+            return false;
+        }
+    }
+    row_matches(plan, row)
+}
+
+pub fn execute(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
+    let root = roots.get(plan.index.tree);
+    let lo = prefix_key(plan.index, &plan.prefix);
+    let hi = if lo.is_empty() { Vec::new() } else { prefix_end(&lo) };
+    let range = Range { lo: &lo, hi: &hi };
+    if plan.count {
+        if plan.filters.is_empty() {
+            return tree::count(ctx, &root, &range).map(Output::Count);
+        }
+        let mut n = 0u64;
+        tree::scan(ctx, &root, &range, false, SCAN_BUDGET, &mut |_, v| {
+            if row_matches(plan, RowRef(v)) {
+                n += 1;
+            }
+            true
+        })?;
+        return Ok(Output::Count(n));
+    }
+    let hint = if plan.filters.is_empty() { plan.limit + 1 } else { SCAN_BUDGET };
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut seen_more = false;
+    tree::scan(ctx, &root, &range, plan.reverse, hint, &mut |k, v| {
+        if !row_matches(plan, RowRef(v)) {
+            return true;
+        }
+        if rows.len() == plan.limit {
+            seen_more = true;
+            return false;
+        }
+        rows.push((k.to_vec(), v.to_vec()));
+        true
+    })?;
+    let mut hits = Vec::with_capacity(rows.len());
+    let mut missed = false;
+    for (k, v) in rows {
+        match render(ctx, roots, plan, RowRef(&v)) {
+            Ok(json) => hits.push(Hit { key: k, pk: RowRef(&v).get(0).str().to_string(), json }),
+            Err(Miss) => missed = true, // keep going: every row's lookups share this round
+        }
+    }
+    if missed {
+        return Err(Miss);
+    }
+    Ok(Output::Rows { hits, complete: !seen_more })
+}
+
+/// Render a row (plus its related data) as a JSON object.
+pub fn render(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Result<String, Miss> {
+    let mut out = String::with_capacity(256);
+    render_into(&mut out, ctx, roots, plan.table, &plan.related, row)?;
+    Ok(out)
+}
+
+fn render_into(out: &mut String, ctx: &Ctx, roots: &Roots, table: Table, related: &[Related], row: RowRef) -> Result<(), Miss> {
+    out.push('{');
+    for (i, (name, cell)) in table.columns().iter().zip(row.cells()).enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(out, name);
+        out.push(':');
+        if table == Table::Issue && i == catalog::issue::TAGS {
+            out.push_str(match cell {
+                Cell::Str(s) if s.starts_with('[') => s,
+                _ => "[]",
+            });
+        } else {
+            json_cell(out, cell);
+        }
+    }
+    let mut missed = false;
+    for r in related {
+        out.push(',');
+        json_str(out, &r.alias);
+        out.push(':');
+        match &r.kind {
+            RelKind::CountColumn(c) => json_cell(out, row.get(*c)),
+            RelKind::One { table: child, parent_col } => {
+                let key = catalog::pk_key(*child, row.get(*parent_col).str());
+                match tree::get(ctx, &roots.get(catalog::primary_of(*child).tree), &key) {
+                    Ok(Some(v)) => render_into(out, ctx, roots, *child, &[], RowRef(&v))?,
+                    Ok(None) => out.push_str("null"),
+                    Err(Miss) => {
+                        missed = true;
+                        out.push_str("null");
+                    }
+                }
+            }
+            RelKind::Many { plan, parent_col } => {
+                let mut p = (**plan).clone();
+                p.prefix[0] = row.get(*parent_col).to_value();
+                match execute(ctx, roots, &p) {
+                    Ok(Output::Rows { hits, .. }) => {
+                        out.push('[');
+                        for (i, h) in hits.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            out.push_str(&h.json);
+                        }
+                        out.push(']');
+                    }
+                    Ok(Output::Count(n)) => out.push_str(&n.to_string()),
+                    Err(Miss) => {
+                        missed = true;
+                        out.push_str("[]");
+                    }
+                }
+            }
+        }
+    }
+    out.push('}');
+    if missed {
+        Err(Miss)
+    } else {
+        Ok(())
+    }
+}

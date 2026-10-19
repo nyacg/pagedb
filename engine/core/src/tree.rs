@@ -17,6 +17,8 @@ pub const NO_PAGE: PageId = u64::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TreeRoot {
     pub tree: u16,
+    /// Leaf pages (written first and contiguously; branch pages follow).
+    pub leaves: u64,
     pub root: PageId,
     /// Levels including the leaves (1 = the root is a leaf). 0 = empty tree.
     pub height: u8,
@@ -25,7 +27,7 @@ pub struct TreeRoot {
 
 impl TreeRoot {
     pub fn empty(tree: u16) -> Self {
-        Self { tree, root: NO_PAGE, height: 0, rows: 0 }
+        Self { tree, leaves: 0, root: NO_PAGE, height: 0, rows: 0 }
     }
 }
 
@@ -59,11 +61,12 @@ pub struct TreeBuilder {
     /// (separator, child id, rows) for the level above the leaves.
     entries: Vec<(Vec<u8>, PageId, u64)>,
     rows: u64,
+    leaves: u64,
 }
 
 impl TreeBuilder {
     pub fn new(tree: u16) -> Self {
-        Self { tree, leaf: PageBuilder::new(LEAF, 0, tree), last_key: Vec::new(), prev_leaf_last: None, entries: Vec::new(), rows: 0 }
+        Self { tree, leaf: PageBuilder::new(LEAF, 0, tree), last_key: Vec::new(), prev_leaf_last: None, entries: Vec::new(), rows: 0, leaves: 0 }
     }
 
     pub fn push(&mut self, sink: &mut dyn PageSink, key: &[u8], val: &[u8]) {
@@ -89,6 +92,7 @@ impl TreeBuilder {
         };
         let rows = self.leaf.rows();
         let id = sink.write(self.leaf.finish());
+        self.leaves += 1;
         self.entries.push((sep, id, rows));
         self.prev_leaf_last = Some(self.last_key.clone());
         self.leaf = PageBuilder::new(LEAF, 0, self.tree);
@@ -129,7 +133,7 @@ impl TreeBuilder {
             entries = next;
         }
         let (_, root, rows) = entries.pop().unwrap();
-        TreeRoot { tree: self.tree, root, height: level + 1, rows }
+        TreeRoot { tree: self.tree, leaves: self.leaves, root, height: level + 1, rows }
     }
 }
 
