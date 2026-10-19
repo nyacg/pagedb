@@ -29,7 +29,10 @@ interface Filter {
   tag?: string;
   title?: string;
 }
-function issuesQuery(project: string, f: Filter, limit: number, status?: string) {
+type Cursor = { createdAt: number; id: string };
+const PAGE = 50;
+
+function issuesQuery(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
   const c: unknown[] = [eq("projectId", project)];
   const st = status ? [status] : f.status;
   if (st.length === 1) c.push(eq("status", st[0]));
@@ -38,7 +41,10 @@ function issuesQuery(project: string, f: Filter, limit: number, status?: string)
   if (f.owner) c.push(eq("ownerId", f.owner));
   if (f.tag) c.push(cond("HAS", "tags", f.tag));
   if (f.title) c.push(cond("ILIKE", "title", `%${f.title}%`));
-  return { table: "issue", where: c.length === 1 ? c[0] : { type: "and", conditions: c }, orderBy: ORDER, limit, related: CARD };
+  const q: Record<string, unknown> = { table: "issue", where: c.length === 1 ? c[0] : { type: "and", conditions: c }, orderBy: ORDER, limit, related: CARD };
+  if (bounds.start) q.start = { row: bounds.start };
+  if (bounds.end) q.end = { row: bounds.end };
+  return q;
 }
 const countQuery = (project: string, status?: string) => ({
   table: "issue",
@@ -70,7 +76,9 @@ const state = {
   project: params.get("project") ?? boot.project,
   view: (params.get("view") ?? "list") as "list" | "board" | "activity",
   issue: params.get("issue") ?? "",
-  limit: 50,
+  /** Infinite scroll: live pages, each a key range. All but the last are bounded (start, end];
+   *  the last is "the next PAGE rows after start". Every row is in exactly one page. */
+  pages: [{}] as { start?: Cursor; end?: Cursor }[],
   filter: { status: [], priority: [] } as Filter,
   creating: false,
   popover: null as null | { kind: string; id?: string; x: number; y: number; search?: string },
@@ -121,9 +129,12 @@ function subscribeView() {
   sync.sub("project", { table: "project", where: eq("id", state.project), one: true });
   sync.sub("count", countQuery(state.project), boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
   if (state.view === "list") {
-    const seed = boot.project === state.project && boot.list && !state.filter.status.length ? { rows: boot.list.rows } : undefined;
-    sync.sub("list", issuesQuery(state.project, state.filter, state.limit), state.limit === 50 ? seed : undefined);
-    keep.add("list");
+    const seed = boot.project === state.project && boot.list && !hasFilter() ? { rows: boot.list.rows } : undefined;
+    state.pages.forEach((pg, i) => {
+      const last = i === state.pages.length - 1;
+      sync.sub(`list:${i}`, issuesQuery(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
+      keep.add(`list:${i}`);
+    });
   } else if (state.view === "board") {
     for (const st of STATUSES) {
       if (state.filter.status.length && !state.filter.status.includes(st)) continue;
@@ -189,13 +200,44 @@ function rowHtml(r: Row) {
   </div>`;
 }
 
+const ROW_H = 38;
+
+const hasFilter = () => !!(state.filter.status.length || state.filter.priority.length || state.filter.owner || state.filter.tag || state.filter.title);
+
+/** Every loaded row (all pages, optimistic edits applied), filtered and sorted. */
+function listRows(): Row[] {
+  const all = new Map<string, Row>();
+  state.pages.forEach((_, i) => {
+    for (const r of sync.view(`list:${i}`)) all.set(r.id, r);
+  });
+  return [...all.values()].filter((r) => matches(r, state.filter)).sort(byCreated);
+}
+
+/** The last page is open-ended: if it's full, close it at its last row and open the next one. */
+function loadMore() {
+  const i = state.pages.length - 1;
+  const s = sync.get(`list:${i}`);
+  if (!s?.ready || s.complete !== false || s.rows.size === 0) return;
+  const last = [...s.rows.values()].sort(byCreated).at(-1)!;
+  const at: Cursor = { createdAt: last.createdAt, id: last.id };
+  state.pages[i] = { ...state.pages[i], end: at };
+  state.pages.push({ start: at });
+  subscribeView();
+}
+
 function listView() {
-  const rows = sync.view("list", (r) => matches(r, state.filter), byCreated, state.limit);
-  const s = sync.get("list");
-  if (!s?.ready) return `<div class="empty">Loading…</div>`;
+  const first = sync.get("list:0");
+  if (!first?.ready) return `<div class="empty">Loading…</div>`;
+  const rows = listRows();
   if (!rows.length) return `<div class="empty">No issues match.</div>`;
-  const more = s.complete === false && state.limit < 500 ? `<button class="more" data-more>Load 50 more</button>` : s.complete === false ? `<div class="empty small">The window stops at 500. Filter to narrow it.</div>` : "";
-  return `<div class="list">${rows.map(rowHtml).join("")}</div>${more}`;
+  // Virtualized: only the rows in view (plus a margin) are in the DOM.
+  const view = $("#view");
+  const from = Math.max(0, Math.floor(view.scrollTop / ROW_H) - 20);
+  const to = Math.min(rows.length, from + Math.ceil((view.clientHeight || 900) / ROW_H) + 40);
+  const lastPage = sync.get(`list:${state.pages.length - 1}`);
+  const done = lastPage?.ready && lastPage.complete !== false;
+  const tail = done ? `<div class="empty small">${rows.length.toLocaleString()} issues · the end</div>` : `<div class="empty small">Loading more…</div>`;
+  return `<div class="list" style="padding-top:${from * ROW_H}px;padding-bottom:${(rows.length - to) * ROW_H}px">${rows.slice(from, to).map(rowHtml).join("")}</div>${tail}`;
 }
 
 function boardView() {
@@ -275,16 +317,19 @@ function popoverView() {
 }
 
 function hudView() {
-  const subs = sync.all().filter((s) => !["me", "pick"].includes(s.id));
+  // List pages: show the first and the open one, and summarize the rest.
+  const pages = sync.all().filter((s) => s.id.startsWith("list:"));
+  const subs = sync.all().filter((s) => !["me", "pick"].includes(s.id) && (!s.id.startsWith("list:") || s === pages[0] || s === pages.at(-1)));
   const label = (s: { id: string; q: any }) => {
     const w = JSON.stringify(s.q.where ?? {});
     if (s.q.aggregate) return `count(${s.q.table})${w.includes("status") ? ` · ${s.id.replace("n:", "")}` : ""}`;
     if (s.id === "detail") return "issue + thread";
     if (s.id === "feed") return "activity feed";
     if (s.id === "project") return "project";
+    if (s.id.startsWith("list:")) return `issues · page ${Number(s.id.slice(5)) + 1}${s.q.end ? "" : " (open)"}`;
     return `${s.q.table} · limit ${s.q.limit}`;
   };
-  return `<div class="hud-h"><b>${subs.length} live queries</b> <span class="dot ${sync.state}"></span> v${sync.version}</div>
+  return `<div class="hud-h"><b>${subs.length + Math.max(0, pages.length - 2)} live queries</b> <span class="dot ${sync.state}"></span> v${sync.version}</div>
     ${subs
       .map((s) => {
         const st = s.stats;
@@ -292,6 +337,7 @@ function hudView() {
         return `<div class="hq"><span class="hq-l">${esc(label(s))}</span><span class="hq-r">${st ? `${Math.round(s.firstMs ?? 0)}ms` : ""} <i>${tier}</i>${s.updates ? ` · ${s.updates}↻` : ""}</span></div>`;
       })
       .join("")}
+    ${pages.length > 2 ? `<div class="hq"><span class="hq-l">+ ${pages.length - 2} more list pages, all live</span><span class="hq-r"></span></div>` : ""}
     ${sync.lastWrite ? `<div class="hq w"><span class="hq-l">last write: ${esc(sync.lastWrite.name)}</span><span class="hq-r">${Math.round(sync.lastWrite.ms)}ms</span></div>` : ""}`;
 }
 
@@ -348,7 +394,7 @@ document.addEventListener("click", (e) => {
   const el = (sel: string) => t.closest(sel) as HTMLElement | null;
   if (el("[data-view]")) {
     state.view = el("[data-view]")!.dataset.view as typeof state.view;
-    state.limit = 50;
+    state.pages = [{}];
     subscribeView();
     return render();
   }
@@ -362,7 +408,7 @@ document.addEventListener("click", (e) => {
     state.project = el("[data-project]")!.dataset.project!;
     state.popover = null;
     state.issue = "";
-    state.limit = 50;
+    state.pages = [{}];
     subscribeView();
     return render();
   }
@@ -404,7 +450,7 @@ document.addEventListener("click", (e) => {
     const list = (state.filter as any)[b.dataset.fchip!] as string[];
     const v = b.dataset.v!;
     (state.filter as any)[b.dataset.fchip!] = list.includes(v) ? list.filter((x) => x !== v) : [...list, v];
-    state.limit = 50;
+    state.pages = [{}];
     subscribeView();
     return render();
   }
@@ -422,11 +468,6 @@ document.addEventListener("click", (e) => {
     e.stopPropagation();
     state.filter.tag = el(".tag[data-tag]")!.dataset.tag;
     state.view = state.view === "activity" ? "list" : state.view;
-    subscribeView();
-    return render();
-  }
-  if (el("[data-more]")) {
-    state.limit = Math.min(500, state.limit + 50);
     subscribeView();
     return render();
   }
@@ -479,7 +520,7 @@ document.addEventListener("input", (e) => {
     clearTimeout((t as any)._d);
     (t as any)._d = setTimeout(() => {
       state.filter.title = t.value.trim() || undefined;
-      state.limit = 50;
+      state.pages = [{}];
       subscribeView();
       render();
       const s = document.querySelector("[data-search]") as HTMLInputElement;
@@ -575,7 +616,22 @@ document.addEventListener("drop", (e) => {
   }
 });
 
-sync.onChange(render);
+$("#view").addEventListener("scroll", () => {
+  if (state.view !== "list") return;
+  const v = $("#view");
+  if (v.scrollTop + v.clientHeight > v.scrollHeight - 1200) loadMore();
+  requestAnimationFrame(() => ($("#view").innerHTML = listView()));
+});
+
+// For tests and the curious: the loaded list as data.
+(window as unknown as { __pagedb: unknown }).__pagedb = { listRows, pages: () => state.pages.length };
+
+sync.onChange(() => {
+  render();
+  // A short page (or a fast scroller) may need the next page right away.
+  const v = $("#view");
+  if (state.view === "list" && v.scrollTop + v.clientHeight > v.scrollHeight - 1200) loadMore();
+});
 subscribeView();
 render();
 if (boot.ms !== undefined) console.log(`server-rendered first page in ${boot.ms} ms`, boot.stats);

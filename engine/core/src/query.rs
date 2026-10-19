@@ -58,6 +58,36 @@ pub struct Plan {
     pub one: bool,
     pub count: bool,
     pub related: Vec<Related>,
+    /// Keyset bounds in scan order, as encodings of the key columns after the prefix:
+    /// rows strictly after `start`, up to and including `end` (infinite scroll pages).
+    pub start: Option<Vec<u8>>,
+    pub end: Option<Vec<u8>>,
+}
+
+impl Plan {
+    /// The key range this plan scans: its prefix, narrowed by its bounds.
+    pub fn scan_range(&self) -> (Vec<u8>, Vec<u8>) {
+        let lo_p = prefix_key(self.index, &self.prefix);
+        let hi_p = if lo_p.is_empty() { Vec::new() } else { prefix_end(&lo_p) };
+        let at = |suffix: &Vec<u8>, extra: bool| {
+            let mut k = lo_p.clone();
+            k.extend_from_slice(suffix);
+            if extra {
+                k.push(0); // just past this key (index keys are prefix-free)
+            }
+            k
+        };
+        if !self.reverse {
+            (self.start.as_ref().map_or(lo_p.clone(), |s| at(s, true)), self.end.as_ref().map_or(hi_p, |e| at(e, true)))
+        } else {
+            (self.end.as_ref().map_or(lo_p.clone(), |e| at(e, false)), self.start.as_ref().map_or(hi_p, |s| at(s, false)))
+        }
+    }
+
+    pub fn in_range(&self, key: &[u8]) -> bool {
+        let (lo, hi) = self.scan_range();
+        key >= lo.as_slice() && (hi.is_empty() || key < hi.as_slice())
+    }
 }
 
 pub const MAX_LIMIT: usize = 1000;
@@ -233,7 +263,21 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
     for r in ast.get("related").and_then(J::as_array).map(|v| v.as_slice()).unwrap_or(&[]) {
         related.push(compile_related(table, r)?);
     }
-    Ok(Plan { table, index, prefix, reverse, filters, limit, one, count, related })
+    // Keyset bounds: {"start":{"row":{…}}} (exclusive), {"end":{"row":{…}}} (inclusive). The row
+    // gives the values of the index columns after the prefix (the order columns + primary key).
+    let bound = |name: &str| -> Result<Option<Vec<u8>>, String> {
+        let Some(b) = ast.get(name) else { return Ok(None) };
+        let row = b.get("row").and_then(J::as_object).ok_or_else(|| format!("{name} needs a row"))?;
+        let mut k = Vec::new();
+        for &(c, desc) in &index.key[p..] {
+            let col = table.columns()[c];
+            let v = row.get(col).ok_or_else(|| format!("{name}.row needs {col}"))?;
+            encode_key_part(&mut k, &json_to_value(v), desc);
+        }
+        Ok(Some(k))
+    };
+    let (start, end) = (bound("start")?, bound("end")?);
+    Ok(Plan { table, index, prefix, reverse, filters, limit, one, count, related, start, end })
 }
 
 fn compile_related(parent: Table, r: &J) -> Result<Related, String> {
@@ -383,8 +427,7 @@ pub fn execute(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
 
 fn execute_plan(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
     let root = roots.get(plan.index.tree);
-    let lo = prefix_key(plan.index, &plan.prefix);
-    let hi = if lo.is_empty() { Vec::new() } else { prefix_end(&lo) };
+    let (lo, hi) = plan.scan_range();
     let range = Range { lo: &lo, hi: &hi };
     if plan.count {
         if plan.filters.is_empty() {
