@@ -7,6 +7,7 @@
     "test:engine": "cd engine && cargo test --release",
     "typecheck": "tsc --noEmit",
     "deploy": "npm run wasm && npm run web && wrangler deploy",
+    "deploy:preview": "npm run wasm && npm run web && wrangler deploy --env preview",
     "web": "node web/build.mjs",
     "deploy:node": "npm run wasm && node node/build.mjs && wrangler deploy -c wrangler.node.jsonc"
   },

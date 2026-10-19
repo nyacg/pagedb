@@ -8,7 +8,11 @@
 //!  "orderBy":[["createdAt","desc"],["id","asc"]], "limit":50,
 //!  "related":[{"alias":"owner","correlation":{"parentField":["ownerId"],"childField":["id"]},"subquery":{"table":"user"}}]}
 //! ```
-//! Operators: `=`, `IN`, `ILIKE` (substring, `%v%`), `HAS` (tag membership). `aggregate:"count"`
+//! Operators: `=`, `IN`, `ILIKE` (substring, `%v%`), `HAS` (tag membership), and on issues
+//! `EXISTS` over its comments with body `ILIKE` (comment search):
+//!     {"type":"correlatedSubquery","op":"EXISTS","related":{"correlation":{"parentField":["id"],"childField":["issueId"]},
+//!      "subquery":{"table":"comment","where":{"type":"simple","op":"ILIKE","left":{"type":"column","name":"body"},"right":{"type":"literal","value":"%flaky%"}}}}}
+//! `aggregate:"count"`
 //! at the top level counts; on a related comment subquery it reads the maintained
 //! `commentCount` column. Equalities on an index's leading columns become the scan prefix
 //! (the query family's parameters); the remaining key columns must give the requested order.
@@ -28,6 +32,9 @@ pub enum Filter {
     /// Lowercased needle; matches if the column contains it, case-insensitively.
     ILike(usize, String),
     HasTag(String),
+    /// Issue has a comment whose body contains this (lowercased) needle. Needs page reads, so
+    /// it's checked after the row's own filters (see `comments_match`).
+    CommentILike(String),
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +100,9 @@ impl Plan {
 pub const MAX_LIMIT: usize = 1000;
 /// Rows a filtered scan may examine in one go (≈ one project).
 pub const SCAN_BUDGET: usize = 20_000;
+/// Comment search: at most this many issues' comments are fetched in one fault round (≈ 20 MB
+/// at the demo's density, read as a few large ranged GETs).
+pub const COMMENT_BATCH: usize = 8192;
 
 // ------------------------------------------------------------------ compile
 
@@ -130,7 +140,7 @@ fn flatten<'a>(w: &'a J, out: &mut Vec<&'a J>) -> Result<(), String> {
             }
             Ok(())
         }
-        Some("simple") => {
+        Some("simple") | Some("correlatedSubquery") => {
             out.push(w);
             Ok(())
         }
@@ -152,6 +162,10 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
     let mut tags: Vec<String> = Vec::new();
     let mut filters: Vec<Filter> = Vec::new();
     for c in conds {
+        if c.get("type").and_then(J::as_str) == Some("correlatedSubquery") {
+            filters.extend(comment_exists(table, c)?);
+            continue;
+        }
         let op = c.get("op").and_then(J::as_str).ok_or("condition without op")?;
         let name = col_name(c.get("left").ok_or("no left")?).ok_or("left must be a column")?;
         let lit = literal(c.get("right").ok_or("no right")?).ok_or("right must be a literal")?;
@@ -258,6 +272,9 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
     let one = ast.get("one").and_then(J::as_bool).unwrap_or(false);
     let limit = if one { 1 } else { ast.get("limit").and_then(J::as_u64).unwrap_or(100).min(MAX_LIMIT as u64) as usize };
     let count = ast.get("aggregate").and_then(J::as_str) == Some("count");
+    if count && filters.iter().any(|f| matches!(f, Filter::CommentILike(_))) {
+        return Err("comment search can't be counted".into());
+    }
 
     let mut related = Vec::new();
     for r in ast.get("related").and_then(J::as_array).map(|v| v.as_slice()).unwrap_or(&[]) {
@@ -278,6 +295,33 @@ pub fn compile(ast: &J) -> Result<Plan, String> {
     };
     let (start, end) = (bound("start")?, bound("end")?);
     Ok(Plan { table, index, prefix, reverse, filters, limit, one, count, related, start, end })
+}
+
+/// `EXISTS (comment of this issue whose body ILIKE …)`: the only correlated subquery supported.
+fn comment_exists(table: Table, c: &J) -> Result<Vec<Filter>, String> {
+    let bad = || "only EXISTS (issue → comment, body ILIKE) is supported".to_string();
+    let rel = c.get("related").ok_or_else(bad)?;
+    let corr = rel.get("correlation").ok_or_else(bad)?;
+    let field = |k: &str| corr.get(k).and_then(J::as_array).and_then(|a| a.first()).and_then(J::as_str);
+    let sub = rel.get("subquery").ok_or_else(bad)?;
+    if c.get("op").and_then(J::as_str) != Some("EXISTS")
+        || table != Table::Issue
+        || field("parentField") != Some("id")
+        || field("childField") != Some("issueId")
+        || sub.get("table").and_then(J::as_str) != Some("comment")
+    {
+        return Err(bad());
+    }
+    let mut conds = Vec::new();
+    flatten(sub.get("where").ok_or_else(bad)?, &mut conds)?;
+    conds
+        .into_iter()
+        .map(|w| {
+            let ok = w.get("op").and_then(J::as_str) == Some("ILIKE") && w.get("left").and_then(col_name) == Some("body");
+            let lit = w.get("right").and_then(literal).and_then(J::as_str).filter(|_| ok).ok_or_else(bad)?;
+            Ok(Filter::CommentILike(lit.trim_matches('%').to_lowercase()))
+        })
+        .collect()
 }
 
 fn compile_related(parent: Table, r: &J) -> Result<Related, String> {
@@ -377,7 +421,74 @@ fn filter_matches(f: &Filter, row: RowRef) -> bool {
         }
         Filter::ILike(c, needle) => contains_ci(row.get(*c).str(), needle),
         Filter::HasTag(t) => row.get(catalog::issue::TAGS).str().contains(&format!("\"{t}\"")),
+        Filter::CommentILike(_) => true, // checked by comments_match
     }
+}
+
+pub fn has_comment_filter(plan: &Plan) -> bool {
+    plan.filters.iter().any(|f| matches!(f, Filter::CommentILike(_)))
+}
+
+/// Comment search for one issue row: every needle must occur in some comment of the issue.
+pub fn comments_match(ctx: &Ctx, roots: &Roots, plan: &Plan, row: RowRef) -> Result<bool, Miss> {
+    let needles: Vec<&str> = plan.filters.iter().filter_map(|f| if let Filter::CommentILike(n) = f { Some(n.as_str()) } else { None }).collect();
+    if needles.is_empty() {
+        return Ok(true);
+    }
+    let ix = catalog::index_named("comment_by_issue").unwrap();
+    let lo = prefix_key(ix, &[Value::from(row.get(catalog::issue::ID).str())]);
+    let hi = prefix_end(&lo);
+    let mut found = vec![false; needles.len()];
+    merged::scan(ctx, &roots.get(ix.tree), &Range { lo: &lo, hi: &hi }, false, 256, &mut |_, v| {
+        let body = RowRef(v).get(catalog::comment::BODY).str();
+        for (i, n) in needles.iter().enumerate() {
+            found[i] = found[i] || contains_ci(body, n);
+        }
+        !found.iter().all(|f| *f)
+    })?;
+    Ok(found.iter().all(|f| *f))
+}
+
+/// Matching rows of `plan` in [lo, hi), in scan order: up to `need`, plus whether more exist.
+/// Comment search reads each candidate's comments; candidates whose comment pages aren't
+/// resident are collected and fetched together, then the scan reruns. Batches grow: the first
+/// covers ~4× the rows still needed (enough for a common word, ~0.5 MB), each next one ~8× what's
+/// been checked so far, up to COMMENT_BATCH, so a word in no comment of a 10k-issue project
+/// costs ~3 rounds.
+pub fn collect(ctx: &Ctx, roots: &Roots, plan: &Plan, lo: &[u8], hi: &[u8], need: usize) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Miss> {
+    let deep = has_comment_filter(plan);
+    let hint = if plan.filters.is_empty() { need + 1 } else { SCAN_BUDGET };
+    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let (mut more, mut unknown, mut known) = (false, 0usize, 0usize);
+    merged::scan(ctx, &roots.get(plan.index.tree), &Range { lo, hi }, plan.reverse, hint, &mut |k, v| {
+        if !row_matches(plan, RowRef(v)) {
+            return true;
+        }
+        if deep {
+            match comments_match(ctx, roots, plan, RowRef(v)) {
+                Ok(m) => {
+                    known += 1;
+                    if !m {
+                        return true;
+                    }
+                }
+                Err(Miss) => {
+                    unknown += 1;
+                    return unknown < (4 * (need.saturating_sub(rows.len()) + 1) + 8 * known).min(COMMENT_BATCH);
+                }
+            }
+        }
+        if rows.len() == need {
+            more = true;
+            return false;
+        }
+        rows.push((k.to_vec(), v.to_vec()));
+        true
+    })?;
+    if unknown > 0 {
+        return Err(Miss);
+    }
+    Ok((rows, more))
 }
 
 fn contains_ci(hay: &str, needle_lower: &str) -> bool {
@@ -442,20 +553,7 @@ fn execute_plan(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
         })?;
         return Ok(Output::Count(n));
     }
-    let hint = if plan.filters.is_empty() { plan.limit + 1 } else { SCAN_BUDGET };
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut seen_more = false;
-    merged::scan(ctx, &root, &range, plan.reverse, hint, &mut |k, v| {
-        if !row_matches(plan, RowRef(v)) {
-            return true;
-        }
-        if rows.len() == plan.limit {
-            seen_more = true;
-            return false;
-        }
-        rows.push((k.to_vec(), v.to_vec()));
-        true
-    })?;
+    let (rows, seen_more) = collect(ctx, roots, plan, &lo, &hi, plan.limit)?;
     let mut hits = Vec::with_capacity(rows.len());
     let mut missed = false;
     for (k, v) in rows {

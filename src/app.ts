@@ -15,13 +15,21 @@ const CARD = [
 export const STATUSES = ["backlog", "todo", "in-progress", "review", "done"] as const;
 export const PRIORITIES = ["urgent", "high", "medium", "low"] as const;
 
+/** Search terms: values of one kind are alternatives (status, priority, owner) or all required (tag, title, comment). */
 export interface Filter {
   status?: string[];
   priority?: string[];
-  owner?: string;
-  tag?: string;
-  title?: string;
+  owner?: string[];
+  tag?: string[];
+  title?: string[];
+  comment?: string[];
 }
+
+const hasComment = (needle: string) => ({
+  type: "correlatedSubquery",
+  op: "EXISTS",
+  related: { correlation: { parentField: ["id"], childField: ["issueId"] }, subquery: { table: "comment", where: cond("ILIKE", "body", `%${needle}%`) } },
+});
 
 type Cursor = { createdAt: number; id: string };
 
@@ -31,9 +39,11 @@ export function issuesQuery(project: string, f: Filter = {}, limit = 50, status?
   if (st.length === 1) conds.push(eq("status", st[0]));
   else if (st.length) conds.push(cond("IN", "status", st));
   if (f.priority?.length) conds.push(cond("IN", "priority", f.priority));
-  if (f.owner) conds.push(eq("ownerId", f.owner));
-  if (f.tag) conds.push(cond("HAS", "tags", f.tag));
-  if (f.title) conds.push(cond("ILIKE", "title", `%${f.title}%`));
+  if (f.owner?.length === 1) conds.push(eq("ownerId", f.owner[0]));
+  else if (f.owner?.length) conds.push(cond("IN", "ownerId", f.owner));
+  for (const t of f.tag ?? []) conds.push(cond("HAS", "tags", t));
+  for (const t of f.title ?? []) conds.push(cond("ILIKE", "title", `%${t}%`));
+  for (const t of f.comment ?? []) conds.push(hasComment(t));
   const q: Record<string, unknown> = { table: "issue", where: conds.length === 1 ? conds[0] : { type: "and", conditions: conds }, orderBy: ORDER, limit: Math.min(Math.max(limit, 1), 1000), related: CARD };
   if (bounds.start) q.start = { row: bounds.start };
   if (bounds.end) q.end = { row: bounds.end };
@@ -92,6 +102,12 @@ const cursor = (v: unknown, what: string): Cursor | undefined => {
 };
 const list = <T extends string>(v: unknown, allowed: readonly T[], what: string): T[] =>
   need(v === undefined || (Array.isArray(v) && v.length <= allowed.length && v.every((x) => allowed.includes(x))), (v as T[] | undefined) ?? [], what);
+/** Up to 8 values; a lone string is accepted as a one-value list. */
+const many = (v: unknown, ok: (x: string) => boolean, what: string): string[] => {
+  const a = v === undefined ? [] : typeof v === "string" ? [v] : v;
+  return need(Array.isArray(a) && a.length <= 8 && a.every((x) => typeof x === "string" && ok(x)), [...new Set(a as string[])], what);
+};
+const words = (max: number) => (x: string) => x.trim().length > 0 && x.length <= max;
 
 /** The only queries a page can subscribe to. Arguments are validated; the AST is built here. */
 export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
@@ -102,9 +118,10 @@ export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
       const filter: Filter = {
         status: list(f.status, STATUSES, "status"),
         priority: list(f.priority, PRIORITIES, "priority"),
-        owner: need(f.owner === undefined || USER.test(f.owner as string), f.owner as string | undefined, "owner"),
-        tag: need(f.tag === undefined || TAG.test(f.tag as string), f.tag as string | undefined, "tag"),
-        title: text(f.title, "title search", 60),
+        owner: many(f.owner, (x) => USER.test(x), "owner"),
+        tag: many(f.tag, (x) => TAG.test(x), "tag"),
+        title: many(f.title, words(60), "title search"),
+        comment: many(f.comment, words(60), "comment search"),
       };
       const status = need(a.status === undefined || STATUSES.includes(a.status), a.status as string | undefined, "status");
       const limit = need(Number.isInteger(a.limit) && a.limit >= 1 && a.limit <= 1000, a.limit as number, "limit");

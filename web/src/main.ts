@@ -13,26 +13,30 @@ const PRIORITIES = ["urgent", "high", "medium", "low"];
 const PRI_LABEL: Record<string, string> = { urgent: "Urgent", high: "High", medium: "Medium", low: "Low" };
 
 // ---------------------------------------------------------------- queries (named; the Worker signs the AST)
-interface Filter {
-  status: string[];
-  priority: string[];
-  owner?: string;
-  ownerName?: string;
-  tag?: string;
-  title?: string;
+/** The search box: a list of terms (chips). Values of one kind are alternatives for status,
+ *  priority and owner, and all required for tag, title and comment. */
+type Kind = "title" | "status" | "priority" | "owner" | "tag" | "comment";
+const KINDS: Kind[] = ["title", "status", "priority", "owner", "tag", "comment"];
+interface Term {
+  kind: Kind;
+  value: string;
+  label: string;
 }
+type Filter = Record<Kind, string[]>;
+function filterOf(terms: Term[]): Filter {
+  const f: Filter = { title: [], status: [], priority: [], owner: [], tag: [], comment: [] };
+  for (const t of terms) if (!f[t.kind].includes(t.value)) f[t.kind].push(t.value);
+  return f;
+}
+/** The generator's tag vocabulary (engine/core/src/gen.rs), for suggestions. */
+const TAGS = "api auth backend billing bug chore cli data design docs editor feature frontend good-first-issue infra ios android web perf regression search security sync ux a11y i18n mobile desktop storage network flaky-test ci deps release triage needs-repro wontfix blocked customer p0".split(" ");
 type Cursor = { createdAt: number; id: string };
 const PAGE = 50;
 
 /** What a list/board subscription asks the Worker to lease (src/app.ts builds the AST). */
 function issuesRef(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
-  const filter = {
-    status: f.status.length ? f.status : undefined,
-    priority: f.priority.length ? f.priority : undefined,
-    owner: f.owner,
-    tag: f.tag,
-    title: f.title,
-  };
+  const opt = (a: string[]) => (a.length ? a : undefined);
+  const filter = { status: opt(f.status), priority: opt(f.priority), owner: opt(f.owner), tag: opt(f.tag), title: opt(f.title), comment: opt(f.comment) };
   return { name: "issues", args: { project, filter, limit, status, start: bounds.start, end: bounds.end } };
 }
 
@@ -46,7 +50,11 @@ const state = {
   /** Infinite scroll: live pages, each a key range. All but the last are bounded (start, end];
    *  the last is "the next PAGE rows after start". Every row is in exactly one page. */
   pages: [{}] as { start?: Cursor; end?: Cursor }[],
-  filter: { status: [], priority: [] } as Filter,
+  terms: [] as Term[],
+  /** What's typed in the search box but not yet a chip; plain text filters titles as you type. */
+  draft: "",
+  searchOpen: false,
+  sel: 0,
   creating: false,
   popover: null as null | { kind: string; id?: string; x: number; y: number; search?: string },
 };
@@ -88,11 +96,28 @@ function matches(r: Row, f: Filter, status?: string) {
   const st = status ? [status] : f.status;
   if (st.length && !st.includes(r.status)) return false;
   if (f.priority.length && !f.priority.includes(r.priority)) return false;
-  if (f.owner && r.ownerId !== f.owner) return false;
-  if (f.tag && !(r.tags ?? []).includes(f.tag)) return false;
-  if (f.title && !String(r.title).toLowerCase().includes(f.title.toLowerCase())) return false;
+  if (f.owner.length && !f.owner.includes(r.ownerId)) return false;
+  if (!f.tag.every((t) => (r.tags ?? []).includes(t))) return false;
+  const title = String(r.title).toLowerCase();
+  if (!f.title.every((t) => title.includes(t.toLowerCase()))) return false;
+  // Rows don't carry their comments, so comment search is the server's call; a row created on
+  // this page appears once the server's results include it.
+  if (f.comment.length && sync.pendingOps().some((p) => p.insert?.id === r.id)) return false;
   return true;
 }
+
+function parseDraft(): { kind?: Kind; text: string } {
+  const m = /^(\w+):\s*(.*)$/.exec(state.draft);
+  const unquote = (x: string) => x.trim().replace(/^"(.*)"$/, "$1");
+  if (m && KINDS.includes(m[1].toLowerCase() as Kind)) return { kind: m[1].toLowerCase() as Kind, text: unquote(m[2]) };
+  return { text: unquote(state.draft) };
+}
+/** The chips, plus plain typed text as a live title term. */
+function liveTerms(): Term[] {
+  const d = parseDraft();
+  return (!d.kind || d.kind === "title") && d.text ? [...state.terms, { kind: "title", value: d.text, label: d.text }] : state.terms;
+}
+const filter = () => filterOf(liveTerms());
 function url() {
   const p = new URLSearchParams();
   p.set("project", state.project);
@@ -107,17 +132,18 @@ function subscribeView() {
   sync.sub("me", { name: "user", args: { id: me } });
   sync.sub("project", { name: "project", args: { id: state.project } });
   sync.sub("count", { name: "count", args: { project: state.project } }, boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
+  const f = filter();
   if (state.view === "list") {
     const seed = boot.project === state.project && boot.list && !hasFilter() ? { rows: boot.list.rows } : undefined;
     state.pages.forEach((pg, i) => {
       const last = i === state.pages.length - 1;
-      sync.sub(`list:${i}`, issuesRef(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
+      sync.sub(`list:${i}`, issuesRef(state.project, f, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
       keep.add(`list:${i}`);
     });
   } else if (state.view === "board") {
     for (const st of STATUSES) {
-      if (state.filter.status.length && !state.filter.status.includes(st)) continue;
-      sync.sub(`col:${st}`, issuesRef(state.project, state.filter, 25, st));
+      if (f.status.length && !f.status.includes(st)) continue;
+      sync.sub(`col:${st}`, issuesRef(state.project, f, 25, st));
       sync.sub(`n:${st}`, { name: "count", args: { project: state.project, status: st } });
       keep.add(`col:${st}`).add(`n:${st}`);
     }
@@ -133,8 +159,11 @@ function subscribeView() {
     sync.sub("pick", { name: "projects", args: { search: state.popover.search || undefined } });
     keep.add("pick");
   }
-  if (state.popover?.kind === "owner" || state.popover?.kind === "filter-owner") {
+  if (state.popover?.kind === "owner") {
     sync.sub("pick", { name: "users", args: { search: state.popover.search || undefined } });
+    keep.add("pick");
+  } else if (state.searchOpen && parseDraft().kind === "owner") {
+    sync.sub("pick", { name: "users", args: { search: parseDraft().text || undefined } });
     keep.add("pick");
   }
   for (const s of sync.all()) if (!keep.has(s.id)) sync.unsub(s.id);
@@ -181,7 +210,7 @@ function rowHtml(r: Row) {
 
 const ROW_H = 38;
 
-const hasFilter = () => !!(state.filter.status.length || state.filter.priority.length || state.filter.owner || state.filter.tag || state.filter.title);
+const hasFilter = () => liveTerms().length > 0;
 
 /** Every loaded row (all pages, optimistic edits applied), filtered and sorted. */
 function listRows(): Row[] {
@@ -189,7 +218,8 @@ function listRows(): Row[] {
   state.pages.forEach((_, i) => {
     for (const r of sync.view(`list:${i}`)) all.set(r.id, r);
   });
-  return [...all.values()].filter((r) => matches(r, state.filter)).sort(byCreated);
+  const f = filter();
+  return [...all.values()].filter((r) => matches(r, f)).sort(byCreated);
 }
 
 /** The last page is open-ended: if it's full, close it at its last row and open the next one. */
@@ -220,10 +250,11 @@ function listView() {
 }
 
 function boardView() {
-  const cols = STATUSES.filter((st) => !state.filter.status.length || state.filter.status.includes(st));
+  const f = filter();
+  const cols = STATUSES.filter((st) => !f.status.length || f.status.includes(st));
   return `<div class="board">${cols
     .map((st) => {
-      const cards = sync.view(`col:${st}`, (r) => matches(r, state.filter, st), byCreated, 25);
+      const cards = sync.view(`col:${st}`, (r) => matches(r, f, st), byCreated, 25);
       const n = sync.count(`n:${st}`, (p) => (p.patch?.set.status === st ? 1 : 0) - (p.patch && sync.findRow(p.patch.id)?.status === st && p.patch.set.status && p.patch.set.status !== st ? 1 : 0));
       return `<div class="col" data-drop="${st}"><div class="col-h">${statusIcon(st)} ${STATUS_LABEL[st]} <span class="n">${n ?? ""}</span></div>
         <div class="cards">${cards
@@ -280,7 +311,7 @@ function popoverView() {
   let items = "";
   if (p.kind === "status") items = STATUSES.map((s) => `<button data-set="status" data-v="${s}">${statusIcon(s)} ${STATUS_LABEL[s]}</button>`).join("");
   if (p.kind === "priority") items = PRIORITIES.map((s) => `<button data-set="priority" data-v="${s}">${priIcon(s)} ${PRI_LABEL[s]}</button>`).join("");
-  if (p.kind === "owner" || p.kind === "filter-owner" || p.kind === "project") {
+  if (p.kind === "owner" || p.kind === "project") {
     const rows = sync.view("pick");
     items =
       `<input class="pop-search" placeholder="Search…" value="${esc(p.search ?? "")}" data-popsearch autofocus>` +
@@ -288,7 +319,7 @@ function popoverView() {
         .map((u) =>
           p.kind === "project"
             ? `<button data-project="${esc(u.id)}"><span class="pk">${esc(u.key)}</span> ${esc(u.name)}</button>`
-            : `<button data-set="${p.kind === "owner" ? "ownerId" : "filter-owner"}" data-v="${esc(u.id)}" data-name="${esc(u.name)}">${avatar(u, "sm")} ${esc(u.name)}</button>`,
+            : `<button data-set="ownerId" data-v="${esc(u.id)}" data-name="${esc(u.name)}">${avatar(u, "sm")} ${esc(u.name)}</button>`,
         )
         .join("");
   }
@@ -322,15 +353,66 @@ function hudView() {
 }
 
 function filtersView() {
-  const f = state.filter;
-  const chip = (kind: string, v: string, label: string) => `<button class="fchip ${(f as any)[kind].includes(v) ? "on" : ""}" data-fchip="${kind}" data-v="${v}">${label}</button>`;
-  return `<div class="filters">
-    ${state.view === "list" ? STATUSES.map((s) => chip("status", s, `${statusIcon(s)} ${STATUS_LABEL[s]}`)).join("") : ""}
-    <span class="sep"></span>${PRIORITIES.map((p) => chip("priority", p, `${priIcon(p)} ${PRI_LABEL[p]}`)).join("")}
-    <span class="sep"></span><button class="fchip ${f.owner ? "on" : ""}" data-pop="filter-owner">${f.owner ? `${esc(f.ownerName)} ×` : "Assignee"}</button>
-    ${f.tag ? `<button class="fchip on" data-cleartag>#${esc(f.tag)} ×</button>` : ""}
-    <input class="search" placeholder="Search titles" value="${esc(f.title ?? "")}" data-search>
-  </div>`;
+  const chips = state.terms.map((t, i) => `<span class="tok"><i>${t.kind}</i>${esc(t.label)}<b data-untok="${i}" title="Remove">×</b></span>`).join("");
+  // (No value attribute: the input keeps what's typed; it's only rebuilt when the chips change.)
+  return `<div class="filters"><div class="tokens" data-tokens>${chips}<input class="tok-input" data-search autocomplete="off" spellcheck="false"
+    placeholder="${state.terms.length ? "Add another term…" : "Search titles, or filter by status:, priority:, owner:, tag:, comment:"}"></div></div>`;
+}
+
+type Sugg = { html: string; prefix?: Kind; term?: Term };
+let suggs: Sugg[] = [];
+function suggestions(): Sugg[] {
+  const d = parseDraft();
+  const q = d.text.toLowerCase();
+  const term = (kind: Kind, value: string, label = value): Sugg => ({ html: `<i>${kind}</i>${esc(label)}`, term: { kind, value, label } });
+  const prefix = (k: Kind): Sugg => ({ html: `${k}:`, prefix: k });
+  const statuses = () => STATUSES.filter((x) => !q || STATUS_LABEL[x].toLowerCase().startsWith(q) || x.startsWith(q)).map((x) => term("status", x, STATUS_LABEL[x]));
+  const priorities = () => PRIORITIES.filter((x) => !q || x.startsWith(q)).map((x) => term("priority", x, PRI_LABEL[x]));
+  const tags = (n: number) => TAGS.filter((t) => !q || t.startsWith(q)).slice(0, n).map((t) => term("tag", t));
+  let out: Sugg[] = [];
+  if (!d.kind) {
+    if (!q) return KINDS.map(prefix);
+    const kinds = KINDS.filter((k) => k.startsWith(q) && k !== q).map(prefix);
+    out = [term("title", d.text), ...kinds, ...statuses(), ...priorities(), ...tags(3), term("comment", d.text)];
+  } else if (d.kind === "status") out = statuses();
+  else if (d.kind === "priority") out = priorities();
+  else if (d.kind === "tag") {
+    const free = q.replace(/[^a-z0-9-]/g, "-").slice(0, 28);
+    out = tags(8);
+    if (free && !TAGS.includes(free)) out.push(term("tag", free));
+  } else if (d.kind === "owner") out = sync.view("pick").map((u) => term("owner", u.id, u.name));
+  else if (d.text) out = [term(d.kind, d.text)];
+  return out.filter((x) => !x.term || !state.terms.some((t) => t.kind === x.term!.kind && t.value === x.term!.value));
+}
+function searchPopView() {
+  suggs = state.searchOpen && state.view !== "activity" ? suggestions() : [];
+  if (!suggs.length) return "";
+  state.sel = Math.min(state.sel, suggs.length - 1);
+  return `<div class="sp">${suggs.map((x, i) => `<button class="${i === state.sel ? "on" : ""}" data-sugg="${i}">${x.html}</button>`).join("")}</div>`;
+}
+const searchInput = () => document.querySelector("[data-search]") as HTMLInputElement | null;
+function setDraft(v: string) {
+  state.draft = v;
+  state.sel = 0;
+  const input = searchInput();
+  if (input) input.value = v;
+}
+function applySugg(x: Sugg) {
+  if (x.prefix) setDraft(`${x.prefix}:`);
+  else if (x.term) {
+    state.terms = [...state.terms, x.term];
+    setDraft("");
+    state.pages = [{}];
+  }
+  subscribeView();
+  render();
+  searchInput()?.focus();
+}
+function removeTerm(i: number) {
+  state.terms = state.terms.filter((_, j) => j !== i);
+  state.pages = [{}];
+  subscribeView();
+  render();
 }
 
 /** Only touch a region whose markup changed: rebuilding it would replace inputs mid-typing. */
@@ -378,6 +460,7 @@ function renderRegions() {
     <span class="count">${state.view === "activity" ? "across every project" : count !== undefined ? `${count.toLocaleString()} issues` : ""}</span>
     <span class="grow"></span>${state.view !== "activity" ? `<button class="primary" data-new>New issue</button>` : ""}`);
   put("#filters", state.view === "activity" ? "" : filtersView());
+  put("#searchpop", searchPopView());
   put("#view", state.view === "list" ? listView() : state.view === "board" ? boardView() : activityView());
   put("#detail", detailView());
   put("#pop", popoverView());
@@ -426,10 +509,11 @@ document.addEventListener("click", (e) => {
     subscribeView();
     return render();
   }
-  if (el("[data-pop='filter-owner']") && state.filter.owner) {
-    state.filter.owner = undefined;
-    subscribeView();
-    return render();
+  if (el("[data-untok]")) return removeTerm(Number(el("[data-untok]")!.dataset.untok));
+  if (el("[data-tokens]")) return searchInput()?.focus();
+  if (state.searchOpen && !el(".sp")) {
+    state.searchOpen = false;
+    render();
   }
   if (el("[data-pop]")) {
     e.stopPropagation();
@@ -443,11 +527,7 @@ document.addEventListener("click", (e) => {
     const b = el("[data-set]")!;
     const p = state.popover;
     state.popover = null;
-    if (b.dataset.set === "filter-owner") {
-      state.filter.owner = b.dataset.v;
-      state.filter.ownerName = b.dataset.name;
-      subscribeView();
-    } else if (p.id) {
+    if (p.id) {
       const name = { status: "setStatus", priority: "setPriority", ownerId: "setOwner" }[b.dataset.set!]!;
       setField(p.id, name, b.dataset.set!, b.dataset.v);
     }
@@ -459,28 +539,11 @@ document.addEventListener("click", (e) => {
     subscribeView();
     render();
   }
-  if (el("[data-fchip]")) {
-    const b = el("[data-fchip]")!;
-    const list = (state.filter as any)[b.dataset.fchip!] as string[];
-    const v = b.dataset.v!;
-    (state.filter as any)[b.dataset.fchip!] = list.includes(v) ? list.filter((x) => x !== v) : [...list, v];
-    state.pages = [{}];
-    subscribeView();
-    return render();
-  }
-  if (el("[data-pop='filter-owner']") && state.filter.owner) {
-    state.filter.owner = undefined;
-    subscribeView();
-    return render();
-  }
-  if (el("[data-cleartag]")) {
-    state.filter.tag = undefined;
-    subscribeView();
-    return render();
-  }
   if (el(".tag[data-tag]") && !el("[data-untag]")) {
     e.stopPropagation();
-    state.filter.tag = el(".tag[data-tag]")!.dataset.tag;
+    const tag = el(".tag[data-tag]")!.dataset.tag!;
+    if (!state.terms.some((x) => x.kind === "tag" && x.value === tag)) state.terms = [...state.terms, { kind: "tag", value: tag, label: tag }];
+    state.pages = [{}];
     state.view = state.view === "activity" ? "list" : state.view;
     subscribeView();
     return render();
@@ -528,19 +591,42 @@ document.addEventListener("click", (e) => {
   }
 });
 
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+let lastSearch = "";
+
+document.addEventListener("focusin", (e) => {
+  if ((e.target as HTMLElement).matches("[data-search]") && !state.searchOpen) {
+    state.searchOpen = true;
+    render();
+  }
+});
+// Suggestions are picked on mousedown, so the box keeps focus.
+document.addEventListener("mousedown", (e) => {
+  const b = (e.target as HTMLElement).closest("[data-sugg]") as HTMLElement | null;
+  if (b) {
+    e.preventDefault();
+    const x = suggs[Number(b.dataset.sugg)];
+    if (x) applySugg(x);
+  }
+});
+
 document.addEventListener("input", (e) => {
   const t = e.target as HTMLInputElement;
   if (t.matches("[data-search]")) {
-    clearTimeout((t as any)._d);
-    (t as any)._d = setTimeout(() => {
-      state.filter.title = t.value.trim() || undefined;
+    // Suggestions and the loaded rows update at once; the live queries after a pause.
+    state.draft = t.value;
+    state.searchOpen = true;
+    state.sel = 0;
+    render();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      const key = JSON.stringify([filter(), parseDraft().kind === "owner" && parseDraft().text]);
+      if (key === lastSearch) return;
+      lastSearch = key;
       state.pages = [{}];
       subscribeView();
       render();
-      const s = document.querySelector("[data-search]") as HTMLInputElement;
-      s.focus();
-      s.setSelectionRange(s.value.length, s.value.length);
-    }, 200);
+    }, 250);
   }
   if (t.matches("[data-popsearch]") && state.popover) {
     clearTimeout((t as any)._d);
@@ -558,6 +644,29 @@ document.addEventListener("change", (e) => {
 
 document.addEventListener("keydown", (e) => {
   const t = e.target as HTMLElement;
+  if (t.matches("[data-search]")) {
+    const input = t as HTMLInputElement;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      state.searchOpen = true;
+      state.sel = (state.sel + (e.key === "ArrowDown" ? 1 : suggs.length - 1)) % Math.max(suggs.length, 1);
+      return render();
+    }
+    if (e.key === "Enter" || (e.key === "Tab" && suggs[state.sel]?.prefix && input.value)) {
+      const x = suggs[state.sel];
+      if (x) {
+        e.preventDefault();
+        applySugg(x);
+      }
+      return;
+    }
+    if (e.key === "Backspace" && !input.value && state.terms.length) return removeTerm(state.terms.length - 1);
+    if (e.key === "Escape") {
+      state.searchOpen = false;
+      input.blur();
+      return render();
+    }
+  }
   if (t.matches("[data-addtag]") && e.key === "Enter") {
     const input = t as HTMLInputElement;
     const v = input.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-");
@@ -638,7 +747,11 @@ $("#view").addEventListener("scroll", () => {
 });
 
 // For tests and the curious: the loaded list as data.
-(window as unknown as { __pagedb: unknown }).__pagedb = { listRows, pages: () => state.pages.length };
+(window as unknown as { __pagedb: unknown }).__pagedb = {
+  listRows,
+  pages: () => state.pages.length,
+  subs: () => sync.all().map((x) => ({ id: x.id, ready: x.ready, rows: x.rows.size, ms: x.firstMs, rounds: x.stats?.rounds, args: x.ref.args })),
+};
 
 sync.onChange(() => {
   render();

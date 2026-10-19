@@ -226,3 +226,45 @@ fn keyset_pages_cover_the_list_exactly() {
         }
     }
 }
+
+fn has_comment(needle: &str) -> J {
+    json!({"type":"correlatedSubquery","op":"EXISTS","related":{"correlation":{"parentField":["id"],"childField":["issueId"]},
+        "subquery":{"table":"comment","where":cond("ILIKE","body",json!(format!("%{needle}%")))}}})
+}
+
+#[test]
+fn comment_search_matches_the_oracle() {
+    let (db, rows) = setup();
+    let order = json!([["createdAt","desc"],["id","asc"]]);
+    let p = "p0003";
+    let bodies = |id: &str| -> Vec<String> { rows.comments.iter().filter(|c| s(&c[comment::ISSUE]) == id).map(|c| s(&c[comment::BODY]).to_lowercase()).collect() };
+    let any_status = |_: &Vec<Value>| true;
+    // A common word, a rare phrase, two words (each in some comment), and with other filters.
+    let cases: Vec<(Vec<&str>, Option<J>, Box<dyn Fn(&Vec<Value>) -> bool>, usize)> = vec![
+        (vec!["cache"], None, Box::new(any_status), 50),
+        (vec!["jank flicker"], None, Box::new(any_status), 20),
+        (vec!["webhook", "invoice"], None, Box::new(any_status), 30),
+        (vec!["retry"], Some(eq("status", json!("todo"))), Box::new(|r: &Vec<Value>| s(&r[issue::STATUS]) == "todo"), 25),
+        (vec!["Socket"], Some(cond("ILIKE", "title", json!("%sync%"))), Box::new(|r: &Vec<Value>| s(&r[issue::TITLE]).to_lowercase().contains("sync")), 10),
+    ];
+    for (needles, extra, keep, limit) in cases {
+        let mut conds = vec![eq("projectId", json!(p))];
+        conds.extend(extra);
+        conds.extend(needles.iter().map(|n| has_comment(n)));
+        let ast = json!({"table":"issue","where":{"type":"and","conditions":conds},"orderBy":order,"limit":limit,"related":card_related()});
+        let (out, rounds, pages) = run(&db, &ast);
+        let want = oracle_issues(
+            &rows,
+            |r| {
+                let b = bodies(s(&r[issue::ID]));
+                s(&r[issue::PROJECT]) == p && keep(r) && needles.iter().all(|n| b.iter().any(|x| x.contains(&n.to_lowercase())))
+            },
+            limit,
+        );
+        assert_eq!(ids(&out), want, "{needles:?}");
+        eprintln!("comment search {needles:?}: {} rows, {rounds} rounds, {pages} pages", want.len());
+    }
+    // Counting a comment search would read every comment of the project: refused.
+    let ast = json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), has_comment("cache")]},"aggregate":"count"});
+    assert!(compile(&ast).is_err());
+}
