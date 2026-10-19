@@ -1,0 +1,10 @@
+{
+  "name": "pagedb-r2-matrix",
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "durable_objects": { "bindings": [{ "name": "PROBE", "class_name": "Probe" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Probe"] }],
+  "kv_namespaces": [{ "binding": "KV", "id": "2044c117f3374ffe8be2125b036a52e2" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }]
+}
