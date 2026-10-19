@@ -288,7 +288,7 @@ function hudView() {
     ${subs
       .map((s) => {
         const st = s.stats;
-        const tier = !st ? (s.ready ? "server-rendered" : "…") : st.rounds === 0 ? "resident" : st.r2Gets ? `${st.rounds} round · R2` : `${st.rounds} round · cache`;
+        const tier = !st ? (s.ready ? "server-rendered" : "…") : st.rounds === 0 ? "resident" : `${st.rounds} round${st.rounds > 1 ? "s" : ""} · ${st.r2Gets ? "R2" : "cache"}`;
         return `<div class="hq"><span class="hq-l">${esc(label(s))}</span><span class="hq-r">${st ? `${Math.round(s.firstMs ?? 0)}ms` : ""} <i>${tier}</i>${s.updates ? ` · ${s.updates}↻` : ""}</span></div>`;
       })
       .join("")}

@@ -1,0 +1,18 @@
+{
+  "name": "pagedb-builder",
+  "main": "src/builder-worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["enable_ctx_exports"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "containers": [
+    {
+      "class_name": "BuilderBox",
+      "scheduling_policy": "durable_object",
+      "images": { "builder": { "dockerfile": "./Dockerfile.builder" } }
+    }
+  ],
+  "durable_objects": { "bindings": [{ "name": "BOX", "class_name": "BuilderBox" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BuilderBox"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }]
+}

@@ -40,8 +40,27 @@ export interface QueryStats {
   totalMs: number;
 }
 
+/** At most 6 outgoing connections per object, shared by every concurrent query and write. */
+class Gate {
+  private active = 0;
+  private queue: (() => void)[] = [];
+  async run<T>(f: () => Promise<T>): Promise<T> {
+    if (this.active >= CONCURRENCY) await new Promise<void>((r) => this.queue.push(r));
+    this.active++;
+    try {
+      return await f();
+    } finally {
+      this.active--;
+      this.queue.shift()?.();
+    }
+  }
+}
+
 export class DbObject extends DurableObject<Env> {
   private sql: SqlStorage;
+  private gate = new Gate();
+  /** Chunks being fetched right now: concurrent faults on the same chunk share one GET. */
+  private inflight = new Map<number, Promise<ArrayBuffer>>();
   private live: Live = { subs: new Map(), pidOf: new Map() };
   private engine?: Engine;
   private db?: string;
@@ -160,10 +179,14 @@ export class DbObject extends DurableObject<Env> {
     stats.pages += ids.length;
     stats.chunks += chunks.length;
     const wanted = new Set(ids);
-    const queue = [...chunks];
-    const worker = async () => {
-      for (let c = queue.shift(); c !== undefined; c = queue.shift()) {
-        const bytes = await this.fetchChunk(c, stats);
+    await Promise.all(
+      chunks.map(async (c) => {
+        let p = this.inflight.get(c);
+        if (!p) {
+          p = this.gate.run(() => this.fetchChunk(c, stats)).finally(() => this.inflight.delete(c));
+          this.inflight.set(c, p);
+        }
+        const bytes = await p;
         const first = c * PAGES_PER_CHUNK;
         for (let i = 0; i * PAGE < bytes.byteLength; i++) {
           const id = first + i;
@@ -171,9 +194,8 @@ export class DbObject extends DurableObject<Env> {
           if ((all || wanted.has(id)) && !this.engine!.putPage(id, page)) throw new Error(`page ${id} failed its checksum`);
           this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page);
         }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, worker));
+      }),
+    );
   }
 
   private async fetchChunk(chunk: number, stats: QueryStats): Promise<ArrayBuffer> {
@@ -270,6 +292,10 @@ export class DbObject extends DurableObject<Env> {
       return;
     }
     await this.ensure(this.db ?? this.ctx.storage.kv.get<string>("db") ?? "db1g");
+    if (m.t === "subs" && Array.isArray((m as any).list)) {
+      await this.subscribeMany(ws, cid, (m as any).list);
+      return;
+    }
     if (m.t === "sub" && m.id && m.q) {
       const q = typeof m.q === "string" ? m.q : JSON.stringify(m.q);
       const stats = newStats();
@@ -290,6 +316,46 @@ export class DbObject extends DurableObject<Env> {
       this.untrack(cid, m.id);
       this.sql.exec("DELETE FROM subs WHERE cid = ? AND id = ?", cid, m.id);
     }
+  }
+
+  /**
+   * Hydrate several subscriptions together: every query's missing pages are gathered into one
+   * fault round (shared chunks fetched once), then each query is retried. A board's ten
+   * queries cost one round instead of ten.
+   */
+  private async subscribeMany(ws: WebSocket, cid: string, list: { id: string; q: unknown }[]) {
+    const t0 = performance.now();
+    const stats = newStats();
+    const pending = list.filter((x) => x?.id && x?.q).map((x) => ({ id: x.id, q: typeof x.q === "string" ? x.q : JSON.stringify(x.q) }));
+    const done: { id: string; q: string; r: { pid: number; rows?: unknown[]; complete?: boolean; count?: number } }[] = [];
+    while (pending.length) {
+      const faults = new Set<number>();
+      for (let i = pending.length - 1; i >= 0; i--) {
+        try {
+          const { status, out } = this.engine!.subscribe(pending[i].q);
+          if (status === OK) {
+            done.push({ ...pending[i], r: JSON.parse(Engine.text(out)) });
+            pending.splice(i, 1);
+          } else for (const id of Engine.faults(out)) faults.add(id);
+        } catch (e) {
+          ws.send(JSON.stringify({ t: "error", id: pending[i].id, message: String((e as Error).message ?? e) }));
+          pending.splice(i, 1);
+        }
+      }
+      if (!faults.size) break;
+      if (++stats.rounds > MAX_ROUNDS) throw new Error("too many fault rounds");
+      const f0 = performance.now();
+      await this.resolve([...faults], stats);
+      stats.roundMs.push(+(performance.now() - f0).toFixed(1));
+    }
+    stats.totalMs = performance.now() - t0;
+    const version = this.engine!.overlayStats().version;
+    for (const d of done) {
+      this.untrack(cid, d.id);
+      this.track(cid, d.id, d.r.pid);
+      this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, d.id, d.q);
+    }
+    ws.send(JSON.stringify({ t: "snaps", version, stats: round(stats), list: done.map((d) => ({ id: d.id, rows: d.r.rows, complete: d.r.complete, count: d.r.count })) }));
   }
 
   async webSocketClose(ws: WebSocket, code: number) {
@@ -333,13 +399,22 @@ export class DbObject extends DurableObject<Env> {
       }
     }
     if (perSocket.size) {
+      // Sockets holding the same subscriptions get the same bytes: encode each distinct
+      // message once (1,000 tabs on one board = one stringify, not 1,000).
+      const encoded = new Map<Record<string, unknown[]>, string>();
+      const byShape = new Map<string, Record<string, unknown[]>>();
       for (const ws of this.ctx.getWebSockets()) {
-        const subs = perSocket.get((ws.deserializeAttachment() as { cid: string }).cid);
-        if (subs) {
-          try {
-            ws.send(JSON.stringify({ t: "poke", version: result.version, subs }));
-          } catch {}
-        }
+        let subs = perSocket.get((ws.deserializeAttachment() as { cid: string }).cid);
+        if (!subs) continue;
+        const shape = Object.keys(subs).sort().join("\u0000") + "\u0001" + Object.values(subs).map((o) => (o as unknown[]).length).join(",");
+        const same = byShape.get(shape);
+        if (same && Object.keys(subs).every((k) => same[k] === subs![k])) subs = same;
+        else byShape.set(shape, subs);
+        let msg = encoded.get(subs);
+        if (!msg) encoded.set(subs, (msg = JSON.stringify({ t: "poke", version: result.version, subs })));
+        try {
+          ws.send(msg);
+        } catch {}
       }
     }
     return { version: result.version, changes: result.changes, ms: +(performance.now() - t0).toFixed(1), rounds: stats.rounds };

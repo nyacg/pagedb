@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pagedb · how it works</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+  body { background: var(--bg); }
+  .doc { max-width: 880px; margin: 0 auto; padding: 36px 24px 80px; }
+  .doc h1 { font-size: 30px; letter-spacing: -.02em; margin: 0 0 6px; } .doc h2 { font-size: 19px; margin: 38px 0 8px; }
+  .doc p, .doc li { color: var(--ink2); font-size: 15px; line-height: 1.6; } .doc b { color: var(--ink); }
+  .lede { font-size: 17px !important; }
+  .tiers { display: grid; gap: 8px; margin: 14px 0; }
+  .tier { display: grid; grid-template-columns: 170px 1fr 120px; gap: 12px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+  .tier b { font-size: 14px; } .tier .ms { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }
+  .tier:nth-child(1) { border-left: 4px solid #16a34a; } .tier:nth-child(2) { border-left: 4px solid #65a30d; } .tier:nth-child(3) { border-left: 4px solid #d97706; } .tier:nth-child(4) { border-left: 4px solid #dc2626; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line2); } th { background: #f6f5f3; color: var(--ink2); font-weight: 600; font-size: 12.5px; }
+  td.n { font-variant-numeric: tabular-nums; } .win { color: #15803d; font-weight: 600; }
+  pre { background: #f6f5f3; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 12.5px; overflow: auto; }
+  .back { color: var(--accent); text-decoration: none; font-size: 14px; }
+</style></head>
+<body><div class="doc">
+<a class="back" href="/">← back to the tracker</a>
+<h1>How pagedb works</h1>
+<p class="lede">A database whose base lives in R2 as immutable pages, served by <b>one Durable Object</b> that only ever holds what queries touch. Every list, board column and thread in the tracker is a <b>live query</b>: when anyone writes, the object works out exactly which rows of which open views changed and pushes just those.</p>
+<p>Our take on <a href="https://demo.r2db.dev">r2db</a>, rebuilt from its public behaviour and built to be measured. The engine is Rust compiled to WebAssembly (the same code builds the dataset natively); the object, sync protocol and UI are TypeScript.</p>
+
+<h2>1 · Four tiers, one object</h2>
+<p>A page is a 64 KiB block of one B+tree. When a query needs a page, it looks in each tier in turn:</p>
+<div class="tiers">
+  <div class="tier"><b>RAM (in the engine)</b><span>A fixed 32 MiB budget inside the WebAssembly heap.</span><span class="ms">&lt; 1 µs</span></div>
+  <div class="tier"><b>The object's SQLite</b><span>Pages it has fetched before, plus every tree's interior pages. Synchronous, survives hibernation.</span><span class="ms">~µs</span></div>
+  <div class="tier"><b>Cloudflare cache, same city</b><span>The base is immutable, so 1 MiB chunks can be cached at the object's location.</span><span class="ms">10–30 ms</span></div>
+  <div class="tier"><b>R2</b><span>The base: 4 MiB parts. A page's id is its position, so its location is arithmetic.</span><span class="ms">170–370 ms</span></div>
+</div>
+
+<h2>2 · A read never waits halfway</h2>
+<p>The engine can't wait for R2 in the middle of a query (WebAssembly calls are synchronous). So when a query needs a page no synchronous tier holds, it <b>records it and keeps going</b>, collecting every page the query will need, then hands the whole list back. The object fetches them as a few coalesced 1 MiB reads (at most 6 at once, a Durable Object limit) and runs the query again.</p>
+<ul>
+  <li><b>Interior pages are pinned.</b> Every tree's branch pages and the small tables (users, projects) are built into one contiguous region at the end of the base and loaded when the object starts. Only leaves can be missing.</li>
+  <li><b>Branch pages know how many rows sit under each child</b>, so a scan for "the newest 50 issues" knows which leaves it will need before reading any of them: <b>one round</b>, however many leaves.</li>
+  <li><b>Covering indexes.</b> An issue list reads one index that holds whole rows, including the issue's tags and its comment count (kept up to date on every comment). The list for a project touches one or two 64 KiB leaves.</li>
+  <li><b>Several queries share a round.</b> A board's ten live queries arrive in one message and their missing pages are fetched together.</li>
+</ul>
+
+<h2>3 · A write updates the views it affects</h2>
+<p>Writes don't touch the base. They go into an <b>overlay</b> of index entries in the object's SQLite (durable when acknowledged, like any Durable Object write), and reads merge the base with the overlay. Counts stay instant: each overlay entry carries its effect on the row count.</p>
+<p>Each open query is a <b>window</b> of keys. For every write, the engine computes, for each window, which rows enter, leave or change (and refills a window from the index if rows left it). This is done <b>without changing anything</b>: if a page is missing, the whole write is retried once it's fetched, so a push can never half-apply. Then the overlay and every window commit together, and each socket gets one message with its changes.</p>
+<p>The tracker applies your edits <b>optimistically</b>: they show instantly, and are reconciled when the server's update (at or after your write's version) arrives. r2db's demo waits for the server.</p>
+
+<h2>4 · Measured</h2>
+<table>
+  <tr><th>Deployed, 1 GB base (284k issues)</th><th>pagedb</th><th>r2db demo</th></tr>
+  <tr><td>Object waking from sleep</td><td class="n win">~0 ms of I/O (state in its SQLite)</td><td class="n">3.2 s</td></tr>
+  <tr><td>Issue list, new object, page in city cache</td><td class="n win">44 ms (start + 1 round)</td><td class="n">172 ms</td></tr>
+  <tr><td>Issue list, nothing cached anywhere (R2)</td><td class="n">≈ 570 ms (3 sequential R2 reads)</td><td class="n">—</td></tr>
+  <tr><td>Count of a project's issues</td><td class="n win">3.6 µs engine time</td><td class="n">3 ms</td></tr>
+  <tr><td>Your own edit visible</td><td class="n win">instant (optimistic)</td><td class="n">after the server round trip</td></tr>
+  <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
+</table>
+<p style="font-size:13px">r2db numbers are from their published source comments and our measurements of their public demo. Larger bases (10 GB, 100 GB) are being built; the read path doesn't change with size (one leaf round), only how often a page is already cached.</p>
+
+<h2>5 · Limits (honest list)</h2>
+<ul>
+  <li><b>Only indexed queries.</b> A query must be answerable from an index (equalities, then the index order); anything else is refused rather than scanning 100 GB.</li>
+  <li><b>One object's CPU.</b> All reads, writes and pushes for a database run on one thread. Read replicas (more objects sharing the base) are the next step.</li>
+  <li><b>Cold reads cost R2 latency</b> (~200 ms+ per round for parts nobody has read recently).</li>
+  <li><b>Base data is generated</b> and users/projects are read-only in the demo; the activity feed's index holds the newest 500k comments of the base plus everything written since.</li>
+</ul>
+<h2>6 · Layout</h2>
+<pre>engine/core     Rust: codec, 64 KiB pages, B+tree, overlay, queries, writes, IVM (tests: oracle + fault-injection fuzz)
+engine/wasm     the engine as WebAssembly for the Durable Object
+engine/builder  native: generates the dataset, writes 4 MiB parts (runs in a Cloudflare Container for 100 GB)
+src/do.ts       the Durable Object: tiers, fault rounds, sockets, overlay persistence
+src/app.ts      the tracker's named queries and mutators
+web/            this site</pre>
+</div></body></html>

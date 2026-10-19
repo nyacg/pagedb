@@ -92,9 +92,16 @@ export class Sync {
     };
   }
 
+  private outbox: Sub[] = [];
+  /** Subscriptions made in the same tick go out as one message (one fault round server-side). */
   private send(s: Sub) {
     s.sentAt = performance.now();
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: "sub", id: s.id, q: s.q }));
+    this.outbox.push(s);
+    if (this.outbox.length === 1)
+      queueMicrotask(() => {
+        const list = this.outbox.splice(0).filter((x) => this.subs.get(x.id) === x);
+        if (list.length && this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ t: "subs", list: list.map((x) => ({ id: x.id, q: x.q })) }));
+      });
   }
 
   /** Subscribe (or re-point) `id` at query `q`. Returns the live subscription. */
@@ -142,6 +149,10 @@ export class Sync {
       s.stats = m.stats;
       s.firstMs = performance.now() - s.sentAt;
       this.version = Math.max(this.version, m.version ?? 0);
+    }
+    if (m.t === "snaps") {
+      for (const one of m.list) this.onMessage({ t: "snap", ...one, version: m.version, stats: m.stats, batch: m.list.length });
+      return;
     }
     if (m.t === "poke") {
       for (const [id, ops] of Object.entries(m.subs as Record<string, any[]>)) {
