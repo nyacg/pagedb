@@ -39,6 +39,11 @@ fn and(cs: Vec<J>) -> J {
     json!({"type":"and","conditions":cs})
 }
 
+fn has_comment(needle: &str) -> J {
+    json!({"type":"correlatedSubquery","op":"EXISTS","related":{"correlation":{"parentField":["id"],"childField":["issueId"]},
+        "subquery":{"table":"comment","where":cond("ILIKE","body",json!(format!("%{needle}%")))}}})
+}
+
 fn queries() -> Vec<J> {
     let order = json!([["createdAt","desc"],["id","asc"]]);
     let owner = json!({"alias":"owner","correlation":{"parentField":["ownerId"],"childField":["id"]},"subquery":{"table":"user"}});
@@ -53,6 +58,9 @@ fn queries() -> Vec<J> {
         json!({"table":"issue","where":eq("projectId", json!("p0000")),"aggregate":"count"}),
         json!({"table":"issue","where":and(vec![eq("projectId", json!("p0001")), eq("status", json!("done"))]),"aggregate":"count"}),
         json!({"table":"comment","orderBy":order,"limit":10}),
+        // Comment search: issues enter when a matching comment is added and leave when it's deleted.
+        json!({"table":"issue","where":and(vec![eq("projectId", json!("p0000")), has_comment("blocked")]),"orderBy":order,"limit":10}),
+        json!({"table":"issue","where":and(vec![eq("projectId", json!("p0001")), cond("IN","priority",json!(["urgent","high"])), has_comment("cache")]),"orderBy":order,"limit":6}),
     ];
     for id in ["i000000399", "i000000398", "i000100005"] {
         q.push(json!({"table":"issue","where":eq("id", json!(id)),"one":true,"related":[cc.clone(),
@@ -186,7 +194,7 @@ fn random_ops(r: &mut Rng, model: &Model, step: usize, clock: &mut f64) -> J {
             2 => json!({"op":"update","table":"issue","id": pick_issue(r),"set":{"status": ST[r.below(5) as usize]}}),
             3 => json!({"op":"update","table":"issue","id": pick_issue(r),"set":{"priority": PRI[r.below(4) as usize], "title": if r.below(2)==0 {"Cache warming"} else {"Something else"}}}),
             4 => json!({"op":"update","table":"issue","id": pick_issue(r),"set":{"tags": (0..r.below(3)).map(|_| tags[r.below(4) as usize]).collect::<Vec<_>>()}}),
-            5 | 6 => json!({"op":"insert","table":"comment","row":{"id": format!("k{step:05}{j}"),"issueId": pick_issue(r),"authorId": format!("u{:05}", r.below(50)),"body":"looks good","createdAt": *clock}}),
+            5 | 6 => json!({"op":"insert","table":"comment","row":{"id": format!("k{step:05}{j}"),"issueId": pick_issue(r),"authorId": format!("u{:05}", r.below(50)),"body": if r.below(3)==0 {"blocked on the cache"} else {"looks good"},"createdAt": *clock}}),
             7 => json!({"op":"delete","table":"comment","id": if comment_ids.is_empty() { "none".to_string() } else { comment_ids[r.below(comment_ids.len() as u64) as usize].clone() }}),
             _ => json!({"op":"delete","table":"issue","id": pick_issue(r)}),
         });

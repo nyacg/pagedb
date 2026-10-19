@@ -9,8 +9,20 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DbObject"] }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
   "triggers": { "crons": ["0 9 * * *"] },
-  // The public demo: the 100 GB base, one long-lived object (its city cache and SQLite stay warm).
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
+  // The public demo: the 100 GB base, one long-lived object (its city cache and SQLite stay warm).
   "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g" },
-  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }]
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
+  "env": {
+    // `npm run deploy:preview` → https://pagedb-preview.do-pool-lab.workers.dev: same base in R2,
+    // its own objects (so its writes never reach the live demo). Secrets are set per Worker.
+    "preview": {
+      "name": "pagedb-preview",
+      "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }] },
+      "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+      "triggers": { "crons": [] },
+      "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g" }
+    }
+  }
 }

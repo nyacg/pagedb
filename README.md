@@ -66,6 +66,15 @@ Details: `bench/results/*.md`.
    - Raw ASTs (`/api/query`, raw socket subscriptions) and raw row ops (`/api/write`) need the admin token.
      Benchmarks and tests use it. Visitors always reach the demo object.
 
+7. **Search.** The search box takes terms as chips: `title:`, `status:`, `priority:`, `owner:`,
+   `tag:`, `comment:` (plain text searches titles). Several statuses, priorities or owners match any
+   of them; tags, title words and comment words must all match.
+   - Comment search is `EXISTS (comment of the issue whose body ILIKE …)`. There's no word index, so
+     the object reads a project's comment pages, in rounds that grow (~200 issues first, then ~8×).
+   - From R2 it takes 1.4–1.9 s for a common word, ~3.5–5 s for a word in no comment of a 10k-issue
+     project (~20–35 MB, read as a few large ranged GETs). Once a project's comments are in the
+     object it's instant. Live: adding or deleting a matching comment moves the issue in or out.
+
 ## Layout
 
 ```
@@ -90,6 +99,7 @@ test/            live sync and hibernation end-to-end tests (deployed)
 cd engine && cargo test --release                       # engine tests
 cargo run --release -p pagedb-builder -- build --projects 27 --out ../data/db1g   # 1 GB in ~7 s
 cd .. && npm i && npm run deploy                        # wasm + web + Worker
+npm run deploy:preview                                  # same, to pagedb-preview (own objects; try changes there first)
 node scripts/upload.mjs data/db1g db1g                  # base → R2 (or the builder container for 100 GB)
 node bench/query.mjs db1g && node bench/load.mjs --sockets 200
 node --import tsx --test test/live.test.ts test/hibernate.test.ts test/lease.test.ts   # need ADMIN_TOKEN in .env
