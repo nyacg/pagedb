@@ -14,6 +14,7 @@ import { decodeRecords, encodeRecords, type OvRecord } from "./overlay-codec";
 export interface Env {
   DB: DurableObjectNamespace<DbObject>;
   BUCKET: R2Bucket;
+  ASSETS: Fetcher;
   ADMIN_TOKEN?: string;
 }
 

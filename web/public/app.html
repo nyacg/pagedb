@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pagedb · issues</title>
+<meta name="description" content="A Linear-style tracker on a database that lives in R2, served by one Durable Object. Every list, column and thread is a live query.">
+<link rel="stylesheet" href="/app.css"><!--BOOT--></head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand">page<span>db</span></div>
+    <button id="side-project" class="side-project"></button>
+    <nav>
+      <button data-view="list"><svg viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10"/></svg>Issues</button>
+      <button data-view="board"><svg viewBox="0 0 16 16"><path d="M3 3h3v10H3zM7 3h3v7H7zM11 3h3v5h-3z"/></svg>Board</button>
+      <button data-view="activity"><svg viewBox="0 0 16 16"><path d="M2 8h3l2-5 2 10 2-5h3"/></svg>Activity</button>
+    </nav>
+    <div id="hud" class="hud"></div>
+    <a class="side-link" href="/how.html">How it works →</a>
+    <div id="me" class="me"></div>
+  </aside>
+  <main class="main">
+    <header id="head" class="head"></header>
+    <div id="filters"></div>
+    <section id="view" class="view"></section>
+  </main>
+  <div id="detail"></div>
+</div>
+<div id="pop"></div><div id="create"></div><div id="toast" class="toast"></div>
+<script type="module" src="/app.js"></script>
+</body></html>

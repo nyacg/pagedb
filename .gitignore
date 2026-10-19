@@ -5,3 +5,4 @@ dist/
 *.part
 data/
 .env
+web/public/app.js
