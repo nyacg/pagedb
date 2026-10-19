@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
 import WebSocket from "ws";
 
 const BASE = process.env.BASE ?? "https://pagedb.do-pool-lab.workers.dev";
+const TOKEN = (await import("node:fs")).readFileSync(".env", "utf8").match(/ADMIN_TOKEN=(\S+)/)![1];
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 const DB = "db1g";
 const OBJ = `live-${Date.now().toString(36)}`; // a private object: the overlay starts empty
 const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
@@ -29,7 +31,7 @@ class Client {
   views = new Map<string, Map<string, { id: string }>>();
   counts = new Map<string, number>();
   async open() {
-    this.ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=${DB}&obj=${OBJ}`);
+    this.ws = new WebSocket(`${BASE.replace(/^http/, "ws")}/api/socket?db=${DB}&obj=${OBJ}&token=${TOKEN}`);
     this.ws.on("message", (d) => {
       const m = JSON.parse(String(d)) as Msg;
       if (m.t === "snap") {
@@ -67,14 +69,14 @@ class Client {
 
 async function write(ops: unknown[]) {
   const t0 = performance.now();
-  const res = await fetch(`${BASE}/api/write`, { method: "POST", body: JSON.stringify({ db: DB, obj: OBJ, ops: { ops } }) });
+  const res = await fetch(`${BASE}/api/write`, { method: "POST", headers: AUTH, body: JSON.stringify({ db: DB, obj: OBJ, ops: { ops } }) });
   const body = (await res.json()) as { version: number; error?: string };
   assert.equal(body.error, undefined, body.error);
   return { ...body, t0 };
 }
 
 async function fresh(q: unknown) {
-  const res = await fetch(`${BASE}/api/query`, { method: "POST", body: JSON.stringify({ db: DB, obj: OBJ, ast: q }) });
+  const res = await fetch(`${BASE}/api/query`, { method: "POST", headers: AUTH, body: JSON.stringify({ db: DB, obj: OBJ, ast: q }) });
   return ((await res.json()) as { result: { rows?: { id: string }[]; count?: number } }).result;
 }
 

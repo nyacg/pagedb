@@ -23,15 +23,21 @@ export interface Filter {
   title?: string;
 }
 
-export function issuesQuery(project: string, f: Filter = {}, limit = 50) {
+type Cursor = { createdAt: number; id: string };
+
+export function issuesQuery(project: string, f: Filter = {}, limit = 50, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
   const conds: unknown[] = [eq("projectId", project)];
-  if (f.status?.length === 1) conds.push(eq("status", f.status[0]));
-  else if (f.status?.length) conds.push(cond("IN", "status", f.status));
+  const st = status ? [status] : f.status ?? [];
+  if (st.length === 1) conds.push(eq("status", st[0]));
+  else if (st.length) conds.push(cond("IN", "status", st));
   if (f.priority?.length) conds.push(cond("IN", "priority", f.priority));
   if (f.owner) conds.push(eq("ownerId", f.owner));
   if (f.tag) conds.push(cond("HAS", "tags", f.tag));
   if (f.title) conds.push(cond("ILIKE", "title", `%${f.title}%`));
-  return { table: "issue", where: conds.length === 1 ? conds[0] : { type: "and", conditions: conds }, orderBy: ORDER, limit: Math.min(Math.max(limit, 1), 500), related: CARD };
+  const q: Record<string, unknown> = { table: "issue", where: conds.length === 1 ? conds[0] : { type: "and", conditions: conds }, orderBy: ORDER, limit: Math.min(Math.max(limit, 1), 1000), related: CARD };
+  if (bounds.start) q.start = { row: bounds.start };
+  if (bounds.end) q.end = { row: bounds.end };
+  return q;
 }
 
 export function countQuery(project: string, status?: string) {
@@ -64,7 +70,65 @@ export const feedQuery = () => ({
 });
 
 export const projectsQuery = (search = "") => ({ table: "project", where: search ? cond("ILIKE", "name", `%${search}%`) : undefined, orderBy: [["id", "asc"]], limit: 60 });
+export const projectQuery = (id: string) => ({ table: "project", where: eq("id", id), one: true });
+export const userQuery = (id: string) => ({ table: "user", where: eq("id", id), one: true });
 export const usersQuery = (search = "") => ({ table: "user", where: search ? cond("ILIKE", "name", `%${search}%`) : undefined, orderBy: [["id", "asc"]], limit: 20 });
+
+// ---------------------------------------------------------------- named queries (what may be leased)
+
+const PROJECT = /^p\d{4}$/;
+const USER = /^u\d{5}$/;
+const ISSUE = /^(i\d{9}|u-[a-z0-9]{6,24})$/;
+const TAG = /^[a-z0-9-]{1,28}$/;
+function need<T>(ok: boolean, v: T, what: string): T {
+  if (!ok) throw new Error(`bad ${what}`);
+  return v;
+}
+const text = (v: unknown, what: string, max: number) => need(v === undefined || (typeof v === "string" && v.length <= max), v as string | undefined, what);
+const cursor = (v: unknown, what: string): Cursor | undefined => {
+  if (v === undefined) return undefined;
+  const c = v as Cursor;
+  return need(!!c && typeof c.createdAt === "number" && Number.isFinite(c.createdAt) && typeof c.id === "string" && ISSUE.test(c.id), { createdAt: c.createdAt, id: c.id }, what);
+};
+const list = <T extends string>(v: unknown, allowed: readonly T[], what: string): T[] =>
+  need(v === undefined || (Array.isArray(v) && v.length <= allowed.length && v.every((x) => allowed.includes(x))), (v as T[] | undefined) ?? [], what);
+
+/** The only queries a page can subscribe to. Arguments are validated; the AST is built here. */
+export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
+  switch (name) {
+    case "issues": {
+      const project = need(PROJECT.test(a.project), a.project as string, "project");
+      const f = (a.filter ?? {}) as Record<string, unknown>;
+      const filter: Filter = {
+        status: list(f.status, STATUSES, "status"),
+        priority: list(f.priority, PRIORITIES, "priority"),
+        owner: need(f.owner === undefined || USER.test(f.owner as string), f.owner as string | undefined, "owner"),
+        tag: need(f.tag === undefined || TAG.test(f.tag as string), f.tag as string | undefined, "tag"),
+        title: text(f.title, "title search", 60),
+      };
+      const status = need(a.status === undefined || STATUSES.includes(a.status), a.status as string | undefined, "status");
+      const limit = need(Number.isInteger(a.limit) && a.limit >= 1 && a.limit <= 1000, a.limit as number, "limit");
+      return issuesQuery(project, filter, limit, status, { start: cursor(a.start, "start"), end: cursor(a.end, "end") });
+    }
+    case "count": {
+      const project = need(PROJECT.test(a.project), a.project as string, "project");
+      return countQuery(project, need(a.status === undefined || STATUSES.includes(a.status), a.status as string | undefined, "status"));
+    }
+    case "detail":
+      return detailQuery(need(ISSUE.test(a.id), a.id as string, "issue id"));
+    case "feed":
+      return feedQuery();
+    case "project":
+      return projectQuery(need(PROJECT.test(a.id), a.id as string, "project"));
+    case "projects":
+      return projectsQuery(text(a.search, "search", 40) ?? "");
+    case "user":
+      return userQuery(need(USER.test(a.id), a.id as string, "user"));
+    case "users":
+      return usersQuery(text(a.search, "search", 40) ?? "");
+  }
+  throw new Error(`unknown query ${name}`);
+}
 
 // ---------------------------------------------------------------- mutators
 

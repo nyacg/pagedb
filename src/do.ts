@@ -10,12 +10,17 @@
 import { DurableObject } from "cloudflare:workers";
 import { Engine, FAULT, OK, PAGE } from "./engine";
 import { decodeRecords, encodeRecords, type OvRecord } from "./overlay-codec";
+import { verifyLease } from "./lease";
 
 export interface Env {
   DB: DurableObjectNamespace<DbObject>;
   /** R2 on Cloudflare; inside a container (workerd) a fetcher to the R2 bridge instead. */
   BUCKET: R2Bucket | Fetcher;
   ASSETS: Fetcher;
+  /** Signs and verifies leases (signed queries): see src/lease.ts. */
+  LEASE_SECRET?: string;
+  /** This deploy's version (the Worker passes its id to sockets, so stale pages can reload). */
+  CF_VERSION_METADATA?: WorkerVersionMetadata;
   /** RAM tier size in 64 KiB pages (default 512 = 32 MiB, the DO budget). */
   RAM_PAGES?: string;
   /** In a container: R2 through a Worker's public route (with a bearer token). */
@@ -127,6 +132,19 @@ export class DbObject extends DurableObject<Env> {
     // Live subscriptions, so they survive hibernation: (socket id, client query id) → AST.
     this.sql.exec("CREATE TABLE IF NOT EXISTS subs (cid TEXT NOT NULL, id TEXT NOT NULL, q TEXT NOT NULL, PRIMARY KEY (cid, id))");
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
+    // Sockets survive deploys (hibernation), so a page can keep running a client older than this
+    // code. Tell those pages which build is current; they reload.
+    const build = env.CF_VERSION_METADATA?.id;
+    if (build) {
+      for (const ws of ctx.getWebSockets()) {
+        const a = ws.deserializeAttachment() as { cid: string; admin?: boolean; build?: string };
+        if (a.build === build) continue;
+        ws.serializeAttachment({ ...a, build });
+        try {
+          ws.send(JSON.stringify({ t: "hello", build }));
+        } catch {}
+      }
+    }
   }
 
   /** Start the engine (once per object lifetime); returns how long that took if it started. */
@@ -354,15 +372,18 @@ export class DbObject extends DurableObject<Env> {
     const { 0: client, 1: server } = new WebSocketPair();
     const cid = crypto.randomUUID();
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ cid });
+    // Set by the Worker only (it strips this header from client requests): an admin socket may
+    // subscribe raw ASTs (benchmarks); everyone else must present leases.
+    const build = this.env.CF_VERSION_METADATA?.id;
+    server.serializeAttachment({ cid, admin: req.headers.get("x-pagedb-admin") === "1", build });
     await this.ensure(db);
-    server.send(JSON.stringify({ t: "hello", version: this.engine!.overlayStats().version }));
+    server.send(JSON.stringify({ t: "hello", version: this.engine!.overlayStats().version, build }));
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, raw: string | ArrayBuffer) {
     if (typeof raw !== "string") return;
-    const { cid } = ws.deserializeAttachment() as { cid: string };
+    const { cid, admin } = ws.deserializeAttachment() as { cid: string; admin?: boolean };
     let m: { t: string; id?: string; q?: unknown };
     try {
       m = JSON.parse(raw);
@@ -371,10 +392,10 @@ export class DbObject extends DurableObject<Env> {
     }
     await this.ensure(this.db ?? this.ctx.storage.kv.get<string>("db") ?? "db1g");
     if (m.t === "subs" && Array.isArray((m as any).list)) {
-      await this.subscribeMany(ws, cid, (m as any).list);
+      await this.subscribeMany(ws, cid, (m as any).list, !!admin);
       return;
     }
-    if (m.t === "sub" && m.id && m.q) {
+    if (m.t === "sub" && m.id && m.q && admin) {
       const q = typeof m.q === "string" ? m.q : JSON.stringify(m.q);
       const stats = newStats();
       const t0 = performance.now();
@@ -402,10 +423,25 @@ export class DbObject extends DurableObject<Env> {
    * fault round (shared chunks fetched once), then each query is retried. A board's ten
    * queries cost one round instead of ten.
    */
-  private async subscribeMany(ws: WebSocket, cid: string, list: { id: string; q: unknown }[]) {
+  private async subscribeMany(ws: WebSocket, cid: string, list: { id: string; q?: unknown; lease?: string }[], admin: boolean) {
     const t0 = performance.now();
     const stats = newStats();
-    const pending = list.filter((x) => x?.id && x?.q).map((x) => ({ id: x.id, q: typeof x.q === "string" ? x.q : JSON.stringify(x.q) }));
+    // Every subscription must carry a lease signed for this database and object (raw ASTs only
+    // on admin sockets). Rejected ones get an error; the rest proceed.
+    const pending: { id: string; q: string }[] = [];
+    for (const x of list.slice(0, 256)) {
+      if (!x?.id) continue;
+      try {
+        if (typeof x.lease === "string") {
+          if (!this.env.LEASE_SECRET) throw new Error("leases are not configured");
+          const p = await verifyLease(this.env.LEASE_SECRET, x.lease, { db: this.db!, obj: this.ctx.id.name ?? "" });
+          pending.push({ id: x.id, q: JSON.stringify(p.ast) });
+        } else if (admin && x.q) pending.push({ id: x.id, q: typeof x.q === "string" ? x.q : JSON.stringify(x.q) });
+        else throw new Error("a lease is required");
+      } catch (e) {
+        ws.send(JSON.stringify({ t: "error", id: x.id, message: String((e as Error).message ?? e) }));
+      }
+    }
     const done: { id: string; q: string; r: { pid: number; rows?: unknown[]; complete?: boolean; count?: number } }[] = [];
     while (pending.length) {
       const faults = new Set<number>();
@@ -562,7 +598,7 @@ export class DbObject extends DurableObject<Env> {
   async info() {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
-    return { db: this.db, base: this.base, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length };
+    return { db: this.db, base: this.base, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
   }
 }
 

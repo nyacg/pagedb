@@ -1,6 +1,8 @@
 // Query latency in the deployed DO across tiers.
 //   node bench/query.mjs [db] [base-url]
 const [db = "db1g", BASE = "https://pagedb.do-pool-lab.workers.dev"] = process.argv.slice(2);
+const TOKEN = (await import("node:fs")).readFileSync(".env", "utf8").match(BASE.includes("pagedb-node") ? /NODE_TOKEN=(\S+)/ : /ADMIN_TOKEN=(\S+)/)[1];
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 const eq = (c, v) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const card = [
   { alias: "project", correlation: { parentField: ["projectId"], childField: ["id"] }, subquery: { table: "project" } },
@@ -19,7 +21,7 @@ const queries = (p) => ({
 });
 async function q(obj, ast, salt) {
   const t0 = performance.now();
-  const res = await fetch(`${BASE}/api/query`, { method: "POST", body: JSON.stringify({ db, ast, obj, salt }) });
+  const res = await fetch(`${BASE}/api/query`, { method: "POST", headers: AUTH, body: JSON.stringify({ db, ast, obj, salt }) });
   const body = await res.json();
   if (body.error) throw new Error(body.error);
   return { client: performance.now() - t0, ...body.stats, rows: body.result.rows?.length ?? body.result.count };

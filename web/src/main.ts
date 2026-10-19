@@ -3,7 +3,7 @@ import { Sync, type Row } from "./sync";
 
 declare global {
   interface Window {
-    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any };
+    __BOOT?: { project: string; db: string; obj: string; list?: { rows: Row[] }; count?: number; ms?: number; stats?: any; leases?: any[]; build?: string };
   }
 }
 
@@ -12,15 +12,7 @@ const STATUS_LABEL: Record<string, string> = { backlog: "Backlog", todo: "Todo",
 const PRIORITIES = ["urgent", "high", "medium", "low"];
 const PRI_LABEL: Record<string, string> = { urgent: "Urgent", high: "High", medium: "Medium", low: "Low" };
 
-// ---------------------------------------------------------------- queries (mirror src/app.ts)
-const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
-const cond = (op: string, c: string, v: unknown) => ({ type: "simple", op, left: { type: "column", name: c }, right: { type: "literal", value: v } });
-const ORDER = [["createdAt", "desc"], ["id", "asc"]];
-const CARD = [
-  { alias: "project", correlation: { parentField: ["projectId"], childField: ["id"] }, subquery: { table: "project" } },
-  { alias: "owner", correlation: { parentField: ["ownerId"], childField: ["id"] }, subquery: { table: "user" } },
-  { alias: "commentCount", correlation: { parentField: ["id"], childField: ["issueId"] }, subquery: { table: "comment", aggregate: "count" } },
-];
+// ---------------------------------------------------------------- queries (named; the Worker signs the AST)
 interface Filter {
   status: string[];
   priority: string[];
@@ -32,42 +24,17 @@ interface Filter {
 type Cursor = { createdAt: number; id: string };
 const PAGE = 50;
 
-function issuesQuery(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
-  const c: unknown[] = [eq("projectId", project)];
-  const st = status ? [status] : f.status;
-  if (st.length === 1) c.push(eq("status", st[0]));
-  else if (st.length) c.push(cond("IN", "status", st));
-  if (f.priority.length) c.push(cond("IN", "priority", f.priority));
-  if (f.owner) c.push(eq("ownerId", f.owner));
-  if (f.tag) c.push(cond("HAS", "tags", f.tag));
-  if (f.title) c.push(cond("ILIKE", "title", `%${f.title}%`));
-  const q: Record<string, unknown> = { table: "issue", where: c.length === 1 ? c[0] : { type: "and", conditions: c }, orderBy: ORDER, limit, related: CARD };
-  if (bounds.start) q.start = { row: bounds.start };
-  if (bounds.end) q.end = { row: bounds.end };
-  return q;
+/** What a list/board subscription asks the Worker to lease (src/app.ts builds the AST). */
+function issuesRef(project: string, f: Filter, limit: number, status?: string, bounds: { start?: Cursor; end?: Cursor } = {}) {
+  const filter = {
+    status: f.status.length ? f.status : undefined,
+    priority: f.priority.length ? f.priority : undefined,
+    owner: f.owner,
+    tag: f.tag,
+    title: f.title,
+  };
+  return { name: "issues", args: { project, filter, limit, status, start: bounds.start, end: bounds.end } };
 }
-const countQuery = (project: string, status?: string) => ({
-  table: "issue",
-  where: status ? { type: "and", conditions: [eq("projectId", project), eq("status", status)] } : eq("projectId", project),
-  aggregate: "count",
-});
-const detailQuery = (id: string) => ({
-  table: "issue",
-  where: eq("id", id),
-  one: true,
-  related: [
-    ...CARD,
-    {
-      alias: "comments",
-      correlation: { parentField: ["id"], childField: ["issueId"] },
-      subquery: { table: "comment", orderBy: [["createdAt", "asc"], ["id", "asc"]], limit: 200, related: [{ alias: "author", correlation: { parentField: ["authorId"], childField: ["id"] }, subquery: { table: "user" } }] },
-    },
-  ],
-});
-const feedQuery = () => ({ table: "comment", orderBy: ORDER, limit: 30, related: [{ alias: "author", correlation: { parentField: ["authorId"], childField: ["id"] }, subquery: { table: "user" } }] });
-const projectsQuery = (s: string) => ({ table: "project", where: s ? cond("ILIKE", "name", `%${s}%`) : undefined, orderBy: [["id", "asc"]], limit: 60 });
-const usersQuery = (s: string) => ({ table: "user", where: s ? cond("ILIKE", "name", `%${s}%`) : undefined, orderBy: [["id", "asc"]], limit: 12 });
-const userQuery = (id: string) => ({ table: "user", where: eq("id", id), one: true });
 
 // ---------------------------------------------------------------- state
 const boot = window.__BOOT ?? { project: "p0003", db: "db1g", obj: "demo" };
@@ -88,7 +55,19 @@ if (!me || !/^u\d{5}$/.test(me)) {
   me = `u${String(Math.floor(Math.random() * 5000)).padStart(5, "0")}`;
   localStorage.setItem("pagedb.user", me);
 }
-const sync = new Sync(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/socket?db=${boot.db}&obj=${boot.obj}`);
+const sync = new Sync(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/socket`, boot.leases ?? []);
+// After a deploy, an open page may be running a client the server no longer speaks to (it would
+// look live but get nothing). Reload it, once nothing is in flight and nobody is typing.
+sync.build = boot.build;
+sync.onStale = () => {
+  // (At most once a minute, so two versions serving side by side can't cause a reload loop.)
+  if (Date.now() - Number(sessionStorage.getItem("pagedb-reloaded") ?? 0) < 60_000) return;
+  const tryReload = () => {
+    if (!sync.pendingOps().length && !document.activeElement?.matches("input, textarea, select")) (sessionStorage.setItem("pagedb-reloaded", String(Date.now())), location.reload());
+    else setTimeout(tryReload, 2000);
+  };
+  tryReload();
+};
 const $ = (s: string) => document.querySelector(s) as HTMLElement;
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const initials = (n?: string) => (n ?? "?").split(" ").map((w) => w[0]).join("").slice(0, 2).toUpperCase();
@@ -125,37 +104,37 @@ function url() {
 // ---------------------------------------------------------------- subscriptions per view
 function subscribeView() {
   const keep = new Set(["me", "project", "count"]);
-  sync.sub("me", userQuery(me!));
-  sync.sub("project", { table: "project", where: eq("id", state.project), one: true });
-  sync.sub("count", countQuery(state.project), boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
+  sync.sub("me", { name: "user", args: { id: me } });
+  sync.sub("project", { name: "project", args: { id: state.project } });
+  sync.sub("count", { name: "count", args: { project: state.project } }, boot.project === state.project && boot.count !== undefined ? { count: boot.count } : undefined);
   if (state.view === "list") {
     const seed = boot.project === state.project && boot.list && !hasFilter() ? { rows: boot.list.rows } : undefined;
     state.pages.forEach((pg, i) => {
       const last = i === state.pages.length - 1;
-      sync.sub(`list:${i}`, issuesQuery(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
+      sync.sub(`list:${i}`, issuesRef(state.project, state.filter, last ? PAGE : 1000, undefined, pg), i === 0 && last ? seed : undefined);
       keep.add(`list:${i}`);
     });
   } else if (state.view === "board") {
     for (const st of STATUSES) {
       if (state.filter.status.length && !state.filter.status.includes(st)) continue;
-      sync.sub(`col:${st}`, issuesQuery(state.project, state.filter, 25, st));
-      sync.sub(`n:${st}`, countQuery(state.project, st));
+      sync.sub(`col:${st}`, issuesRef(state.project, state.filter, 25, st));
+      sync.sub(`n:${st}`, { name: "count", args: { project: state.project, status: st } });
       keep.add(`col:${st}`).add(`n:${st}`);
     }
   } else {
-    sync.sub("feed", feedQuery());
+    sync.sub("feed", { name: "feed" });
     keep.add("feed");
   }
   if (state.issue) {
-    sync.sub("detail", detailQuery(state.issue));
+    sync.sub("detail", { name: "detail", args: { id: state.issue } });
     keep.add("detail");
   }
   if (state.popover?.kind === "project") {
-    sync.sub("pick", projectsQuery(state.popover.search ?? ""));
+    sync.sub("pick", { name: "projects", args: { search: state.popover.search || undefined } });
     keep.add("pick");
   }
   if (state.popover?.kind === "owner" || state.popover?.kind === "filter-owner") {
-    sync.sub("pick", usersQuery(state.popover.search ?? ""));
+    sync.sub("pick", { name: "users", args: { search: state.popover.search || undefined } });
     keep.add("pick");
   }
   for (const s of sync.all()) if (!keep.has(s.id)) sync.unsub(s.id);
@@ -321,6 +300,7 @@ function hudView() {
   const pages = sync.all().filter((s) => s.id.startsWith("list:"));
   const subs = sync.all().filter((s) => !["me", "pick"].includes(s.id) && (!s.id.startsWith("list:") || s === pages[0] || s === pages.at(-1)));
   const label = (s: { id: string; q: any }) => {
+    if (!s.q) return s.id;
     const w = JSON.stringify(s.q.where ?? {});
     if (s.q.aggregate) return `count(${s.q.table})${w.includes("status") ? ` · ${s.id.replace("n:", "")}` : ""}`;
     if (s.id === "detail") return "issue + thread";
@@ -353,22 +333,56 @@ function filtersView() {
   </div>`;
 }
 
+/** Only touch a region whose markup changed: rebuilding it would replace inputs mid-typing. */
+const shown = new Map<string, string>();
+function put(sel: string, html: string) {
+  if (shown.get(sel) === html) return;
+  shown.set(sel, html);
+  $(sel).innerHTML = html;
+}
+
+/** A selector that finds "the same" field after its region is rebuilt. */
+function fieldKey(el: Element): string | null {
+  const tag = el.tagName.toLowerCase();
+  const own = [...el.attributes].find((a) => a.name.startsWith("data-"));
+  if (own) return `${tag}[${own.name}="${CSS.escape(own.value)}"]`;
+  const form = el.closest("form");
+  const fa = form && [...form.attributes].find((a) => a.name.startsWith("data-"));
+  const name = (el as HTMLInputElement).name;
+  return fa ? `form[${fa.name}="${CSS.escape(fa.value)}"] ${tag}${name ? `[name="${CSS.escape(name)}"]` : ""}` : null;
+}
+
 function render() {
+  // If a live update rebuilds the field being typed in, carry over its text, focus and caret.
+  const active = document.activeElement as HTMLInputElement | null;
+  const typing = active?.matches("input, textarea") ? { el: active, key: fieldKey(active), value: active.value, a: active.selectionStart, b: active.selectionEnd } : null;
+  renderRegions();
+  if (typing?.key && !typing.el.isConnected) {
+    const el = document.querySelector(typing.key) as HTMLInputElement | null;
+    if (el) {
+      el.value = typing.value;
+      el.focus();
+      if (typing.a !== null) el.setSelectionRange(typing.a, typing.b);
+    }
+  }
+}
+
+function renderRegions() {
   const project = sync.view("project")[0];
   const meRow = sync.view("me")[0];
   const count = sync.count("count", (p) => (p.insert?.projectId === state.project ? 1 : 0) - (p.remove ? 1 : 0));
-  $("#side-project").innerHTML = `<span class="pk">${esc(project?.key ?? "…")}</span> ${esc(project?.name ?? state.project)} <span class="caret">▾</span>`;
-  $("#me").innerHTML = `${avatar(meRow)} <span>${esc(meRow?.name ?? me)}</span>`;
+  put("#side-project", `<span class="pk">${esc(project?.key ?? "…")}</span> ${esc(project?.name ?? state.project)} <span class="caret">▾</span>`);
+  put("#me", `${avatar(meRow)} <span>${esc(meRow?.name ?? me)}</span>`);
   for (const v of ["list", "board", "activity"]) $(`[data-view="${v}"]`).classList.toggle("on", state.view === v);
-  $("#head").innerHTML = `<h1>${state.view === "activity" ? "Activity" : esc(project?.name ?? "Issues")}</h1>
+  put("#head", `<h1>${state.view === "activity" ? "Activity" : esc(project?.name ?? "Issues")}</h1>
     <span class="count">${state.view === "activity" ? "across every project" : count !== undefined ? `${count.toLocaleString()} issues` : ""}</span>
-    <span class="grow"></span>${state.view !== "activity" ? `<button class="primary" data-new>New issue</button>` : ""}`;
-  $("#filters").innerHTML = state.view === "activity" ? "" : filtersView();
-  $("#view").innerHTML = state.view === "list" ? listView() : state.view === "board" ? boardView() : activityView();
-  $("#detail").innerHTML = detailView();
-  $("#pop").innerHTML = popoverView();
-  $("#hud").innerHTML = hudView();
-  $("#create").innerHTML = state.creating ? createView() : "";
+    <span class="grow"></span>${state.view !== "activity" ? `<button class="primary" data-new>New issue</button>` : ""}`);
+  put("#filters", state.view === "activity" ? "" : filtersView());
+  put("#view", state.view === "list" ? listView() : state.view === "board" ? boardView() : activityView());
+  put("#detail", detailView());
+  put("#pop", popoverView());
+  put("#hud", hudView());
+  put("#create", state.creating ? createView() : "");
   const ps = document.querySelector("[data-popsearch]") as HTMLInputElement | null;
   if (ps && document.activeElement !== ps) {
     ps.focus();
@@ -620,7 +634,7 @@ $("#view").addEventListener("scroll", () => {
   if (state.view !== "list") return;
   const v = $("#view");
   if (v.scrollTop + v.clientHeight > v.scrollHeight - 1200) loadMore();
-  requestAnimationFrame(() => ($("#view").innerHTML = listView()));
+  requestAnimationFrame(() => put("#view", listView()));
 });
 
 // For tests and the curious: the loaded list as data.
