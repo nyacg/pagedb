@@ -10,10 +10,12 @@ status "{\"phase\":\"building\",\"uploaded\":0,\"base\":\"$BASE\"}"
 pagedb-builder build --projects "$PROJECTS" --comments "${COMMENTS:-5.0}" --out "$OUT" > /data/build.log 2>&1 &
 BPID=$!
 up() {
+  # Already in R2 from an earlier (identical, deterministic) run: skip it.
+  if curl -sf -I --max-time 20 "http://r2.internal/put/db/$DB/base/$BASE/$(basename "$1")" >/dev/null; then rm -f "$1"; return 0; fi
   for i in 1 2 3 4 5 6; do
     # Bounded: a hung request must not stall the whole pipeline.
     if curl -sf --connect-timeout 10 --max-time 120 -X PUT --data-binary @"$1" "http://r2.internal/put/db/$DB/base/$BASE/$(basename "$1")" >/dev/null; then rm -f "$1"; return 0; fi
-    sleep $((i * 2))
+    sleep $i
   done
   echo "upload failed: $1" >> /data/build.log
 }
@@ -32,7 +34,8 @@ while :; do
   if [ ${#ready[@]} -gt 0 ]; then
     # At most 48 parts per pass, so progress is reported every ~10 s even when far behind.
     batch=("${ready[@]:0:48}")
-    printf '%s\n' "${batch[@]}" | xargs -P 12 -I{} bash -c 'up "$@"' _ {}
+    # 3 at a time: the intercepted route takes ~4 concurrent connections; more just fail and back off.
+    printf '%s\n' "${batch[@]}" | xargs -P 3 -I{} bash -c 'up "$@"' _ {}
     n=$((n + ${#batch[@]}))
   fi
   last=$(grep -E "rows|issues" /data/build.log | tail -1 | tr -d '"\\' | cut -c1-160)

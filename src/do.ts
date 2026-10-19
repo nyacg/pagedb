@@ -132,6 +132,10 @@ export class DbObject extends DurableObject<Env> {
   /** Start the engine (once per object lifetime); returns how long that took if it started. */
   private async ensure(db: string): Promise<number | undefined> {
     if (this.engine && this.db === db) return undefined;
+    // Page ids, the overlay and subscriptions are per base: one object serves one database.
+    const bound = this.ctx.storage.kv.get<string>("boundDb");
+    if (bound && bound !== db) throw new Error(`this object serves ${bound}, not ${db}`);
+    if (!bound) this.ctx.storage.kv.put("boundDb", db);
     const t0 = performance.now();
     let manifest = this.ctx.storage.kv.get<string>(`manifest:${db}`);
     if (!manifest) {
@@ -175,7 +179,11 @@ export class DbObject extends DurableObject<Env> {
       }
       if (ids.length) {
         const st: QueryStats = { rounds: 0, roundMs: [], pages: 0, chunks: 0, cacheHits: 0, r2Gets: 0, bytes: 0, sqliteHits: 0, r2Ms: [], cacheMs: [], engineMs: 0, fetchMs: 0, totalMs: 0 };
-        await this.resolve(ids, st, true);
+        // Small pinned regions go straight into RAM. A big one (100 GB base: ~73 MB of interior
+        // pages) goes to SQLite now, synchronously, and into RAM only as queries touch it:
+        // holding it all in memory would crowd a 128 MB isolate.
+        const small = ids.length * PAGE <= Number(this.env.RAM_PAGES ?? 512) * PAGE / 4;
+        await this.resolve(ids, st, small, !small);
       }
     }
     await this.rehydrate();
@@ -243,7 +251,7 @@ export class DbObject extends DurableObject<Env> {
   }
 
   /** Fetch the chunks holding `ids`, hand the pages to the engine and the SQLite tier. */
-  private async resolve(ids: number[], stats: QueryStats, all = false) {
+  private async resolve(ids: number[], stats: QueryStats, all = false, persistNow = false) {
     const chunks = [...new Set(ids.map((id) => Math.floor(id / PAGES_PER_CHUNK)))];
     stats.pages += ids.length;
     stats.chunks += chunks.length;
@@ -261,7 +269,8 @@ export class DbObject extends DurableObject<Env> {
           const id = first + i;
           const page = new Uint8Array(bytes, i * PAGE, PAGE);
           if ((all || wanted.has(id)) && !this.engine!.putPage(id, page)) throw new Error(`page ${id} failed its checksum`);
-          this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page));
+          if (persistNow) this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page);
+          else this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page));
         }
       }),
     );

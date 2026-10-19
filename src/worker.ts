@@ -9,9 +9,10 @@ import { DbObject, type Env } from "./do";
 import { issuesQuery, countQuery, mutate } from "./app";
 export { DbObject };
 
-/** The demo's database and object (all visitors share one object, like r2db's demo). */
-const DEMO_DB = "db1g";
-const DEMO_OBJ = "demo";
+/** The demo's database and object (all visitors share one object, like r2db's demo).
+ *  DEMO_DB is a var so the demo can move from the 1 GB to the 100 GB base without a code change. */
+let DEMO_DB = "db1g";
+let DEMO_OBJ = "demo";
 
 const admin = (req: Request, env: Env) => !!env.ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 
@@ -38,6 +39,8 @@ async function ssr(req: Request, env: Env, url: URL): Promise<Response> {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    DEMO_DB = (env as Env & { DEMO_DB?: string }).DEMO_DB ?? DEMO_DB;
+    DEMO_OBJ = (env as Env & { DEMO_OBJ?: string }).DEMO_OBJ ?? DEMO_OBJ;
     try {
       if (url.pathname === "/api/query" && req.method === "POST") {
         const { db, ast, obj, salt } = (await req.json()) as { db: string; ast: unknown; obj?: string; salt?: string };
@@ -87,6 +90,8 @@ export default {
   },
   /** 09:00 UTC: the public demo goes back to the published base (two writes, not 100 GB). */
   async scheduled(_c: ScheduledController, env: Env) {
+    DEMO_DB = (env as Env & { DEMO_DB?: string }).DEMO_DB ?? DEMO_DB;
+    DEMO_OBJ = (env as Env & { DEMO_OBJ?: string }).DEMO_OBJ ?? DEMO_OBJ;
     await (env.DB.getByName(DEMO_OBJ) as unknown as { resetOverlay(db: string): Promise<unknown> }).resetOverlay(DEMO_DB);
   },
 } satisfies ExportedHandler<Env>;

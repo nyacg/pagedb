@@ -18,6 +18,11 @@ interface Env {
 export class R2Put extends WorkerEntrypoint<Env> {
   override async fetch(req: Request) {
     const url = new URL(req.url);
+    if (req.method === "HEAD" && url.pathname.startsWith("/put/")) {
+      // Resume support: parts are deterministic, so one that already exists is skipped.
+      const head = await this.env.BUCKET.head(decodeURIComponent(url.pathname.slice(5)));
+      return new Response(null, { status: head ? 200 : 404 });
+    }
     if (req.method !== "PUT" || !url.pathname.startsWith("/put/")) return new Response("no", { status: 403 });
     await this.env.BUCKET.put(decodeURIComponent(url.pathname.slice(5)), req.body);
     return new Response("ok");
@@ -25,10 +30,11 @@ export class R2Put extends WorkerEntrypoint<Env> {
 }
 
 export class BuilderBox extends DurableObject<Env> {
-  async start(db: string, projects: number, comments: number) {
+  async start(db: string, projects: number, comments: number, resumeBase?: string) {
     const c = this.ctx.container!;
     if (c.running) return { running: true, base: this.ctx.storage.kv.get("base") };
-    const base = `b${Date.now().toString(36)}`;
+    // Resuming reuses a base id: the builder is deterministic, so parts already in R2 are skipped.
+    const base = resumeBase || `b${Date.now().toString(36)}`;
     this.ctx.storage.kv.put("base", base);
     c.start({
       image: c.images.builder,
@@ -85,14 +91,14 @@ export default {
     const db = url.searchParams.get("db") ?? "db100g";
     // (RPC return types are deep; a narrow view keeps the checker fast.)
     const box = env.BOX.getByName(db) as unknown as {
-      start(db: string, p: number, c: number): Promise<unknown>;
+      start(db: string, p: number, c: number, base?: string): Promise<unknown>;
       info(): Promise<unknown>;
       stop(): Promise<unknown>;
       reattach(): Promise<unknown>;
       logs(): Promise<unknown>;
     };
     if (url.pathname === "/start" && req.method === "POST")
-      return Response.json(await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8)));
+      return Response.json(await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8), url.searchParams.get("base") ?? undefined));
     if (url.pathname === "/status") {
       const s = await env.BUCKET.get(`db/${db}/build-status.json`);
       return Response.json({ box: await box.info(), status: s ? await s.json() : null });
