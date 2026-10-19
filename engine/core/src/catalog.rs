@@ -275,6 +275,8 @@ mod tests {
         assert_eq!(index_entries(ix, &row).len(), 2);
         assert_eq!(index_entries(index_named("issue_by_id").unwrap(), &row).len(), 1);
         assert!(INDEXES.iter().all(|i| INDEXES.iter().filter(|j| j.tree == i.tree).count() == 1));
+        // The write path relies on every index key containing the row's primary key (col 0).
+        assert!(INDEXES.iter().all(|i| i.key.iter().any(|(c, _)| *c == 0)), "every index key must include the primary key");
         for t in [Table::Project, Table::User, Table::Issue, Table::Comment] {
             assert_eq!(indexes_of(t).filter(|i| i.primary).count(), 1, "{t:?}");
         }

@@ -6,3 +6,7 @@ pub mod catalog;
 pub mod gen;
 pub mod query;
 pub mod build;
+pub mod overlay;
+pub mod merged;
+pub mod write;
+pub mod ivm;

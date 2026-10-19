@@ -50,6 +50,17 @@ impl Ram {
 struct Db {
     roots: pagedb_core::query::Roots,
     plans: HashMap<String, Rc<pagedb_core::query::Plan>>,
+    overlay: pagedb_core::overlay::Overlay,
+    parts: HashMap<u32, Live>,
+    by_ast: HashMap<String, u32>,
+    next_pid: u32,
+}
+
+/// A live partition and how many subscriptions share it.
+struct Live {
+    part: pagedb_core::ivm::Partition,
+    refs: u32,
+    ast: String,
 }
 
 thread_local! {
@@ -249,7 +260,16 @@ pub unsafe extern "C" fn init(ptr: *const u8, len: u32) -> u32 {
     };
     match pagedb_core::query::Roots::from_manifest(&m) {
         Ok(roots) => {
-            DB.with(|d| *d.borrow_mut() = Some(Db { roots, plans: HashMap::new() }));
+            DB.with(|d| {
+                *d.borrow_mut() = Some(Db {
+                    roots,
+                    plans: HashMap::new(),
+                    overlay: Default::default(),
+                    parts: HashMap::new(),
+                    by_ast: HashMap::new(),
+                    next_pid: 1,
+                })
+            });
             set_out(Vec::new());
             0
         }
@@ -290,8 +310,11 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
         Some(Ok(p)) => p,
     };
     let store = Tiers;
-    let ctx = Ctx::new(&store);
-    let r = DB.with(|d| execute(&ctx, &d.borrow().as_ref().unwrap().roots, &plan));
+    let guard = DB.with(|d| d.as_ptr());
+    let db = unsafe { (*guard).as_ref().unwrap() };
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    let r = execute(&ctx, &db.roots, &plan);
     finish(&ctx, r, |o| match o {
         Output::Count(n) => format!("{{\"count\":{n}}}").into_bytes(),
         Output::Rows { hits, complete } => {
@@ -309,4 +332,267 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
             s.into_bytes()
         }
     })
+}
+
+// ------------------------------------------------------------------ live queries and writes
+
+fn plan_for(db: &mut Db, text: &str) -> Result<Rc<pagedb_core::query::Plan>, String> {
+    if let Some(p) = db.plans.get(text) {
+        return Ok(p.clone());
+    }
+    let ast: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("bad query JSON: {e}"))?;
+    let p = Rc::new(pagedb_core::query::compile(&ast)?);
+    db.plans.insert(text.to_string(), p.clone());
+    Ok(p)
+}
+
+fn rows_json(out: &pagedb_core::query::Output) -> String {
+    use pagedb_core::query::Output;
+    match out {
+        Output::Count(n) => format!("\"count\":{n}"),
+        Output::Rows { hits, complete } => {
+            let mut s = String::from("\"rows\":[");
+            for (i, h) in hits.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&h.json);
+            }
+            s.push_str("],\"complete\":");
+            s.push_str(if *complete { "true" } else { "false" });
+            s
+        }
+    }
+}
+
+/// Subscribe to a query. OK payload: {"pid":n,"rows":[…],"complete":b} or {"pid":n,"count":c}.
+/// Identical queries share one partition (ref-counted).
+#[no_mangle]
+pub unsafe extern "C" fn subscribe(ptr: *const u8, len: u32) -> u32 {
+    let text = match std::str::from_utf8(slice(ptr, len)) {
+        Ok(t) => t.to_string(),
+        Err(_) => return error("query is not UTF-8"),
+    };
+    let guard = DB.with(|d| d.as_ptr());
+    let db = match (*guard).as_mut() {
+        Some(db) => db,
+        None => return error("engine not initialized"),
+    };
+    let plan = match plan_for(db, &text) {
+        Ok(p) => p,
+        Err(e) => return error(e),
+    };
+    let store = Tiers;
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    if let Some(&pid) = db.by_ast.get(&text) {
+        let r = pagedb_core::query::execute(&ctx, &db.roots, &plan);
+        let status = finish(&ctx, r, |o| format!("{{\"pid\":{pid},{}}}", rows_json(&o)).into_bytes());
+        if status == 0 {
+            db.parts.get_mut(&pid).unwrap().refs += 1;
+        }
+        return status;
+    }
+    let r = pagedb_core::ivm::hydrate(&ctx, &db.roots, plan);
+    match r {
+        Ok((part, out)) => {
+            let pid = db.next_pid;
+            db.next_pid += 1;
+            db.parts.insert(pid, Live { part, refs: 1, ast: text.clone() });
+            db.by_ast.insert(text, pid);
+            set_out(format!("{{\"pid\":{pid},{}}}", rows_json(&out)).into_bytes());
+            0
+        }
+        Err(Miss) => {
+            set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+            1
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn unsubscribe(pid: u32) -> u32 {
+    DB.with(|d| {
+        if let Some(db) = d.borrow_mut().as_mut() {
+            let drop_it = match db.parts.get_mut(&pid) {
+                Some(l) => {
+                    l.refs = l.refs.saturating_sub(1);
+                    l.refs == 0
+                }
+                None => false,
+            };
+            if drop_it {
+                let l = db.parts.remove(&pid).unwrap();
+                db.by_ast.remove(&l.ast);
+            }
+        }
+    });
+    0
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Overlay record: u16 tree | u32 klen | key | u8 kind (0 drop entry, 1 entry) | i8 delta |
+/// u8 has_val | u32 vlen | val
+fn encode_writes(writes: &[(pagedb_core::overlay::Key, Option<pagedb_core::overlay::Entry>)], out: &mut Vec<u8>) {
+    for ((tree, key), e) in writes {
+        out.extend_from_slice(&tree.to_le_bytes());
+        put_u32(out, key.len() as u32);
+        out.extend_from_slice(key);
+        match e {
+            None => out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]),
+            Some(e) => {
+                out.push(1);
+                out.push(e.delta as u8);
+                match &e.val {
+                    None => out.extend_from_slice(&[0, 0, 0, 0, 0]),
+                    Some(v) => {
+                        out.push(1);
+                        put_u32(out, v.len() as u32);
+                        out.extend_from_slice(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load persisted overlay records (same encoding as write's) and the version.
+#[no_mangle]
+pub unsafe extern "C" fn ovl_load(ptr: *const u8, len: u32, version: f64) -> u32 {
+    let b = slice(ptr, len);
+    let mut writes = Vec::new();
+    let mut p = 0;
+    let u32_at = |p: usize| u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+    while p < b.len() {
+        let tree = u16::from_le_bytes([b[p], b[p + 1]]);
+        let klen = u32_at(p + 2);
+        let key = b[p + 6..p + 6 + klen].to_vec();
+        p += 6 + klen;
+        let kind = b[p];
+        let delta = b[p + 1] as i8;
+        let has = b[p + 2];
+        p += 3;
+        let vlen = u32_at(p);
+        p += 4;
+        let val = if has == 1 { Some(b[p..p + vlen].to_vec()) } else { None };
+        p += vlen;
+        writes.push(((tree, key), if kind == 1 { Some(pagedb_core::overlay::Entry { val, delta }) } else { None }));
+    }
+    DB.with(|d| {
+        if let Some(db) = d.borrow_mut().as_mut() {
+            db.overlay.apply(&writes);
+            db.overlay.version = version as u64;
+        }
+    });
+    set_out(Vec::new());
+    0
+}
+
+/// Apply a write batch. OK payload: u32 json_len | json | overlay records, where json =
+/// {"version":v,"changes":n,"pokes":{"<pid>":[["a",pk,row],["r",pk],["e",pk,row],["c",n]]}}.
+/// FAULT: fetch pages and call again (nothing was applied). ERROR: invalid batch.
+#[no_mangle]
+pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
+    use pagedb_core::ivm::{compute, DeltaOp};
+    use pagedb_core::write::{parse_ops, plan_write, WriteError};
+    let ops_json: serde_json::Value = match serde_json::from_slice(slice(ptr, len)) {
+        Ok(v) => v,
+        Err(e) => return error(format!("bad ops JSON: {e}")),
+    };
+    let ops = match parse_ops(&ops_json) {
+        Ok(o) => o,
+        Err(e) => return error(e),
+    };
+    let guard = DB.with(|d| d.as_ptr());
+    let db = match (*guard).as_mut() {
+        Some(db) => db,
+        None => return error("engine not initialized"),
+    };
+    let store = Tiers;
+    let (writes, results, changes) = {
+        let view = pagedb_core::overlay::View::new(&db.overlay);
+        let ctx = Ctx::with_view(&store, &view);
+        let changes = match plan_write(&ctx, &db.roots, &view, &ops) {
+            Ok(c) => c,
+            Err(WriteError::Miss) => {
+                set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+                return 1;
+            }
+            Err(WriteError::Invalid(e)) => return error(e),
+        };
+        let mut results = Vec::new();
+        let mut missed = false;
+        for (pid, live) in db.parts.iter() {
+            match compute(&ctx, &db.roots, &live.part, &changes) {
+                Ok(r) => results.push((*pid, r)),
+                Err(Miss) => missed = true,
+            }
+        }
+        if missed {
+            set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+            return 1;
+        }
+        (view.into_writes(), results, changes.len())
+    };
+    // Commit.
+    db.overlay.apply(&writes);
+    db.overlay.version += 1;
+    let mut json = format!("{{\"version\":{},\"changes\":{changes},\"pokes\":{{", db.overlay.version);
+    let mut first = true;
+    for (pid, (state, ops)) in results {
+        db.parts.get_mut(&pid).unwrap().part.state = state;
+        if ops.is_empty() {
+            continue;
+        }
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        json.push_str(&format!("\"{pid}\":["));
+        for (i, op) in ops.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            match op {
+                DeltaOp::Add { pk, json: row } => {
+                    json.push_str("[\"a\",");
+                    json_str(&mut json, pk);
+                    json.push(',');
+                    json.push_str(row);
+                    json.push(']');
+                }
+                DeltaOp::Edit { pk, json: row } => {
+                    json.push_str("[\"e\",");
+                    json_str(&mut json, pk);
+                    json.push(',');
+                    json.push_str(row);
+                    json.push(']');
+                }
+                DeltaOp::Remove { pk } => {
+                    json.push_str("[\"r\",");
+                    json_str(&mut json, pk);
+                    json.push(']');
+                }
+                DeltaOp::Count(n) => json.push_str(&format!("[\"c\",{n}]")),
+            }
+        }
+        json.push(']');
+    }
+    json.push_str("}}");
+    let mut out = Vec::with_capacity(json.len() + 64);
+    put_u32(&mut out, json.len() as u32);
+    out.extend_from_slice(json.as_bytes());
+    encode_writes(&writes, &mut out);
+    set_out(out);
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn overlay_stats() -> u32 {
+    let s = DB.with(|d| d.borrow().as_ref().map(|db| [db.overlay.map.len() as u64, db.overlay.bytes as u64, db.overlay.version, db.parts.len() as u64]).unwrap_or_default());
+    set_out(s.iter().flat_map(|v| v.to_le_bytes()).collect());
+    0
 }

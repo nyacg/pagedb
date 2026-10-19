@@ -18,6 +18,16 @@ export default {
         const { db, ast, obj, salt } = (await req.json()) as { db: string; ast: unknown; obj?: string; salt?: string };
         return Response.json(await env.DB.getByName(obj ?? db).query(db, ast, { salt }));
       }
+      if (url.pathname === "/api/socket") {
+        const db = url.searchParams.get("db") ?? "db1g";
+        return env.DB.getByName(url.searchParams.get("obj") ?? db).fetch(req);
+      }
+      if (url.pathname === "/api/write" && req.method === "POST") {
+        // Raw row ops (the demo app's named mutators build these; see app.ts later).
+        const { db, ops, obj } = (await req.json()) as { db: string; ops: unknown; obj?: string };
+        const r = await env.DB.getByName(obj ?? db).write(db, ops);
+        return Response.json(r, { status: "error" in r ? 400 : 200 });
+      }
       if (url.pathname.startsWith("/api/admin/")) {
         if (!admin(req, env)) return new Response("unauthorized", { status: 401 });
         if (url.pathname.startsWith("/api/admin/r2/") && req.method === "PUT") {

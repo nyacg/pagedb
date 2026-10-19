@@ -19,6 +19,11 @@ interface Exports {
   page_put(lo: number, hi: number, ptr: number): number;
   set_ram_budget(pages: number): void;
   stats(): number;
+  subscribe(ptr: number, len: number): number;
+  unsubscribe(pid: number): number;
+  write(ptr: number, len: number): number;
+  ovl_load(ptr: number, len: number, version: number): number;
+  overlay_stats(): number;
 }
 
 const enc = new TextEncoder();
@@ -65,6 +70,29 @@ export class Engine {
 
   query(ast: string) {
     return this.result(this.withBytes(enc.encode(ast), (p, l) => this.x.query(p, l)));
+  }
+
+  subscribe(ast: string) {
+    return this.result(this.withBytes(enc.encode(ast), (p, l) => this.x.subscribe(p, l)));
+  }
+
+  unsubscribe(pid: number) {
+    this.x.unsubscribe(pid);
+  }
+
+  /** OK payload: u32 json length, json ({version, changes, pokes}), then overlay records. */
+  write(ops: string) {
+    return this.result(this.withBytes(enc.encode(ops), (p, l) => this.x.write(p, l)));
+  }
+
+  loadOverlay(records: Uint8Array, version: number) {
+    this.result(this.withBytes(records, (p, l) => this.x.ovl_load(p, l, version)));
+  }
+
+  overlayStats() {
+    this.x.overlay_stats();
+    const [entries, bytes, version, partitions] = [...new BigUint64Array(this.out().buffer)].map(Number);
+    return { entries, bytes, version, partitions };
   }
 
   putPage(id: number, page: Uint8Array): boolean {

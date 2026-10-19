@@ -180,11 +180,17 @@ pub struct Ctx<'a> {
     pub store: &'a dyn PageStore,
     pub want: RefCell<BTreeSet<PageId>>,
     pub reads: std::cell::Cell<u64>,
+    /// Writes not yet in the base (committed overlay + a batch's staged writes).
+    pub view: Option<&'a crate::overlay::View<'a>>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(store: &'a dyn PageStore) -> Self {
-        Self { store, want: RefCell::new(BTreeSet::new()), reads: std::cell::Cell::new(0) }
+        Self { store, want: RefCell::new(BTreeSet::new()), reads: std::cell::Cell::new(0), view: None }
+    }
+
+    pub fn with_view(store: &'a dyn PageStore, view: &'a crate::overlay::View<'a>) -> Self {
+        Self { store, want: RefCell::new(BTreeSet::new()), reads: std::cell::Cell::new(0), view: Some(view) }
     }
 
     #[inline]

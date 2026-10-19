@@ -16,7 +16,8 @@
 
 use crate::catalog::{self, Index, IndexValue, Table};
 use crate::codec::{encode_key_part, json_cell, json_str, prefix_end, Cell, RowRef, Value};
-use crate::tree::{self, Ctx, Miss, Range, TreeRoot};
+use crate::merged;
+use crate::tree::{Ctx, Miss, Range, TreeRoot};
 use serde_json::Value as J;
 use std::collections::HashMap;
 
@@ -387,10 +388,10 @@ fn execute_plan(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
     let range = Range { lo: &lo, hi: &hi };
     if plan.count {
         if plan.filters.is_empty() {
-            return tree::count(ctx, &root, &range).map(Output::Count);
+            return merged::count(ctx, &root, &range).map(Output::Count);
         }
         let mut n = 0u64;
-        tree::scan(ctx, &root, &range, false, SCAN_BUDGET, &mut |_, v| {
+        merged::scan(ctx, &root, &range, false, SCAN_BUDGET, &mut |_, v| {
             if row_matches(plan, RowRef(v)) {
                 n += 1;
             }
@@ -401,7 +402,7 @@ fn execute_plan(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
     let hint = if plan.filters.is_empty() { plan.limit + 1 } else { SCAN_BUDGET };
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut seen_more = false;
-    tree::scan(ctx, &root, &range, plan.reverse, hint, &mut |k, v| {
+    merged::scan(ctx, &root, &range, plan.reverse, hint, &mut |k, v| {
         if !row_matches(plan, RowRef(v)) {
             return true;
         }
@@ -459,7 +460,7 @@ fn render_into(out: &mut String, ctx: &Ctx, roots: &Roots, table: Table, related
             RelKind::CountColumn(c) => json_cell(out, row.get(*c)),
             RelKind::One { table: child, parent_col } => {
                 let key = catalog::pk_key(*child, row.get(*parent_col).str());
-                match tree::get(ctx, &roots.get(catalog::primary_of(*child).tree), &key) {
+                match merged::get(ctx, &roots.get(catalog::primary_of(*child).tree), &key) {
                     Ok(Some(v)) => render_into(out, ctx, roots, *child, &[], RowRef(&v))?,
                     Ok(None) => out.push_str("null"),
                     Err(Miss) => {
