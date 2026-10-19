@@ -115,7 +115,7 @@ pub struct PendingTree(TreeBuilder);
 
 impl PendingTree {
     pub fn finish_branches(self, sink: &mut dyn PageSink) -> TreeRoot {
-        let mut this = self.0;
+        let this = self.0;
         if this.entries.is_empty() {
             return TreeRoot::empty(this.tree);
         }

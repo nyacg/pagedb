@@ -2,7 +2,7 @@
 //! cold page cache (fault injection at every page read).
 
 use pagedb_core::build::{self, MemDb, Rows};
-use pagedb_core::catalog::{comment, issue};
+use pagedb_core::catalog::{comment, issue, tracker};
 use pagedb_core::codec::Value;
 use pagedb_core::gen::Config;
 use pagedb_core::page::PageId;
@@ -25,7 +25,7 @@ impl PageStore for Cold<'_> {
 
 /// (output, fault rounds, pages fetched)
 fn run(db: &MemDb, ast: &J) -> (Output, usize, usize) {
-    let plan = compile(ast).unwrap_or_else(|e| panic!("{e}: {ast}"));
+    let plan = compile(tracker(), ast).unwrap_or_else(|e| panic!("{e}: {ast}"));
     let store = Cold { db, resident: RefCell::new(HashSet::new()) };
     let mut rounds = 0;
     loop {
@@ -105,7 +105,7 @@ fn issue_list_board_filters_counts() {
         // Board column: status partition uses issue_by_project_status_created.
         for st in ["todo", "done"] {
             let ast = json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), eq("status", json!(st))]},"orderBy":order,"limit":25});
-            let plan = compile(&ast).unwrap();
+            let plan = compile(tracker(), &ast).unwrap();
             assert_eq!(plan.index.name, "issue_by_project_status_created");
             let (out, _, _) = run(&db, &ast);
             assert_eq!(ids(&out), oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p && s(&r[issue::STATUS]) == st, 25));
@@ -118,7 +118,7 @@ fn issue_list_board_filters_counts() {
             oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p && ["urgent", "high"].contains(&s(&r[issue::PRIORITY])) && s(&r[issue::TITLE]).to_lowercase().contains("cache"), 50)
         );
         let ast = json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), cond("HAS","tags",json!("bug"))]},"orderBy":order,"limit":50});
-        assert_eq!(compile(&ast).unwrap().index.name, "issue_by_tag");
+        assert_eq!(compile(tracker(), &ast).unwrap().index.name, "issue_by_tag");
         let (out, _, _) = run(&db, &ast);
         assert_eq!(ids(&out), oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p && s(&r[issue::TAGS]).contains("\"bug\""), 50));
         // Counts.
@@ -168,8 +168,8 @@ fn detail_and_feed() {
 
 #[test]
 fn refuses_unindexed_queries() {
-    assert!(compile(&json!({"table":"issue","orderBy":[["title","asc"]]})).is_err());
-    assert!(compile(&json!({"table":"comment","where":eq("authorId", json!("u00001")),"orderBy":[["body","asc"]]})).is_err());
+    assert!(compile(tracker(), &json!({"table":"issue","orderBy":[["title","asc"]]})).is_err());
+    assert!(compile(tracker(), &json!({"table":"comment","where":eq("authorId", json!("u00001")),"orderBy":[["body","asc"]]})).is_err());
 }
 
 #[test]
@@ -266,5 +266,5 @@ fn comment_search_matches_the_oracle() {
     }
     // Counting a comment search would read every comment of the project: refused.
     let ast = json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), has_comment("cache")]},"aggregate":"count"});
-    assert!(compile(&ast).is_err());
+    assert!(compile(tracker(), &ast).is_err());
 }
