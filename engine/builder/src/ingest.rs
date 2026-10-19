@@ -4,6 +4,9 @@
 //!   pagedb-builder ingest --schema schema.json --input story=stories.ndjson --input comment=- \
 //!       [--mem 6000] [--tmp DIR] --out DIR
 //!
+//! `--input comment=PATH@comment_by_story,comment_by_id` builds only those indexes from that
+//! input: a big table can be read in several passes, so its spill runs never all sit on disk.
+//!
 //! Each input line is a JSON object keyed by column name (missing columns are null; lists are
 //! JSON arrays of strings). Maintained columns (relation counts, copies) must already be right
 //! in the input: the base is taken as given.
@@ -216,12 +219,16 @@ pub fn run(args: &[String]) {
     let out = PathBuf::from(arg("--out").expect("--out DIR"));
     let tmp = arg("--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp"));
     let mem_mb: usize = arg("--mem").map(|v| v.parse().unwrap()).unwrap_or(4000);
-    let inputs: Vec<(TableId, String)> = args
+    let inputs: Vec<(TableId, String, Option<Vec<String>>)> = args
         .windows(2)
         .filter(|w| w[0] == "--input")
         .map(|w| {
-            let (t, p) = w[1].split_once('=').expect("--input table=PATH");
-            (schema.table_named(t).unwrap_or_else(|| panic!("unknown table {t}")), p.to_string())
+            let (t, p) = w[1].split_once('=').expect("--input table=PATH[@index,…]");
+            let (p, only) = match p.rsplit_once('@') {
+                Some((p, ix)) => (p, Some(ix.split(',').map(str::to_string).collect())),
+                None => (p, None),
+            };
+            (schema.table_named(t).unwrap_or_else(|| panic!("unknown table {t}")), p.to_string(), only)
         })
         .collect();
     let pinned: Vec<bool> = schema_json["tables"].as_array().unwrap().iter().map(|t| t.get("pinned").and_then(J::as_bool).unwrap_or(false)).collect();
@@ -234,9 +241,10 @@ pub fn run(args: &[String]) {
     let mut rows_per_table = vec![0u64; schema.tables.len()];
     let mut deferred: Vec<(&Index, Sorter)> = Vec::new();
 
-    for (table, path) in &inputs {
+    for (table, path, only) in &inputs {
         let t0 = Instant::now();
-        let ixs: Vec<&Index> = schema.indexes_of(*table).collect();
+        let ixs: Vec<&Index> = schema.indexes_of(*table).filter(|ix| only.as_ref().map_or(true, |o| o.contains(&ix.name))).collect();
+        rows_per_table[*table] = 0;
         let budget = mem_mb * (1 << 20) / ixs.len().max(1);
         let mut sorters: Vec<Sorter> = ixs.iter().map(|ix| Sorter::new(&tmp.join(&ix.name), budget)).collect();
         let mut bad = 0u64;
@@ -309,7 +317,7 @@ pub fn run(args: &[String]) {
                 b.root.height,
                 b.secs
             );
-            serde_json::json!({"tree": b.root.tree, "name": b.name, "root": b.root.root, "height": b.root.height, "rows": b.root.rows,
+            serde_json::json!({"tree": b.root.tree, "name": b.name, "root": if b.root.height == 0 { J::Null } else { J::from(b.root.root) }, "height": b.root.height, "rows": b.root.rows,
                 "firstPage": b.first_page, "pages": b.pages, "leafPages": b.root.leaves})
         })
         .collect();

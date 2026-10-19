@@ -19,7 +19,8 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub enum Op {
     Insert { table: TableId, row: Vec<Value> },
-    Update { table: TableId, id: String, set: Vec<(usize, Value)> },
+    /// `set` replaces values; `add` increments number columns (counters without a read).
+    Update { table: TableId, id: String, set: Vec<(usize, Value)>, add: Vec<(usize, f64)> },
     Delete { table: TableId, id: String },
 }
 
@@ -64,7 +65,7 @@ fn col_value(schema: &Schema, table: TableId, col: usize, v: &J) -> Result<Value
     })
 }
 
-/// `{"ops":[{"op":"insert","table":"issue","row":{…}}, {"op":"update","table":"issue","id":"…","set":{…}}, {"op":"delete","table":"comment","id":"…"}]}`
+/// `{"ops":[{"op":"insert","table":"issue","row":{…}}, {"op":"update","table":"issue","id":"…","set":{…},"add":{"n":1}}, {"op":"delete","table":"comment","id":"…"}]}`
 pub fn parse_ops(schema: &Schema, j: &J) -> Result<Vec<Op>, String> {
     let mut out = Vec::new();
     for o in j.get("ops").and_then(J::as_array).ok_or("missing ops")? {
@@ -95,14 +96,28 @@ pub fn parse_ops(schema: &Schema, j: &J) -> Result<Vec<Op>, String> {
             "update" => {
                 let id = o.get("id").and_then(J::as_str).ok_or("update without id")?.to_string();
                 let mut set = Vec::new();
-                for (name, v) in o.get("set").and_then(J::as_object).ok_or("update without set")? {
+                let mut add = Vec::new();
+                for (name, v) in o.get("add").and_then(J::as_object).into_iter().flatten() {
+                    let c = tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"))?;
+                    if tdef.columns[c].immutable || tdef.columns[c].ty != ColType::Num {
+                        return Err(format!("{name} cannot be incremented"));
+                    }
+                    add.push((c, v.as_f64().ok_or_else(|| format!("add.{name} needs a number"))?));
+                }
+                let empty = serde_json::Map::new();
+                let sets = match o.get("set") {
+                    Some(v) => v.as_object().ok_or("set must be an object")?,
+                    None if !add.is_empty() => &empty,
+                    None => return Err("update without set".into()),
+                };
+                for (name, v) in sets {
                     let c = tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"))?;
                     if tdef.columns[c].immutable {
                         return Err(format!("{name} cannot be updated"));
                     }
                     set.push((c, col_value(schema, table, c, v)?));
                 }
-                out.push(Op::Update { table, id, set });
+                out.push(Op::Update { table, id, set, add });
             }
             "delete" => out.push(Op::Delete { table, id: o.get("id").and_then(J::as_str).ok_or("delete without id")?.to_string() }),
             other => return Err(format!("unknown op {other}")),
@@ -262,11 +277,14 @@ impl Planner<'_, '_> {
         Ok(())
     }
 
-    fn update(&mut self, table: TableId, id: &str, set: &[(usize, Value)]) -> Result<(), WriteError> {
+    fn update(&mut self, table: TableId, id: &str, set: &[(usize, Value)], add: &[(usize, f64)]) -> Result<(), WriteError> {
         let old = self.read(table, id)?.ok_or_else(|| WriteError::Invalid(format!("no {} {id}", self.schema.table(table).name)))?;
         let mut new = old.clone();
         for (c, v) in set {
             new[*c] = v.clone();
+        }
+        for (c, d) in add {
+            new[*c] = Value::Num(new[*c].as_num().unwrap_or(0.0) + d);
         }
         if new != old {
             self.replace(table, old, new)?;
@@ -326,7 +344,7 @@ pub fn plan_write(ctx: &Ctx, roots: &Roots, view: &View, ops: &[Op]) -> Result<V
     for op in ops {
         match op {
             Op::Insert { table, row } => p.insert(*table, row)?,
-            Op::Update { table, id, set } => p.update(*table, id, set)?,
+            Op::Update { table, id, set, add } => p.update(*table, id, set, add)?,
             Op::Delete { table, id } => p.delete(*table, id, None)?,
         }
     }

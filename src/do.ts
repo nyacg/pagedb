@@ -17,6 +17,8 @@ export interface Env {
   /** R2 on Cloudflare; inside a container (workerd) a fetcher to the R2 bridge instead. */
   BUCKET: R2Bucket | Fetcher;
   ASSETS: Fetcher;
+  /** The Hacker News live tail (src/hn-tail.ts). */
+  HN_TAIL: DurableObjectNamespace;
   /** Signs and verifies leases (signed queries): see src/lease.ts. */
   LEASE_SECRET?: string;
   /** This deploy's version (the Worker passes its id to sockets, so stale pages can reload). */
@@ -377,7 +379,7 @@ export class DbObject extends DurableObject<Env> {
   }
 
   private track(cid: string, id: string, pid: number) {
-    this.live.pidOf.set(`${cid} ${id}`, pid);
+    this.live.pidOf.set(`${cid}\u0000${id}`, pid);
     let m = this.live.subs.get(pid);
     if (!m) this.live.subs.set(pid, (m = new Map()));
     let ids = m.get(cid);
@@ -386,7 +388,7 @@ export class DbObject extends DurableObject<Env> {
   }
 
   private untrack(cid: string, id: string) {
-    const k = `${cid} ${id}`;
+    const k = `${cid}\u0000${id}`;
     const pid = this.live.pidOf.get(k);
     if (pid === undefined) return;
     this.live.pidOf.delete(k);
@@ -507,7 +509,7 @@ export class DbObject extends DurableObject<Env> {
 
   async webSocketClose(ws: WebSocket, code: number) {
     const { cid } = ws.deserializeAttachment() as { cid: string };
-    for (const k of [...this.live.pidOf.keys()]) if (k.startsWith(`${cid} `)) this.untrack(cid, k.slice(cid.length + 1));
+    for (const k of [...this.live.pidOf.keys()]) if (k.startsWith(`${cid}\u0000`)) this.untrack(cid, k.slice(cid.length + 1));
     this.sql.exec("DELETE FROM subs WHERE cid = ?", cid);
     try {
       ws.close(code === 1005 || code === 1006 ? 1000 : code);

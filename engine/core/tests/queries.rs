@@ -268,3 +268,20 @@ fn comment_search_matches_the_oracle() {
     let ast = json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), has_comment("cache")]},"aggregate":"count"});
     assert!(compile(tracker(), &ast).is_err());
 }
+
+#[test]
+fn lookup_through_a_pointer_primary() {
+    let (db, rows) = setup();
+    let c = &rows.comments[1234];
+    let id = s(&c[comment::ID]).to_string();
+    let (out, _, _) = run(&db, &json!({"table":"comment","where":eq("id", json!(id)),"one":true}));
+    match out {
+        Output::Rows { hits, .. } => {
+            assert_eq!(hits.len(), 1);
+            let row: J = serde_json::from_str(&hits[0].json).unwrap();
+            assert_eq!(row["id"], json!(id));
+            assert_eq!(row["body"], json!(s(&c[comment::BODY])));
+        }
+        o => panic!("{o:?}"),
+    }
+}

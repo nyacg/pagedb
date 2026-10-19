@@ -477,6 +477,15 @@ mod tests {
     }
 
     #[test]
+    fn dataset_schemas_parse() {
+        for f in ["hn"] {
+            let path = format!("{}/../../datasets/{f}/schema.json", env!("CARGO_MANIFEST_DIR"));
+            let s = Schema::parse(&std::fs::read_to_string(&path).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}"));
+            assert!(!s.indexes.is_empty());
+        }
+    }
+
+    #[test]
     fn rejects_bad_schemas() {
         let bad = |s: &str| Schema::from_json(&serde_json::from_str(s).unwrap()).is_err();
         // Index without the primary key; a table without a primary index; a multi on a non-list.

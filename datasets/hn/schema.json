@@ -1,0 +1,27 @@
+{
+  "name": "hn",
+  "tables": [
+    {"name": "story", "columns": ["id", "by", {"name": "time", "type": "number"}, "title", "url", "text",
+      {"name": "score", "type": "number"}, {"name": "descendants", "type": "number"},
+      {"name": "kind", "immutable": true}, {"name": "words", "type": "list", "immutable": true}, {"name": "domain", "immutable": true},
+      {"name": "topRank", "type": "number"}]},
+    {"name": "comment", "columns": ["id", "storyId", {"name": "parent", "immutable": true}, "by", {"name": "time", "type": "number"}, "text"]}
+  ],
+  "indexes": [
+    {"tree": 1, "name": "story_by_id", "table": "story", "key": ["id"], "primary": true},
+    {"tree": 2, "name": "story_by_time", "table": "story", "key": ["-time", "id"], "truncate": {"text": 0, "words": 0}},
+    {"tree": 3, "name": "story_by_kind", "table": "story", "key": ["kind", "-time", "id"], "truncate": {"text": 0, "words": 0}},
+    {"tree": 4, "name": "story_by_score", "table": "story", "key": ["-score", "id"], "truncate": {"text": 0, "words": 0}},
+    {"tree": 5, "name": "story_by_word", "table": "story", "key": ["words", "-time", "id"], "multi": "words", "truncate": {"text": 0}},
+    {"tree": 6, "name": "story_by_user", "table": "story", "key": ["by", "-time", "id"], "truncate": {"text": 0, "words": 0}},
+    {"tree": 7, "name": "story_by_domain", "table": "story", "key": ["domain", "-time", "id"], "truncate": {"text": 0, "words": 0}, "where": {"notNull": "domain"}},
+    {"tree": 8, "name": "story_by_top", "table": "story", "key": ["topRank", "id"], "truncate": {"text": 0, "words": 0}, "where": {"notNull": "topRank"}},
+    {"tree": 10, "name": "comment_by_id", "table": "comment", "key": ["id"], "primary": true, "cols": ["id", "storyId", "time"], "rowIndex": "comment_by_story"},
+    {"tree": 11, "name": "comment_by_story", "table": "comment", "key": ["storyId", "time", "id"]},
+    {"tree": 12, "name": "comment_by_time", "table": "comment", "key": ["-time", "id"], "truncate": {"text": 300}, "baseLimit": 200000},
+    {"tree": 13, "name": "comment_by_user", "table": "comment", "key": ["by", "-time", "id"], "truncate": {"text": 160}}
+  ],
+  "relations": [
+    {"parent": "story", "child": "comment", "fk": "storyId", "count": "descendants", "onDelete": "cascade"}
+  ]
+}

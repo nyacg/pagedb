@@ -36,6 +36,10 @@ fn main() {
         println!(r#"{{"count":{n},"newest":{:?},"title":{:?},"comments":{}}}"#, newest, first.row[pagedb_core::catalog::issue::TITLE].as_str().unwrap(), first.comments);
         return;
     }
+    if args.get(1).map(String::as_str) == Some("fetch-hn") {
+        fetch_hn(&args[2..]);
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("export") {
         // The generated tracker as JSON lines per table (to check `ingest` against `build`).
         let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
@@ -287,4 +291,51 @@ fn main() {
         pages as f64 * PAGE_SIZE as f64 / 1e9,
         started.elapsed().as_secs_f64()
     );
+}
+
+/// Hacker News items [from, to] from the official API as JSON lines on stdout (null/missing
+/// items skipped). `--threads` requests in flight; each item is retried a few times.
+fn fetch_hn(args: &[String]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    let arg = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+    let from: u64 = arg("--from").expect("--from ID").parse().unwrap();
+    let to: u64 = arg("--to").expect("--to ID").parse().unwrap();
+    let threads: usize = arg("--threads").map(|v| v.parse().unwrap()).unwrap_or(64);
+    let next = AtomicU64::new(from);
+    let done = AtomicU64::new(0);
+    let out = Mutex::new(BufWriter::with_capacity(1 << 20, std::io::stdout()));
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).build();
+    let t0 = Instant::now();
+    std::thread::scope(|sc| {
+        for _ in 0..threads {
+            sc.spawn(|| loop {
+                let id = next.fetch_add(1, Ordering::Relaxed);
+                if id > to {
+                    break;
+                }
+                let url = format!("https://hacker-news.firebaseio.com/v0/item/{id}.json");
+                for attempt in 0..5 {
+                    match agent.get(&url).call().and_then(|r| Ok(r.into_string()?)) {
+                        Ok(body) => {
+                            let body = body.trim();
+                            if body != "null" && !body.is_empty() {
+                                let mut w = out.lock().unwrap();
+                                w.write_all(body.as_bytes()).unwrap();
+                                w.write_all(b"\n").unwrap();
+                            }
+                            break;
+                        }
+                        Err(e) if attempt == 4 => eprintln!("item {id}: {e}"),
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(200 << attempt)),
+                    }
+                }
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 20_000 == 0 {
+                    eprintln!("fetched {n} of {} ({:.0}/s)", to - from + 1, n as f64 / t0.elapsed().as_secs_f64());
+                }
+            });
+        }
+    });
+    out.lock().unwrap().flush().unwrap();
 }

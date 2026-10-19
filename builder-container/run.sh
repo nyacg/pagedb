@@ -7,7 +7,12 @@ OUT=/data/out
 mkdir -p "$OUT"
 status() { curl -s --max-time 20 -X PUT --data "$1" "http://r2.internal/put/db/$DB/build-status.json" >/dev/null || true; }
 status "{\"phase\":\"building\",\"uploaded\":0,\"base\":\"$BASE\"}"
-pagedb-builder build --projects "$PROJECTS" --comments "${COMMENTS:-5.0}" --out "$OUT" > /data/build.log 2>&1 &
+if [ -n "${JOB:-}" ]; then
+  # A dataset job (datasets/$JOB/build.sh): reads public data, streams it into `pagedb-builder ingest`.
+  OUT="$OUT" WORK=/data/work /datasets/$JOB/build.sh > /data/build.log 2>&1 &
+else
+  pagedb-builder build --projects "$PROJECTS" --comments "${COMMENTS:-5.0}" --out "$OUT" > /data/build.log 2>&1 &
+fi
 BPID=$!
 up() {
   # Already in R2 from an earlier (identical, deterministic) run: skip it.
@@ -38,7 +43,7 @@ while :; do
     printf '%s\n' "${batch[@]}" | xargs -P 3 -I{} bash -c 'up "$@"' _ {}
     n=$((n + ${#batch[@]}))
   fi
-  last=$(grep -E "rows|issues" /data/build.log | tail -1 | tr -d '"\\' | cut -c1-160)
+  last=$(grep -E "rows|issues|pass|backfill|fetched|pages" /data/build.log | tail -1 | tr -d '"\\' | cut -c1-160)
   status "{\"phase\":\"building\",\"uploaded\":$n,\"finished\":$finished,\"secs\":$(( $(date +%s) - t0 )),\"base\":\"$BASE\",\"last\":\"$last\"}"
   if [ $finished = 1 ] && [ ${#ready[@]} -le 48 ]; then
     left=$(ls "$OUT/parts" 2>/dev/null | wc -l)

@@ -208,7 +208,10 @@ pub fn compile(schema: &'static Schema, ast: &J) -> Result<Plan, String> {
     // Index choice: most equality columns as prefix, then the rest must give `order`.
     let mut best: Option<(usize, &'static Index, bool)> = None;
     for ix in schema.indexes_of(table) {
-        if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) {
+        // Covering indexes, and a pointer primary for lookups by primary key (rows are read
+        // through the pointer).
+        let pk_lookup = ix.primary && ix.row_index.is_some() && eqs.iter().any(|(e, _)| *e == 0);
+        if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) && !pk_lookup {
             continue;
         }
         // A partial index serves only queries that exclude the rows it leaves out.
@@ -404,6 +407,11 @@ impl Roots {
         let mut out = HashMap::new();
         for t in m.get("trees").and_then(J::as_array).ok_or("manifest without trees")? {
             let tree = t.get("tree").and_then(J::as_u64).ok_or("tree id")? as u16;
+            // An empty tree has no root page (written as null: JSON readers mangle u64::MAX).
+            if t.get("height").and_then(J::as_u64).unwrap_or(0) == 0 {
+                out.insert(tree, TreeRoot::empty(tree));
+                continue;
+            }
             out.insert(
                 tree,
                 TreeRoot {
@@ -521,10 +529,27 @@ pub fn read_row(ctx: &Ctx, roots: &Roots, table: TableId, id: &str) -> Result<Op
 /// costs ~3 rounds.
 pub fn collect(ctx: &Ctx, roots: &Roots, plan: &Plan, lo: &[u8], hi: &[u8], need: usize) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Miss> {
     let deep = has_child_filter(plan);
+    let pointer = plan.index.row_index.is_some();
     let hint = if plan.filters.is_empty() { need + 1 } else { SCAN_BUDGET };
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let (mut more, mut unknown, mut known) = (false, 0usize, 0usize);
     merged::scan(ctx, &roots.get(plan.index.tree), &Range { lo, hi }, plan.reverse, hint, &mut |k, v| {
+        let full;
+        let v: &[u8] = if pointer {
+            match read_row(ctx, roots, plan.table, RowRef(v).get(0).str()) {
+                Ok(Some(r)) => {
+                    full = crate::codec::encode_row(&r);
+                    &full
+                }
+                Ok(None) => return true,
+                Err(Miss) => {
+                    unknown += 1;
+                    return true;
+                }
+            }
+        } else {
+            v
+        };
         if !row_matches(plan, RowRef(v)) {
             return true;
         }
