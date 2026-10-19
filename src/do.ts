@@ -270,17 +270,27 @@ export class DbObject extends DurableObject<Env> {
 
   /** Fetch the chunks holding `ids`, hand the pages to the engine and the SQLite tier. */
   private async resolve(ids: number[], stats: QueryStats, all = false, persistNow = false) {
-    const chunks = [...new Set(ids.map((id) => Math.floor(id / PAGES_PER_CHUNK)))];
+    const chunks = [...new Set(ids.map((id) => Math.floor(id / PAGES_PER_CHUNK)))].sort((a, b) => a - b);
     stats.pages += ids.length;
     stats.chunks += chunks.length;
     const wanted = new Set(ids);
+    // Chunks not already on their way, in runs of neighbours within one part: a run is one
+    // ranged GET (a big scan's pages arrive in a few large reads, not many 1 MiB ones).
+    const part = (c: number) => Math.floor((c * PAGES_PER_CHUNK) / PAGES_PER_PART);
+    const runs: number[][] = [];
+    for (const c of chunks) {
+      if (this.inflight.has(c)) continue;
+      const last = runs.at(-1);
+      if (last && last.at(-1) === c - 1 && part(c) === part(last[0])) last.push(c);
+      else runs.push([c]);
+    }
+    for (const run of runs) {
+      const got = this.gate.run(() => this.fetchRun(run, stats));
+      for (const c of run) this.inflight.set(c, got.then((m) => m.get(c)!).finally(() => this.inflight.delete(c)));
+    }
+    const pending = chunks.map((c) => [c, this.inflight.get(c)!] as const);
     await Promise.all(
-      chunks.map(async (c) => {
-        let p = this.inflight.get(c);
-        if (!p) {
-          p = this.gate.run(() => this.fetchChunk(c, stats)).finally(() => this.inflight.delete(c));
-          this.inflight.set(c, p);
-        }
+      pending.map(async ([c, p]) => {
         const bytes = await p;
         const first = c * PAGES_PER_CHUNK;
         for (let i = 0; i * PAGE < bytes.byteLength; i++) {
@@ -294,30 +304,52 @@ export class DbObject extends DurableObject<Env> {
     );
   }
 
-  private async fetchChunk(chunk: number, stats: QueryStats): Promise<ArrayBuffer> {
-    const part = Math.floor((chunk * PAGES_PER_CHUNK) / PAGES_PER_PART);
-    const offset = ((chunk * PAGES_PER_CHUNK) % PAGES_PER_PART) * PAGE;
+  /** Neighbouring chunks of one part: each from the city cache if it's there, the rest from R2
+   *  in as few ranged GETs as possible (then cached as 1 MiB chunks). */
+  private async fetchRun(run: number[], stats: QueryStats): Promise<Map<number, ArrayBuffer>> {
+    const part = Math.floor((run[0] * PAGES_PER_CHUNK) / PAGES_PER_PART);
     const key = `db/${this.db}/base/${this.base}/part-${String(part).padStart(6, "0")}`;
-    const cacheUrl = `https://pagedb.cache/${key}/${offset}${this.salt ? `?s=${this.salt}` : ""}`;
+    const offsetOf = (c: number) => ((c * PAGES_PER_CHUNK) % PAGES_PER_PART) * PAGE;
+    const cacheUrl = (c: number) => `https://pagedb.cache/${key}/${offsetOf(c)}${this.salt ? `?s=${this.salt}` : ""}`;
+    const out = new Map<number, ArrayBuffer>();
     const cache = await openCache();
-    const c0 = performance.now();
-    const hit = await cache?.match(cacheUrl);
-    if (hit) {
-      stats.cacheHits++;
-      const buf = await hit.arrayBuffer();
-      stats.cacheMs.push(+(performance.now() - c0).toFixed(1));
-      stats.bytes += buf.byteLength;
-      return buf;
+    if (cache) {
+      await Promise.all(
+        run.map(async (c) => {
+          const c0 = performance.now();
+          const hit = await cache.match(cacheUrl(c));
+          if (!hit) return;
+          const buf = await hit.arrayBuffer();
+          stats.cacheHits++;
+          stats.cacheMs.push(+(performance.now() - c0).toFixed(1));
+          stats.bytes += buf.byteLength;
+          out.set(c, buf);
+        }),
+      );
     }
-    const r0 = performance.now();
-    const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(key, { range: { offset, length: PAGES_PER_CHUNK * PAGE } });
-    if (!obj) throw new Error(`missing ${key}`);
-    const buf = await obj.arrayBuffer();
-    stats.r2Ms.push(+(performance.now() - r0).toFixed(1));
-    stats.r2Gets++;
-    stats.bytes += buf.byteLength;
-    if (cache) this.cachePuts.push([cacheUrl, buf.slice(0)]);
-    return buf;
+    const CHUNK = PAGES_PER_CHUNK * PAGE;
+    for (let i = 0; i < run.length; ) {
+      if (out.has(run[i])) {
+        i++;
+        continue;
+      }
+      let j = i;
+      while (j + 1 < run.length && !out.has(run[j + 1])) j++;
+      const r0 = performance.now();
+      const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(key, { range: { offset: offsetOf(run[i]), length: (j - i + 1) * CHUNK } });
+      if (!obj) throw new Error(`missing ${key}`);
+      const buf = await obj.arrayBuffer();
+      stats.r2Ms.push(+(performance.now() - r0).toFixed(1));
+      stats.r2Gets++;
+      stats.bytes += buf.byteLength;
+      for (let k = i; k <= j; k++) {
+        const piece = buf.slice((k - i) * CHUNK, (k - i + 1) * CHUNK);
+        out.set(run[k], piece);
+        if (cache && piece.byteLength) this.cachePuts.push([cacheUrl(run[k]), piece.slice(0)]);
+      }
+      i = j + 1;
+    }
+    return out;
   }
 
   /** Run an engine call to completion, resolving page faults. */

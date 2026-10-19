@@ -10,9 +10,8 @@
 
 use crate::catalog::{self, index_entries, Table};
 use crate::codec::{RowRef, Value};
-use crate::merged;
-use crate::query::{execute, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
-use crate::tree::{Ctx, Miss, Range};
+use crate::query::{comments_match, execute, render, row_in_partition, Hit, Output, Plan, RelKind, Roots};
+use crate::tree::{Ctx, Miss};
 use crate::write::RowChange;
 use std::rc::Rc;
 
@@ -56,8 +55,9 @@ fn before(plan: &Plan, a: &[u8], b: &[u8]) -> bool {
     }
 }
 
-/// The row's key in this partition's index, if the row belongs to the partition.
-fn key_in(plan: &Plan, row: &[Value]) -> Option<Vec<u8>> {
+/// The row's key in this partition's index, if the row belongs to the partition (read through
+/// ctx's view, so comment search sees the batch's comments).
+fn key_in(ctx: &Ctx, roots: &Roots, plan: &Plan, row: &[Value]) -> Result<Option<Vec<u8>>, Miss> {
     let enc = crate::codec::encode_row(row);
     let r = RowRef(&enc);
     let ix = plan.index;
@@ -69,10 +69,10 @@ fn key_in(plan: &Plan, row: &[Value]) -> Option<Vec<u8>> {
             vals[pos].as_str().unwrap_or_default().to_string()
         });
         if row_in_partition(plan, r, elem.as_deref()) && plan.in_range(&k) {
-            return Some(k);
+            return Ok(if comments_match(ctx, roots, plan, r)? { Some(k) } else { None });
         }
     }
-    None
+    Ok(None)
 }
 
 fn render_row(ctx: &Ctx, roots: &Roots, plan: &Plan, row: &[Value]) -> Result<String, Miss> {
@@ -100,10 +100,17 @@ pub fn compute(ctx: &Ctx, roots: &Roots, part: &Partition, changes: &[RowChange]
             let mut missed = false;
             // Rows of this table entering, leaving or changing within the window.
             for ch in changes.iter().filter(|c| c.table == plan.table) {
-                let old_k = ch.old.as_ref().and_then(|r| key_in(plan, r));
-                let new_k = ch.new.as_ref().and_then(|r| key_in(plan, r));
+                let new_k = match ch.new.as_ref().map(|r| key_in(ctx, roots, plan, r)).transpose() {
+                    Ok(k) => k.flatten(),
+                    Err(Miss) => {
+                        missed = true;
+                        continue;
+                    }
+                };
                 let pk = ch.new.as_ref().or(ch.old.as_ref()).unwrap()[0].as_str().unwrap_or("").to_string();
-                let pos = old_k.as_ref().and_then(|k| w.iter().position(|(wk, _)| wk == k));
+                // Where the row was: by pk (a window holds a pk at most once). Re-evaluating the
+                // old row would read the *new* comments, so it can't tell whether it matched.
+                let pos = if ch.old.is_some() { w.iter().position(|(_, p)| *p == pk) } else { None };
                 if let (Some(i), Some(nk)) = (pos, &new_k) {
                     if &w[i].0 == nk {
                         match render_row(ctx, roots, plan, ch.new.as_ref().unwrap()) {
@@ -139,7 +146,6 @@ pub fn compute(ctx: &Ctx, roots: &Roots, part: &Partition, changes: &[RowChange]
             }
             // Refill a window that lost rows.
             if w.len() < plan.limit && !complete {
-                let root = roots.get(plan.index.tree);
                 let (lo_prefix, hi_prefix) = plan.scan_range();
                 // Continue strictly after the last key in scan order.
                 let (lo, hi) = match (w.last(), plan.reverse) {
@@ -152,20 +158,7 @@ pub fn compute(ctx: &Ctx, roots: &Roots, part: &Partition, changes: &[RowChange]
                     (Some((lk, _)), true) => (lo_prefix.clone(), lk.clone()),
                 };
                 let need = plan.limit - w.len();
-                let mut found: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut more = false;
-                let hint = if plan.filters.is_empty() { need + 1 } else { crate::query::SCAN_BUDGET };
-                merged::scan(ctx, &root, &Range { lo: &lo, hi: &hi }, plan.reverse, hint, &mut |k, v| {
-                    if !crate::query::row_matches(plan, RowRef(v)) {
-                        return true;
-                    }
-                    if found.len() == need {
-                        more = true;
-                        return false;
-                    }
-                    found.push((k.to_vec(), v.to_vec()));
-                    true
-                })?;
+                let (found, more) = crate::query::collect(ctx, roots, plan, &lo, &hi, need)?;
                 complete = !more;
                 for (k, v) in found {
                     let pk = RowRef(&v).get(0).str().to_string();
