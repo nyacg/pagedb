@@ -98,11 +98,33 @@ impl TreeBuilder {
         self.leaf = PageBuilder::new(LEAF, 0, self.tree);
     }
 
-    pub fn finish(mut self, sink: &mut dyn PageSink) -> TreeRoot {
+    pub fn finish(self, sink: &mut dyn PageSink) -> TreeRoot {
+        self.finish_leaves(sink).finish_branches(sink)
+    }
+
+    /// Write the last leaf; branch levels can be written later (so all interior pages of all
+    /// trees can share one contiguous, pinned region at the end of the base).
+    pub fn finish_leaves(mut self, sink: &mut dyn PageSink) -> PendingTree {
         self.flush_leaf(sink);
-        if self.entries.is_empty() {
-            return TreeRoot::empty(self.tree);
+        PendingTree(self)
+    }
+}
+
+/// A tree whose leaves are written and whose branch levels are not yet.
+pub struct PendingTree(TreeBuilder);
+
+impl PendingTree {
+    pub fn finish_branches(self, sink: &mut dyn PageSink) -> TreeRoot {
+        let mut this = self.0;
+        if this.entries.is_empty() {
+            return TreeRoot::empty(this.tree);
         }
+        this.build_levels(sink)
+    }
+}
+
+impl TreeBuilder {
+    fn build_levels(mut self, sink: &mut dyn PageSink) -> TreeRoot {
         let mut level = 0u8;
         let mut entries = std::mem::take(&mut self.entries);
         while entries.len() > 1 {

@@ -216,6 +216,7 @@ name = "pagedb-wasm"
 version = "0.1.0"
 dependencies = [
  "pagedb-core",
+ "serde_json",
 ]
 
 [[package]]

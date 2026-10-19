@@ -68,6 +68,7 @@ impl PageSink for PartSink {
 }
 
 struct Built {
+    pending: Option<pagedb_core::tree::PendingTree>,
     root: TreeRoot,
     name: &'static str,
     first_page: PageId,
@@ -80,8 +81,8 @@ fn build_tree(sink: &mut PartSink, tree: u16, entries: &mut dyn FnMut(&mut dyn F
     let first_page = sink.next;
     let mut b = TreeBuilder::new(tree);
     entries(&mut |k, v| b.push(sink, k, v));
-    let root = b.finish(sink);
-    Built { root, name: catalog::index(tree).name, first_page, pages: sink.next - first_page, secs: t0.elapsed().as_secs_f64() }
+    let pending = b.finish_leaves(sink);
+    Built { pending: Some(pending), root: TreeRoot::empty(tree), name: catalog::index(tree).name, first_page, pages: sink.next - first_page, secs: t0.elapsed().as_secs_f64() }
 }
 
 fn main() {
@@ -118,17 +119,6 @@ fn main() {
         }
     };
 
-    // 1, 2: small tables.
-    built.push(build_tree(&mut sink, 1, &mut |f| {
-        for p in 0..cfg.projects {
-            emit_row(ix("project_by_id"), &gen::project_row(&cfg, p), f);
-        }
-    }));
-    built.push(build_tree(&mut sink, 2, &mut |f| {
-        for u in 0..cfg.users {
-            emit_row(ix("user_by_id"), &gen::user_row(&cfg, u), f);
-        }
-    }));
     // 3: issue_by_id — ids sort by (project, seq).
     built.push(build_tree(&mut sink, 3, &mut |f| {
         for p in 0..cfg.projects {
@@ -249,6 +239,26 @@ fn main() {
         }
     }));
 
+    // Pinned region (loaded whole when an object starts): the small tables, then the interior
+    // (branch) pages of every tree. Contiguous, so it costs one or two ranged GETs.
+    let pinned_from = sink.next;
+    // 1, 2: small tables.
+    built.push(build_tree(&mut sink, 1, &mut |f| {
+        for p in 0..cfg.projects {
+            emit_row(ix("project_by_id"), &gen::project_row(&cfg, p), f);
+        }
+    }));
+    built.push(build_tree(&mut sink, 2, &mut |f| {
+        for u in 0..cfg.users {
+            emit_row(ix("user_by_id"), &gen::user_row(&cfg, u), f);
+        }
+    }));
+    for b in built.iter_mut() {
+        let first = sink.next;
+        b.root = b.pending.take().unwrap().finish_branches(&mut sink);
+        b.pages += sink.next - first;
+    }
+    built.sort_by_key(|b| b.root.tree);
     let (pages, crcs) = sink.finish();
     let issues: u64 = (0..cfg.projects).map(|p| gen::issue_count(&cfg, p) as u64).sum();
     let mut trees = String::new();
@@ -274,7 +284,7 @@ fn main() {
     let parts = crcs.len();
     let crc_list: Vec<String> = crcs.iter().map(|c| c.to_string()).collect();
     let manifest = format!(
-        r#"{{"version":1,"pageSize":{PAGE_SIZE},"pagesPerPart":{PAGES_PER_PART},"pages":{pages},"parts":{parts},"bytes":{},"issues":{issues},"gen":{{"seed":{},"projects":{},"issuesPerProject":{},"users":{},"commentsPerIssue":{},"feedBase":{}}},"tables":{{"project":1,"user":2,"issue":3,"comment":9}},"trees":[{trees}],"partCrcs":[{}]}}"#,
+        r#"{{"version":1,"pageSize":{PAGE_SIZE},"pagesPerPart":{PAGES_PER_PART},"pages":{pages},"pinnedFrom":{pinned_from},"parts":{parts},"bytes":{},"issues":{issues},"gen":{{"seed":{},"projects":{},"issuesPerProject":{},"users":{},"commentsPerIssue":{},"feedBase":{}}},"tables":{{"project":1,"user":2,"issue":3,"comment":9}},"trees":[{trees}],"partCrcs":[{}]}}"#,
         pages * PAGE_SIZE as u64,
         cfg.seed,
         cfg.projects,

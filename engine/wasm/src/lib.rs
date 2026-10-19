@@ -47,7 +47,13 @@ impl Ram {
     }
 }
 
+struct Db {
+    roots: pagedb_core::query::Roots,
+    plans: HashMap<String, Rc<pagedb_core::query::Plan>>,
+}
+
 thread_local! {
+    static DB: RefCell<Option<Db>> = RefCell::new(None);
     static RAM: RefCell<Ram> = RefCell::new(Ram { pages: HashMap::new(), tick: 0, budget: 512, hits: 0, host_hits: 0 });
     static OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
@@ -227,4 +233,80 @@ pub unsafe extern "C" fn tree_count(root_lo: u32, root_hi: u32, height: u32, row
 #[allow(dead_code)]
 fn _keep(s: &mut String) {
     json_str(s, "");
+}
+
+fn error(msg: impl Into<String>) -> u32 {
+    set_out(msg.into().into_bytes());
+    2
+}
+
+/// Load the manifest (JSON). Must be called before `query`.
+#[no_mangle]
+pub unsafe extern "C" fn init(ptr: *const u8, len: u32) -> u32 {
+    let m: serde_json::Value = match serde_json::from_slice(slice(ptr, len)) {
+        Ok(v) => v,
+        Err(e) => return error(format!("bad manifest: {e}")),
+    };
+    match pagedb_core::query::Roots::from_manifest(&m) {
+        Ok(roots) => {
+            DB.with(|d| *d.borrow_mut() = Some(Db { roots, plans: HashMap::new() }));
+            set_out(Vec::new());
+            0
+        }
+        Err(e) => error(e),
+    }
+}
+
+/// Run a query AST (JSON). OK payload: {"rows":[…],"complete":bool,"keys":[hex…]} or {"count":n}.
+#[no_mangle]
+pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
+    use pagedb_core::query::{compile, execute, Output};
+    let text = match std::str::from_utf8(slice(ptr, len)) {
+        Ok(t) => t,
+        Err(_) => return error("query is not UTF-8"),
+    };
+    let plan = DB.with(|d| {
+        let mut d = d.borrow_mut();
+        let db = d.as_mut()?;
+        if let Some(p) = db.plans.get(text) {
+            return Some(Ok(p.clone()));
+        }
+        let ast: serde_json::Value = match serde_json::from_str(text) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(format!("bad query JSON: {e}"))),
+        };
+        Some(compile(&ast).map(|p| {
+            let p = Rc::new(p);
+            if db.plans.len() > 4096 {
+                db.plans.clear();
+            }
+            db.plans.insert(text.to_string(), p.clone());
+            p
+        }))
+    });
+    let plan = match plan {
+        None => return error("engine not initialized"),
+        Some(Err(e)) => return error(e),
+        Some(Ok(p)) => p,
+    };
+    let store = Tiers;
+    let ctx = Ctx::new(&store);
+    let r = DB.with(|d| execute(&ctx, &d.borrow().as_ref().unwrap().roots, &plan));
+    finish(&ctx, r, |o| match o {
+        Output::Count(n) => format!("{{\"count\":{n}}}").into_bytes(),
+        Output::Rows { hits, complete } => {
+            let mut s = String::with_capacity(hits.iter().map(|h| h.json.len() + 1).sum::<usize>() + 32);
+            s.push_str("{\"rows\":[");
+            for (i, h) in hits.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&h.json);
+            }
+            s.push_str("],\"complete\":");
+            s.push_str(if complete { "true" } else { "false" });
+            s.push('}');
+            s.into_bytes()
+        }
+    })
 }

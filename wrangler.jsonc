@@ -1,0 +1,11 @@
+{
+  "name": "pagedb",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DbObject"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+  "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "pagedb",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "wasm": "cd engine && cargo build --release -p pagedb-wasm --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/pagedb_wasm.wasm ../src/engine.wasm",
+    "test:engine": "cd engine && cargo test --release",
+    "typecheck": "tsc --noEmit",
+    "deploy": "npm run wasm && wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261015.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.151.0",
+    "tsx": "^4.19.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.12",
+    "@types/node": "^22.0.0"
+  }
+}

@@ -359,6 +359,28 @@ pub fn row_in_partition(plan: &Plan, row: RowRef, multi_elem: Option<&str>) -> b
 }
 
 pub fn execute(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
+    // A lookup by primary key whose related rows hang off that key (issue → comments): the
+    // child prefix is known before the parent is read, so fault both in the same round.
+    let mut speculative_miss = false;
+    if plan.index.primary && !plan.prefix.is_empty() {
+        for r in &plan.related {
+            if let RelKind::Many { plan: child, parent_col: 0 } = &r.kind {
+                let mut c = (**child).clone();
+                c.prefix[0] = plan.prefix[0].clone();
+                if execute(ctx, roots, &c).is_err() {
+                    speculative_miss = true;
+                }
+            }
+        }
+    }
+    let r = execute_plan(ctx, roots, plan);
+    if speculative_miss && r.is_ok() {
+        return Err(Miss); // the child pages are on their way; render once they're resident
+    }
+    r
+}
+
+fn execute_plan(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
     let root = roots.get(plan.index.tree);
     let lo = prefix_key(plan.index, &plan.prefix);
     let hi = if lo.is_empty() { Vec::new() } else { prefix_end(&lo) };
