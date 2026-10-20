@@ -61,7 +61,7 @@ const COLS: { key: string; label: string; w: number; sort?: Sort; fmt: (r: Row) 
   { key: "total", label: "Total", w: 80, sort: "total", fmt: (r) => `$${(r.total ?? 0).toFixed(2)}` },
   { key: "note", label: "Note (editable)", w: 220, edit: "note", fmt: (r) => r.note ?? "" },
 ];
-const template = `56px ${COLS.map((c) => `${c.w}px`).join(" ")}`;
+const template = `96px ${COLS.map((c) => `${c.w}px`).join(" ")}`;
 
 // ---------------------------------------------------------------- data: pages of rows at offsets
 
