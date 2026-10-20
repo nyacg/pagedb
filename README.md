@@ -81,6 +81,43 @@ Details: `bench/results/*.md`.
      project (~20–35 MB, read as a few large ranged GETs). Once a project's comments are in the
      object it's instant. Live: adding or deleting a matching comment moves the issue in or out.
 
+## Semantic search (pagevec)
+
+Vector search in the same pages, tiers and object: **every HN story since 2006 is an embedding
+in an IVF index stored as ordinary B+trees**, next to the relational data. It's turbopuffer's
+design (object storage first, centroids pinned, one round trip per query, unindexed writes
+searched directly) on Durable Objects + R2. Try it: `/hn?p=semantic&q=…` on the vec Worker.
+
+- **Index format** (`engine/core/src/vector`): a tree keyed `cluster ‖ pk` whose entries hold a
+  4-bit residual code of the vector (all 1024 dims: 512 B) and the columns a result shows; a
+  pinned centroid tree; a `byId` tree for replacing and deleting. Scores are one i8 dot product
+  per entry (SIMD128 in the object).
+- **One fault round:** score the centroids, take the `nprobe` best, find their leaves through
+  the pinned branch pages, ask for all of them at once (≤ `maxPages`). Vector segments use
+  256 KiB chunks; a prewarmed object reads them from its SQLite in batches.
+- **Writes are searchable at once:** `vec_put` / `vec_del` go into the overlay with the row ops
+  of the same batch; a search scans overlay vectors too and tombstones hide base entries. New HN
+  stories (the live tail) and visitors' submissions are embedded on write.
+- **Live semantic results:** a semantic page is a live query. A newly written story that scores
+  into its top k is pushed to every tab showing that search; points and comment counts update
+  in place.
+- **Embeddings:** Workers AI `@cf/qwen/qwen3-embedding-0.6b` (1024 dims) for documents (builder
+  container, PVEC shards in R2, resumable and parallel) and queries (the Worker, cached). Any
+  OpenAI-compatible endpoint (e.g. EmbeddingGemma behind AI Gateway) plugs in via `EMBED_URL`.
+
+Build and attach (see `datasets/hn/embed.sh`, `vec.sh`, `vectors.json`):
+
+```sh
+POST pagedb-builder/start?db=emb-a&job=hn/embed                 # stories → PVEC shards in R2
+pagedb-builder vec-build --schema datasets/hn/schema.json --config datasets/hn/vectors.json \
+  --shards LIST --first-page 1099511627776 --out data/seg        # k-means, codes, trees
+pagedb-builder vec-gt … && pagedb-builder vec-eval …             # recall vs exact, offline
+node scripts/attach-vec.mjs data/seg hn hnv                      # base + segment → db "hnv"
+npm run deploy:vec                                               # pagedb-vec Worker (HN_DB=hnv)
+```
+
+Results: `bench/results/v0-vec-synth.md`, `v1-hn-recall.md`, `v3-vs-vectorize.md`.
+
 ## Schemas and datasets
 
 A base carries its schema in `manifest.json`: tables (typed columns, column 0 is the primary
@@ -128,19 +165,22 @@ leases, sockets and mutations carry `?app=`.
 
 ```
 engine/core      Rust: key/row codec, 64 KiB pages, B+tree (bulk build + fault-aware reads),
-                 catalog, generator, queries, overlay, writes, IVM
+                 catalog, generator, queries, overlay, writes, IVM, vector (IVF search, live top k)
                  tests: oracle queries, write+IVM fuzz with fault injection, B+tree property tests
 engine/wasm      the engine as WebAssembly (raw exports, synchronous host import for SQLite pages)
-engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container)
+engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container);
+                 embed (PVEC shards), vec-build / vec-gt / vec-eval / vec-merge
 src/do.ts        DbObject: tiers, fault rounds, sockets, overlay persistence, hibernation
 src/apps/        the apps' named queries and validated mutators (tracker, hn, place, taxi)
-src/hn-tail.ts   HnTail: keeps the HN base live from the official API
+src/hn-tail.ts   HnTail: keeps the HN base live from the official API (and embeds new stories)
+src/embed.ts     embeddings in the Worker: query vectors (cached), story text shared with the builder
 datasets/        per-app schema.json and build.sh (run in the builder container)
 src/lease.ts     signed queries: lease signing and verification
 src/worker.ts    edge Worker: SSR first paint, /api/socket, /api/mutate, admin, nightly reset
 src/node-*.ts    the same DbObject in workerd in a Container (pagedb-node)
 web/             the tracker UI (optimistic sync client) and the how-it-works page
-bench/           R2/tier spikes, query tiers, fan-out load, WASM microbenchmarks
+bench/           R2/tier spikes, query tiers, fan-out load, WASM microbenchmarks, vector tiers,
+                 write visibility, Vectorize comparison (spikes/vectorize-bench)
 test/            live sync and hibernation end-to-end tests (deployed)
 ```
 
