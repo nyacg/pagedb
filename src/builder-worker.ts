@@ -13,6 +13,10 @@ interface Env {
   BUCKET: R2Bucket;
   BOX: DurableObjectNamespace<BuilderBox>;
   ADMIN_TOKEN?: string;
+  /** R2 S3 credentials for dataset jobs' uploads (secrets). */
+  R2_AK?: string;
+  R2_SK?: string;
+  R2_ENDPOINT?: string;
 }
 
 /** The container's only egress: PUT http://r2.internal/put/<key> → R2. */
@@ -42,7 +46,15 @@ export class BuilderBox extends DurableObject<Env> {
       // Dataset jobs read public data from the internet; the generated tracker needs none.
       enableInternet: !!job,
       instance: { vcpu: 4, memoryMib: 12288, diskMb: 20000 },
-      env: { DB: db, PROJECTS: String(projects), COMMENTS: String(comments), BASE: base, ...(job ? { JOB: job } : {}) },
+      // Dataset jobs upload straight to R2's S3 API (much faster than the intercepted route).
+      env: {
+        DB: db,
+        PROJECTS: String(projects),
+        COMMENTS: String(comments),
+        BASE: base,
+        ...(job ? { JOB: job } : {}),
+        ...(job && this.env.R2_AK ? { R2_AK: this.env.R2_AK, R2_SK: this.env.R2_SK!, R2_ENDPOINT: this.env.R2_ENDPOINT! } : {}),
+      },
     } as any);
     await c.interceptOutboundHttp("r2.internal", (this.ctx.exports as any).R2Put({ props: {} }));
     // A container lives and dies with its object, and the container's uploads never touch the

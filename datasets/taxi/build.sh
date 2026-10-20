@@ -23,14 +23,15 @@ duck() { "$DUCKDB" "$DB" -c "SET memory_limit='${DUCK_MEM:-5GB}'; SET threads=4;
 files=$(for m in 01 02 03 04 05 06 07 08 09 10 11 12; do printf "'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_%s-%s.parquet'," "$YEAR" "$m"; done)
 duck "CREATE TABLE zone AS SELECT LocationID::VARCHAR AS id, Borough AS borough, Zone AS zone, service_zone AS service
   FROM read_csv('https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv', header = true);"
-# Month by month: each month's trips sorted by pickup and numbered on from the last month, so
+# Month by month: each month's trips sorted by pickup (then every column, so the numbering is
+# deterministic and a resumed build makes identical parts) and numbered on from the last month, so
 # the table is in id (= pickup) order without sorting the whole year at once.
 offset=0
 for m in ${MONTHS:-01 02 03 04 05 06 07 08 09 10 11 12}; do
   [ "$offset" = 0 ] && create="CREATE TABLE trip AS" || create="INSERT INTO trip"
   n=$(duck "
 $create
-  SELECT lpad(($offset + row_number() OVER (ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime, PULocationID, total_amount))::VARCHAR, 9, '0') AS id,
+  SELECT lpad(($offset + row_number() OVER (ORDER BY tpep_pickup_datetime, tpep_dropoff_datetime, PULocationID, DOLocationID, total_amount, fare_amount, tip_amount, tolls_amount, trip_distance, passenger_count, payment_type, VendorID))::VARCHAR, 9, '0') AS id,
          epoch_ms(tpep_pickup_datetime) AS pickup, epoch_ms(tpep_dropoff_datetime) AS dropoff,
          greatest(0, date_diff('second', tpep_pickup_datetime, tpep_dropoff_datetime)) AS duration,
          VendorID AS vendor, passenger_count AS passengers, round(trip_distance, 2) AS distance,
