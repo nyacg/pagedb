@@ -25,6 +25,7 @@
 
 pub mod kernels;
 pub mod live;
+pub mod probe;
 
 use crate::codec::{encode_key, encode_row, json_cell, json_str, Cell, RowRef, Value};
 use crate::page::{Page, PageId};
@@ -77,8 +78,21 @@ pub struct VecIndex {
     pub nprobe: usize,
     pub max_pages: usize,
     pub model: String,
+    /// A probe tier (1-bit codes scanned first; `tree` then holds the rerank entries).
+    pub probe: Option<Probe>,
     pub json: J,
     cache: Arc<OnceLock<Arc<Centroids>>>,
+}
+
+/// The probe tier of a two-stage index: `tree` (same keys as the index's tree) holds 1-bit codes
+/// and the `cols` filters need; the best `rerank` candidates are scored again with the finer
+/// codes in the index's tree, which also carries the rows results show.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub tree: TreeId,
+    /// Table columns stored in each probe entry, in order.
+    pub cols: Vec<usize>,
+    pub rerank: usize,
 }
 
 impl VecIndex {
@@ -113,6 +127,25 @@ impl VecIndex {
             c => return Err(format!("{name}: unknown codec {c}")),
         };
         let (tree, by_id, centroids) = (tree_of("tree")?, tree_of("byId")?, tree_of("centroids")?);
+        let probe = match j.get("probe") {
+            None | Some(J::Null) => None,
+            Some(p) => {
+                if !dims.is_power_of_two() || dims % 8 != 0 {
+                    return Err(format!("{name}: a probe tier needs dims that are a power of two"));
+                }
+                let cols = p
+                    .get("cols")
+                    .and_then(J::as_array)
+                    .map(|a| a.iter().map(|c| c.as_str().and_then(|c| tdef.col(c)).ok_or_else(|| format!("{name}: unknown probe column {c}"))).collect::<Result<Vec<usize>, String>>())
+                    .transpose()?
+                    .unwrap_or_default();
+                Some(Probe {
+                    tree: p.get("tree").and_then(J::as_u64).map(|t| t as TreeId).ok_or_else(|| format!("{name}: probe needs a tree"))?,
+                    cols,
+                    rerank: p.get("rerank").and_then(J::as_u64).unwrap_or(100) as usize,
+                })
+            }
+        };
         Ok(VecIndex {
             name,
             table,
@@ -127,6 +160,7 @@ impl VecIndex {
             nprobe: j.get("nprobe").and_then(J::as_u64).unwrap_or(32) as usize,
             max_pages: j.get("maxPages").and_then(J::as_u64).unwrap_or(256) as usize,
             model: j.get("model").and_then(J::as_str).unwrap_or("").to_string(),
+            probe,
             json: j.clone(),
             cache: Arc::new(OnceLock::new()),
         })
@@ -171,6 +205,11 @@ impl VecIndex {
             Codec::Sq8 => q.map(|x| x as i8 as u8).collect(),
             Codec::Sq4 => pack_u4(&q.map(|x| (x as i8 + 8) as u8).collect::<Vec<u8>>()),
         }
+    }
+
+    /// The probe entry's row, from an entry row (the index's `cols`).
+    pub fn probe_row(&self, p: &Probe, row: &[Value]) -> Vec<Value> {
+        p.cols.iter().map(|c| self.cols.iter().position(|x| x == c).and_then(|i| row.get(i).cloned()).unwrap_or(Value::Null)).collect()
     }
 
     /// v − c, rotated if the index rotates.
@@ -297,11 +336,20 @@ pub fn entry_value(code: &[u8], row: &[Value]) -> Vec<u8> {
 
 /// Everything an index needs to file one vector: its cluster, key and entry.
 pub fn encode_entry(vi: &VecIndex, cents: &Centroids, v: &[f32], row: &[Value]) -> (u32, Vec<u8>, Vec<u8>) {
+    let (cid, k, val, _) = encode_entries(vi, cents, v, row);
+    (cid, k, val)
+}
+
+/// As `encode_entry`, plus the probe-tier entry (same key) when the index has one. `row` is the
+/// entry row (the index's `cols`).
+pub fn encode_entries(vi: &VecIndex, cents: &Centroids, v: &[f32], row: &[Value]) -> (u32, Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
     let i = cents.nearest(v);
-    let code = vi.encode_code(v, &cents.decode(i));
+    let c = cents.decode(i);
+    let code = vi.encode_code(v, &c);
     let cid = cents.ids[i];
     let pk = row.first().and_then(Value::as_str).unwrap_or_default();
-    (cid, key(cid, pk), entry_value(&code, row))
+    let probe = vi.probe.as_ref().map(|p| probe::encode(v, &c, &vi.probe_row(p, row)));
+    (cid, key(cid, pk), entry_value(&code, row), probe)
 }
 
 // ------------------------------------------------------------------ queries
@@ -315,6 +363,20 @@ pub enum VFilter {
 }
 
 impl VFilter {
+    fn col(&self) -> usize {
+        match self {
+            VFilter::Eq(c, _) | VFilter::In(c, _) | VFilter::Cmp(c, _, _) => *c,
+        }
+    }
+
+    fn with_col(&self, c: usize) -> VFilter {
+        match self {
+            VFilter::Eq(_, v) => VFilter::Eq(c, v.clone()),
+            VFilter::In(_, v) => VFilter::In(c, v.clone()),
+            VFilter::Cmp(_, op, x) => VFilter::Cmp(c, op, *x),
+        }
+    }
+
     fn matches(&self, row: RowRef) -> bool {
         match self {
             VFilter::Eq(c, v) => row.get(*c).eq_value(v),
@@ -344,6 +406,8 @@ pub struct AnnQuery {
     pub nprobe: usize,
     pub max_pages: usize,
     pub filters: Vec<VFilter>,
+    /// Candidates reranked (two-stage indexes).
+    pub rerank: usize,
 }
 
 /// `{"table":"story","ann":{"index":"story_vec","vec":"<base64 f32 LE>"|[…],"k":30,"nprobe":32,
@@ -397,7 +461,8 @@ pub fn compile(roots: &Roots, ast: &J) -> Result<AnnQuery, String> {
             });
         }
     }
-    Ok(AnnQuery { index, q, k: int("k", 10, MAX_K), nprobe: int("nprobe", vi.nprobe, MAX_NPROBE), max_pages: int("maxPages", vi.max_pages, MAX_PAGES), filters })
+    let rerank = int("rerank", vi.probe.as_ref().map_or(100, |p| p.rerank), 1000);
+    Ok(AnnQuery { index, q, k: int("k", 10, MAX_K), nprobe: int("nprobe", vi.nprobe, MAX_NPROBE), max_pages: int("maxPages", vi.max_pages, MAX_PAGES), filters, rerank })
 }
 
 fn flatten<'a>(w: &'a J, out: &mut Vec<&'a J>) -> Result<(), String> {
@@ -427,9 +492,13 @@ pub struct AnnHit {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AnnStats {
     pub clusters: usize,
+    /// Leaf pages scanned (the probe tier's, in a two-stage index).
     pub pages: usize,
     pub scanned: usize,
     pub overlay: usize,
+    /// Two-stage indexes: candidates reranked, and the pages that took.
+    pub reranked: usize,
+    pub rerank_pages: usize,
 }
 
 /// Total order on scores for heaps.
@@ -454,8 +523,6 @@ pub struct Scorer {
     /// Σ q8 (sq4 codes are stored offset by 8).
     q8_sum: i32,
     alpha: f32,
-    /// q · centroid for the probed clusters.
-    qc: HashMap<u32, f32>,
 }
 
 impl Scorer {
@@ -468,7 +535,7 @@ impl Scorer {
         let qs: Vec<f32> = q.iter().zip(&vi.steps).map(|(a, b)| a * b).collect();
         let (q8, alpha) = quantize(&qs);
         let q8_sum = q8.iter().map(|&x| x as i32).sum();
-        Scorer { codec: vi.codec, q8, q8_sum, alpha, qc: HashMap::new() }
+        Scorer { codec: vi.codec, q8, q8_sum, alpha }
     }
 
     #[inline]
@@ -504,32 +571,57 @@ pub fn probe_order(cents: &Centroids, q: &[f32], nprobe: usize) -> Vec<usize> {
     s.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Run a vector query. One fault round when the centroid and branch pages are resident (they
-/// are pinned), with at most `max_pages` leaf pages requested.
-pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, AnnStats), Miss> {
-    let vi = &roots.vectors[aq.index];
-    let cents = vi.centroids(ctx, roots)?;
-    let root = roots.get(vi.tree);
-    let mut stats = AnnStats::default();
-    let mut scorer = Scorer::new(vi, &aq.q);
+type Cand = (Score, Vec<u8>, Vec<u8>);
 
-    // Clusters, best first, until the page budget is spent (at least one).
+/// Keeps the `keep` best (score, key, value).
+struct Best {
+    keep: usize,
+    heap: BinaryHeap<std::cmp::Reverse<Cand>>,
+}
+
+impl Best {
+    fn new(keep: usize) -> Best {
+        Best { keep, heap: BinaryHeap::new() }
+    }
+
+    #[inline]
+    fn offer(&mut self, s: f32, k: &[u8], v: &[u8]) {
+        if self.heap.len() < self.keep {
+            self.heap.push(std::cmp::Reverse((Score(s), k.to_vec(), v.to_vec())));
+        } else if self.heap.peek().is_some_and(|m| Score(s) > m.0 .0) {
+            self.heap.pop();
+            self.heap.push(std::cmp::Reverse((Score(s), k.to_vec(), v.to_vec())));
+        }
+    }
+
+    /// Best first.
+    fn sorted(self) -> Vec<Cand> {
+        let mut c: Vec<Cand> = self.heap.into_iter().map(|r| r.0).collect();
+        c.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        c
+    }
+}
+
+/// Clusters to read, best first, until `max_pages` leaves of `root` (at least one cluster):
+/// (cluster ids with their q·centroid, leaf pages). Misses only if a branch page is missing.
+fn select_clusters(ctx: &Ctx, root: &crate::tree::TreeRoot, cents: &Centroids, aq: &AnnQuery) -> Result<(HashMap<u32, f32>, Vec<PageId>), Miss> {
+    let mut qc = HashMap::new();
     let mut leaves: Vec<PageId> = Vec::new();
     let mut seen: HashSet<PageId> = HashSet::new();
     let mut branch_missed = false;
-    for i in probe_order(&cents, &aq.q, aq.nprobe) {
+    for i in probe_order(cents, &aq.q, aq.nprobe) {
         let cid = cents.ids[i];
         let (lo, hi) = (cid.to_be_bytes(), (cid + 1).to_be_bytes());
         let mut ls = Vec::new();
-        if tree::leaves_in(ctx, &root, &Range { lo: &lo, hi: &hi }, &mut ls).is_err() {
+        if tree::leaves_in(ctx, root, &Range { lo: &lo, hi: &hi }, &mut ls).is_err() {
             branch_missed = true;
             continue;
         }
         let new: Vec<PageId> = ls.into_iter().filter(|p| !seen.contains(p)).collect();
-        if !scorer.qc.is_empty() && leaves.len() + new.len() > aq.max_pages {
+        if !qc.is_empty() && leaves.len() + new.len() > aq.max_pages {
             break;
         }
-        scorer.qc.insert(cid, q_dot_centroid(&cents, i, &aq.q));
+        qc.insert(cid, q_dot_centroid(cents, i, &aq.q));
         for p in new {
             seen.insert(p);
             leaves.push(p);
@@ -538,9 +630,22 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
     if branch_missed {
         return Err(Miss);
     }
-    let pages = ctx.get_all(&leaves)?;
-    stats.clusters = scorer.qc.len();
-    stats.pages = pages.len();
+    Ok((qc, leaves))
+}
+
+/// q·centroid for a cluster: from the probed set, else computed (overlay vectors may sit in any).
+fn qc_of(qc: &HashMap<u32, f32>, cents: &Centroids, q: &[f32], cid: u32) -> Option<f32> {
+    qc.get(&cid).copied().or_else(|| cents.ids.binary_search(&cid).ok().map(|i| q_dot_centroid(cents, i, q)))
+}
+
+/// Run a vector query. One fault round when the centroid and branch pages are resident (they
+/// are pinned), with at most `max_pages` leaf pages requested; two for a two-stage index (the
+/// probe pages, then the rerank entries of the best candidates).
+pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, AnnStats), Miss> {
+    let vi = &roots.vectors[aq.index];
+    let cents = vi.centroids(ctx, roots)?;
+    let mut stats = AnnStats::default();
+    let scorer = Scorer::new(vi, &aq.q);
 
     // Overlay: its entries for this index (new vectors, and tombstones hiding base ones),
     // borrowed (an object's overlay can hold many vectors; queries shouldn't copy them).
@@ -553,58 +658,131 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
     let shadow: HashSet<&[u8]> = ov.iter().map(|(k, _)| *k).collect();
 
     // Top candidates (2k: room for rows the overlay has since deleted).
-    let keep = aq.k * 2 + 8;
-    let mut heap: BinaryHeap<std::cmp::Reverse<(Score, Vec<u8>, Vec<u8>)>> = BinaryHeap::new();
-    let offer = |s: f32, k: &[u8], v: &[u8], heap: &mut BinaryHeap<std::cmp::Reverse<(Score, Vec<u8>, Vec<u8>)>>| {
-        if heap.len() < keep {
-            heap.push(std::cmp::Reverse((Score(s), k.to_vec(), v.to_vec())));
-        } else if heap.peek().is_some_and(|m| Score(s) > m.0 .0) {
-            heap.pop();
-            heap.push(std::cmp::Reverse((Score(s), k.to_vec(), v.to_vec())));
+    let mut best = Best::new(aq.k * 2 + 8);
+    let qc = match &vi.probe {
+        None => {
+            let (qc, leaves) = select_clusters(ctx, &roots.get(vi.tree), &cents, aq)?;
+            let pages = ctx.get_all(&leaves)?;
+            stats.clusters = qc.len();
+            stats.pages = pages.len();
+            for p in &pages {
+                let page = Page(p);
+                let mut cur = (u32::MAX, None::<f32>);
+                for i in 0..page.count() {
+                    let (k, v) = page.entry(i);
+                    let cid = cluster_of(k);
+                    if cid != cur.0 {
+                        cur = (cid, qc.get(&cid).copied());
+                    }
+                    let Some(c) = cur.1 else { continue };
+                    stats.scanned += 1;
+                    let (code, row) = vi.split(v);
+                    if !aq.filters.iter().all(|f| f.matches(row)) || (!shadow.is_empty() && shadow.contains(k)) {
+                        continue;
+                    }
+                    best.offer(scorer.score(c, code), k, v);
+                }
+            }
+            qc
+        }
+        Some(probe) => {
+            // Stage 1: 1-bit estimates over the probe tier; filters on the columns it carries.
+            let (qc, leaves) = select_clusters(ctx, &roots.get(probe.tree), &cents, aq)?;
+            let pages = ctx.get_all(&leaves)?;
+            stats.clusters = qc.len();
+            stats.pages = pages.len();
+            let (early, late): (Vec<VFilter>, Vec<VFilter>) = {
+                let (mut e, mut l) = (Vec::new(), Vec::new());
+                for f in &aq.filters {
+                    match probe.cols.iter().position(|&c| c == vi.cols[f.col()]) {
+                        Some(pos) => e.push(f.with_col(pos)),
+                        None => l.push(f.clone()),
+                    }
+                }
+                (e, l)
+            };
+            let ps = probe::ProbeScorer::new(&aq.q);
+            let mut cands = Best::new(aq.rerank.max(aq.k));
+            for p in &pages {
+                let page = Page(p);
+                let mut cur = (u32::MAX, None::<f32>);
+                for i in 0..page.count() {
+                    let (k, v) = page.entry(i);
+                    let cid = cluster_of(k);
+                    if cid != cur.0 {
+                        cur = (cid, qc.get(&cid).copied());
+                    }
+                    let Some(c) = cur.1 else { continue };
+                    stats.scanned += 1;
+                    let (w, bits, row) = probe::split(vi.dims, v);
+                    if !early.iter().all(|f| f.matches(row)) || (!shadow.is_empty() && shadow.contains(k)) {
+                        continue;
+                    }
+                    cands.offer(c + ps.estimate(w, bits), k, &[]);
+                }
+            }
+            // Stage 2: the candidates' rerank entries (one more round for any not resident).
+            let droot = roots.get(vi.tree);
+            let cands = cands.sorted();
+            let mut want: Vec<PageId> = Vec::new();
+            let mut leaf_of: Vec<Option<PageId>> = Vec::with_capacity(cands.len());
+            let mut missed = false;
+            for (_, k, _) in &cands {
+                let mut hi = k.clone();
+                hi.push(0);
+                let mut ls = Vec::new();
+                if tree::leaves_in(ctx, &droot, &Range { lo: k, hi: &hi }, &mut ls).is_err() {
+                    missed = true;
+                    leaf_of.push(None);
+                    continue;
+                }
+                leaf_of.push(ls.first().copied());
+                if let Some(&l) = ls.first() {
+                    if !want.contains(&l) {
+                        want.push(l);
+                    }
+                }
+            }
+            if missed {
+                return Err(Miss);
+            }
+            let got = ctx.get_all(&want)?;
+            stats.rerank_pages = got.len();
+            let page_of: HashMap<PageId, &std::rc::Rc<[u8]>> = want.iter().copied().zip(got.iter()).collect();
+            for ((_, k, _), leaf) in cands.iter().zip(leaf_of) {
+                let Some(page) = leaf.and_then(|l| page_of.get(&l)).map(|p| Page(p)) else { continue };
+                let at = page.lower_bound(k);
+                if at >= page.count() || page.key(at) != k.as_slice() {
+                    continue;
+                }
+                let (_, v) = page.entry(at);
+                let (code, row) = vi.split(v);
+                if !late.iter().all(|f| f.matches(row)) {
+                    continue;
+                }
+                let Some(c) = qc_of(&qc, &cents, &aq.q, cluster_of(k)) else { continue };
+                stats.reranked += 1;
+                best.offer(scorer.score(c, code), k, v);
+            }
+            qc
         }
     };
-    for p in &pages {
-        let page = Page(p);
-        let mut cur = (u32::MAX, None::<f32>);
-        for i in 0..page.count() {
-            let (k, v) = page.entry(i);
-            let cid = cluster_of(k);
-            if cid != cur.0 {
-                cur = (cid, scorer.qc.get(&cid).copied());
-            }
-            let Some(qc) = cur.1 else { continue };
-            stats.scanned += 1;
-            let (code, row) = vi.split(v);
-            if !aq.filters.iter().all(|f| f.matches(row)) || (!shadow.is_empty() && shadow.contains(k)) {
-                continue;
-            }
-            offer(scorer.score(qc, code), k, v, &mut heap);
-        }
-    }
-    // New vectors in the overlay: scored exactly like base entries (any cluster; ids are sorted).
+
+    // New vectors in the overlay: scored exactly like base entries (any cluster).
     for &(k, e) in &ov {
         let Some(v) = &e.val else { continue };
-        let cid = cluster_of(k);
-        let qc = match scorer.qc.get(&cid) {
-            Some(&qc) => qc,
-            None => match cents.ids.binary_search(&cid) {
-                Ok(i) => q_dot_centroid(&cents, i, &aq.q),
-                Err(_) => continue,
-            },
-        };
+        let Some(c) = qc_of(&qc, &cents, &aq.q, cluster_of(k)) else { continue };
         stats.overlay += 1;
         let (code, row) = vi.split(v);
         if aq.filters.iter().all(|f| f.matches(row)) {
-            offer(scorer.score(qc, code), k, v, &mut heap);
+            best.offer(scorer.score(c, code), k, v);
         }
     }
 
     // Best first; rows changed since the base render as they are now, deleted ones drop out.
-    let mut cands: Vec<(Score, Vec<u8>, Vec<u8>)> = heap.into_iter().map(|r| r.0).collect();
-    cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let primary = roots.schema.primary_of(vi.table);
     let mut hits = Vec::with_capacity(aq.k);
-    for (s, k, v) in cands {
+    for (s, k, v) in best.sorted() {
         if hits.len() == aq.k {
             break;
         }
@@ -659,8 +837,8 @@ pub fn output_json(hits: &[AnnHit], stats: &AnnStats) -> String {
         s.push_str(&h.json);
     }
     s.push_str(&format!(
-        "],\"complete\":true,\"ann\":{{\"clusters\":{},\"pages\":{},\"scanned\":{},\"overlay\":{}}}}}",
-        stats.clusters, stats.pages, stats.scanned, stats.overlay
+        "],\"complete\":true,\"ann\":{{\"clusters\":{},\"pages\":{},\"scanned\":{},\"overlay\":{},\"reranked\":{},\"rerankPages\":{}}}}}",
+        stats.clusters, stats.pages, stats.scanned, stats.overlay, stats.reranked, stats.rerank_pages
     ));
     s
 }

@@ -70,6 +70,11 @@ fn build(n: usize, nlist: usize) -> Built {
 }
 
 fn build_with(n: usize, nlist: usize, codec: &str) -> Built {
+    build_opts(n, nlist, codec, None)
+}
+
+/// `probe`: a two-stage index (probe tier tree 23 carrying time and kind; rerank this many).
+fn build_opts(n: usize, nlist: usize, codec: &str, probe: Option<usize>) -> Built {
     let levels = if codec == "sq4" { 7.0 } else { 127.0 };
     let vecs = data(n, 40, 7);
     let rows: Vec<Vec<Value>> = (0..n).map(|i| vec![Value::from(format!("d{i}")), Value::from(format!("title {i}")), Value::Num(i as f64), Value::from(KINDS[i % 3])]).collect();
@@ -105,30 +110,42 @@ fn build_with(n: usize, nlist: usize, codec: &str) -> Built {
             r[(r.len() as f64 * if codec == "sq4" { 0.99 } else { 0.999 }) as usize].max(1e-6) / levels
         })
         .collect();
-    let vj = serde_json::json!({"name":"doc_vec","table":"doc","dims":DIMS,"cols":["id","title","time","kind"],"tree":20,"byId":21,"centroids":22,
+    let mut vj = serde_json::json!({"name":"doc_vec","table":"doc","dims":DIMS,"cols":["id","title","time","kind"],"tree":20,"byId":21,"centroids":22,
         "steps":steps,"nprobe":8,"maxPages":256,"codec":codec});
+    if let Some(r) = probe {
+        vj["probe"] = serde_json::json!({"tree":23,"cols":["time","kind"],"rerank":r});
+    }
     let schema = pagedb_core::catalog::Schema::parse(SCHEMA).unwrap();
     let vi = VecIndex::from_json(schema, &vj).unwrap();
 
     let mut sink = VecSink::default();
     let mut entries = BTreeMap::new();
+    let mut probes = BTreeMap::new();
     let mut by_id = BTreeMap::new();
     for (v, row) in vecs.iter().zip(&rows) {
-        let (cid, k, val) = vector::encode_entry(&vi, &cq, v, &vi.project(row));
+        let (cid, k, val, pv) = vector::encode_entries(&vi, &cq, v, &vi.project(row));
         by_id.insert(pagedb_core::codec::encode_key(&[row[0].clone()], &[false]), cid.to_be_bytes().to_vec());
+        if let Some(pv) = pv {
+            probes.insert(k.clone(), pv);
+        }
         entries.insert(k, val);
     }
     let mut trees = Vec::new();
-    let mut tb = TreeBuilder::new(20);
-    for (k, v) in &entries {
-        tb.push(&mut sink, k, v);
+    let mut pending = Vec::new();
+    for (tree, map) in [(23u16, &probes), (20u16, &entries)] {
+        if map.is_empty() {
+            continue;
+        }
+        let mut tb = TreeBuilder::new(tree);
+        for (k, v) in map {
+            tb.push(&mut sink, k, v);
+        }
+        pending.push(tb.finish_leaves(&mut sink));
     }
-    let leaf_end = {
-        let p = tb.finish_leaves(&mut sink);
-        let end = sink.pages.len() as PageId;
+    let leaf_end = sink.pages.len() as PageId;
+    for p in pending {
         trees.push(p.finish_branches(&mut sink));
-        end
-    };
+    }
     let leaves: HashSet<PageId> = (0..leaf_end).collect();
     let mut tb = TreeBuilder::new(21);
     for (k, v) in &by_id {
@@ -473,3 +490,69 @@ fn vector_writes_and_live_windows() {
     let ctx = Ctx::with_view(&store, &view);
     assert!(matches!(pagedb_core::write::plan_write_all(&ctx, &b.roots, &view, &parsed), Err(pagedb_core::write::WriteError::Invalid(_))));
 }
+
+#[test]
+fn two_stage_exhaustive_rerank_equals_brute_force() {
+    // Probe every cluster and rerank every candidate: the result is exactly the sq8 ranking.
+    let b = build_opts(6000, 60, "sq8", Some(6000));
+    assert!(b.roots.vectors[0].probe.is_some());
+    let store = Store { pages: &b.pages, resident: RefCell::new((0..b.pages.len() as PageId).collect()) };
+    let ov = Overlay::default();
+    for qi in [5usize, 3333] {
+        let q = &b.vecs[qi];
+        let aq = query(&b, q, 20, 60, serde_json::Value::Null);
+        let ((hits, st), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+        assert_eq!(st.scanned, 6000);
+        let want: Vec<String> = brute_quantized(&b, q, |_| true).into_iter().take(20).map(|(p, _)| p).collect();
+        assert_eq!(hits.iter().map(|h| h.pk.clone()).collect::<Vec<_>>(), want);
+        assert!(hits[0].json.contains(&format!("\"title\":\"title {qi}\"")), "rows render from the rerank entries");
+    }
+}
+
+#[test]
+fn two_stage_recall_rounds_and_filters() {
+    // (1-bit estimates at 64 dims are noisy: rerank enough to match the sq8 one-stage index.
+    // At 1024 dims far fewer candidates suffice.)
+    let b = build_opts(20_000, 100, "sq8", Some(240));
+    assert!(recall(&b, 12) >= 0.95, "two-stage recall");
+    // Cold leaves, pinned branches: the probe pages, then the rerank pages.
+    let pinned: HashSet<PageId> = (0..b.pages.len() as PageId).filter(|p| !b.leaves.contains(p)).collect();
+    let store = Store { pages: &b.pages, resident: RefCell::new(pinned) };
+    let aq = query(&b, &b.vecs[77], 10, 16, serde_json::Value::Null);
+    let ((hits, st), rounds) = run(&store, &Overlay::default(), |ctx| vector::search(ctx, &b.roots, &aq));
+    assert_eq!(rounds, 2);
+    assert_eq!(hits[0].pk, "d77");
+    assert!(st.reranked > 0 && st.rerank_pages > 0, "{st:?}");
+    // A filter on a probe column (kind) and one only the rerank entries carry (title).
+    let store = Store { pages: &b.pages, resident: RefCell::new((0..b.pages.len() as PageId).collect()) };
+    let w = serde_json::json!({"type":"and","conditions":[
+        {"type":"simple","op":"=","left":{"type":"column","name":"kind"},"right":{"type":"literal","value":"show"}},
+        {"type":"simple","op":"IN","left":{"type":"column","name":"title"},"right":{"type":"literal","value":["title 80","title 83","title 86"]}}]});
+    let aq = query(&b, &b.vecs[80], 10, 100, w);
+    let ((hits, _), _) = run(&store, &Overlay::default(), |ctx| vector::search(ctx, &b.roots, &aq));
+    let got: HashSet<String> = hits.iter().map(|h| h.pk.clone()).collect();
+    assert!(got.iter().all(|p| ["d80", "d83", "d86"].contains(&p.as_str())) && got.contains("d80"), "{got:?}");
+}
+
+#[test]
+fn two_stage_writes_are_seen_at_once() {
+    let b = build_opts(6000, 60, "sq8", Some(100));
+    let store = Store { pages: &b.pages, resident: RefCell::new((0..b.pages.len() as PageId).collect()) };
+    let mut ov = Overlay::default();
+    let q = b.vecs[321].clone();
+    let mut v = q.clone();
+    v[1] += 0.002;
+    let (_, vecs) = write(&b, &store, &mut ov, serde_json::json!({"ops":[
+        {"op":"insert","table":"doc","row":{"id":"p1","title":"new","time":1.0,"kind":"show"}},
+        {"op":"vec_put","index":"doc_vec","id":"p1","vec":vec_b64(&v)}]}));
+    assert_eq!(vecs.len(), 1);
+    assert!(ov.map.keys().any(|(t, _)| *t == 23), "the probe tier gets the new entry too");
+    let aq = query(&b, &q, 5, 8, serde_json::Value::Null);
+    let ((hits, _), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+    assert!(hits.iter().take(2).any(|h| h.pk == "p1"));
+    // Re-filing a base vector elsewhere hides its old entry in both tiers.
+    write(&b, &store, &mut ov, serde_json::json!({"ops":[{"op":"vec_put","index":"doc_vec","id":"d321","vec":vec_b64(&b.vecs[9])}]}));
+    let ((hits, _), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+    assert!(!hits.iter().any(|h| h.pk == "d321"));
+}
+

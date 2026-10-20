@@ -335,6 +335,8 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
 
     let tmp = out.join("tmp");
     let mut entries = Sorter::new(&tmp.join("vec"), mem_mb * (1 << 20) / 2);
+    // Two-stage index: the probe tier's 1-bit entries, under the same keys.
+    let mut probes = vi.probe.as_ref().map(|_| Sorter::new(&tmp.join("probe"), mem_mb * (1 << 20) / 4));
     let mut by_id = Sorter::new(&tmp.join("byid"), mem_mb * (1 << 20) / 8);
     let mut prim = primary.then(|| Sorter::new(&tmp.join("prim"), mem_mb * (1 << 20) / 4));
     let pidx = schema.primary_of(cfg.table);
@@ -345,18 +347,21 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
         // Assign and encode in parallel; push in order.
         let t = threads();
         let chunk = batch.len().div_ceil(t).max(1);
-        let enc: Vec<Option<(usize, Vec<u8>)>> = std::thread::scope(|sc| {
+        let enc: Vec<Option<(usize, Vec<u8>, Option<Vec<u8>>)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = batch
                 .chunks(chunk)
                 .map(|part| {
                     let m = &m;
                     let vi = &vi;
+                    let cfg = &cfg;
                     sc.spawn(move || {
                         part.iter()
-                            .map(|(v, _)| {
+                            .map(|(v, row)| {
                                 let x = prep(v, d)?;
                                 let c = m.assign(&x);
-                                Some((c, vi.encode_code(&x, &m.fine_f32[c * d..(c + 1) * d])))
+                                let cen = &m.fine_f32[c * d..(c + 1) * d];
+                                let pv = vi.probe.as_ref().map(|p| vector::probe::encode(&x, cen, &vi.probe_row(p, &cfg.project(row))));
+                                Some((c, vi.encode_code(&x, cen), pv))
                             })
                             .collect::<Vec<_>>()
                     })
@@ -365,7 +370,7 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         for ((_, row), e) in batch.iter().zip(enc) {
-            let Some((c, code)) = e else {
+            let Some((c, code, pv)) = e else {
                 skipped += 1;
                 continue;
             };
@@ -377,6 +382,9 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
                 continue;
             }
             entries.push(&vector::key(cid, pk), &val);
+            if let (Some(ps), Some(pv)) = (probes.as_mut(), pv) {
+                ps.push(&vector::key(cid, pk), &pv);
+            }
             by_id.push(&encode_key(&[Value::from(pk)], &[false]), &cid.to_be_bytes());
             if let Some(p) = prim.as_mut() {
                 let ents = pagedb_core::catalog::index_entries(pidx, row);
@@ -407,6 +415,13 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
     }
     let mut sink = PartSink::starting_at(out, first_page);
     let mut built: Vec<Built> = Vec::new();
+    // The probe tier first: it's what every search scans.
+    if let (Some(p), Some(ps)) = (&vi.probe, probes.take()) {
+        let mut ps = Some(ps);
+        built.push(build_tree(&mut sink, p.tree, &format!("{}_probe", cfg.name), &mut |f| {
+            ps.take().unwrap().drain(&mut |k, v| f(k, v));
+        }));
+    }
     built.push(build_tree(&mut sink, cfg.tree, &cfg.name, &mut |f| {
         std::mem::replace(&mut entries, Sorter::new(&tmp, 1 << 20)).drain(&mut |k, v| f(k, v));
     }));
@@ -772,16 +787,17 @@ pub fn eval(args: &[String]) {
     let k = 10;
     let index = arg(args, "--index").unwrap_or_else(|| roots.vectors[0].name.clone());
     let has_full = gt.first().is_some_and(|g| g.get("idsFull").is_some());
-    println!("| nprobe | max pages | recall@{k} | recall@{k} (in top 100) |{} clusters | pages | 1 MiB chunks | GETs (runs) | scanned | ms (native) |", if has_full { " recall@10 vs full dims |" } else { "" });
-    println!("|---|---|---|---|{}---|---|---|---|---|---|", if has_full { "---|" } else { "" });
+    println!("| nprobe | max pages | rerank | recall@{k} | recall@{k} (in top 100) |{} clusters | pages | rerank pages | 1 MiB chunks | GETs (runs) | scanned | ms (native) |", if has_full { " recall@10 vs full dims |" } else { "" });
+    println!("|---|---|---|---|---|{}---|---|---|---|---|---|---|", if has_full { "---|" } else { "" });
     for &nprobe in &list("--nprobe", "8,16,32,64") {
         for &max_pages in &list("--pages", "256") {
+        for &rerank in &list("--rerank", "100") {
             let (mut hit, mut hit100, mut hit_full, mut tot) = (0usize, 0usize, 0usize, 0usize);
-            let (mut clusters, mut pages, mut chunks, mut runs, mut scanned, mut ms) = (0usize, 0usize, 0usize, 0usize, 0usize, 0f64);
+            let (mut clusters, mut pages, mut chunks, mut runs, mut scanned, mut ms, mut rpages) = (0usize, 0usize, 0usize, 0usize, 0usize, 0f64, 0usize);
             for g in &gt {
                 let q: Vec<f64> = g["q"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
                 let ids: Vec<&str> = g["ids"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
-                let ast = json!({"ann": {"index": index, "vec": q, "k": k, "nprobe": nprobe, "maxPages": max_pages}});
+                let ast = json!({"ann": {"index": index, "vec": q, "k": k, "nprobe": nprobe, "maxPages": max_pages, "rerank": rerank}});
                 let aq = vector::compile(&roots, &ast).unwrap();
                 let ctx = Ctx::new(&store);
                 let t0 = Instant::now();
@@ -799,6 +815,7 @@ pub fn eval(args: &[String]) {
                 clusters += st.clusters;
                 pages += st.pages;
                 scanned += st.scanned;
+                rpages += st.rerank_pages;
                 // What the object would fetch: distinct 1 MiB chunks, merged into runs within a part.
                 let leaves = vector_leaves(&ctx, &roots, &aq);
                 let mut cs: Vec<u64> = leaves.iter().map(|p| p / 16).collect();
@@ -809,17 +826,19 @@ pub fn eval(args: &[String]) {
             }
             let n = gt.len() as f64;
             println!(
-                "| {nprobe} | {max_pages} | {:.3} | {:.3} |{} {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.2} |",
+                "| {nprobe} | {max_pages} | {rerank} | {:.3} | {:.3} |{} {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.2} |",
                 hit as f64 / tot as f64,
                 hit100 as f64 / tot as f64,
                 if has_full { format!(" {:.3} |", hit_full as f64 / tot as f64) } else { String::new() },
                 clusters as f64 / n,
                 pages as f64 / n,
+                rpages as f64 / n,
                 chunks as f64 / n,
                 runs as f64 / n,
                 scanned as f64 / n,
                 ms / n
             );
+        }
         }
     }
 }
@@ -828,7 +847,7 @@ pub fn eval(args: &[String]) {
 fn vector_leaves(ctx: &pagedb_core::tree::Ctx, roots: &pagedb_core::query::Roots, aq: &vector::AnnQuery) -> Vec<u64> {
     let vi = &roots.vectors[aq.index];
     let cents = vi.centroids(ctx, roots).unwrap();
-    let root = roots.get(vi.tree);
+    let root = roots.get(vi.probe.as_ref().map_or(vi.tree, |p| p.tree));
     let mut leaves: Vec<u64> = Vec::new();
     let mut n_clusters = 0;
     for i in vector::probe_order(&cents, &aq.q, aq.nprobe) {

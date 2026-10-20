@@ -2,7 +2,7 @@
   "name": "story_vec",
   "table": "story",
   "dims": 1024,
-  "codec": "sq4",
+  "codec": "sq8",
   "cols": [
     "id",
     "by",
@@ -21,7 +21,15 @@
   "supers": 64,
   "sample": 400000,
   "truncate": 300,
-  "nprobe": 64,
+  "nprobe": 1024,
   "maxPages": 256,
-  "model": "@cf/qwen/qwen3-embedding-0.6b"
+  "model": "@cf/qwen/qwen3-embedding-0.6b",
+  "probe": {
+    "tree": 23,
+    "cols": [
+      "time",
+      "kind"
+    ],
+    "rerank": 100
+  }
 }

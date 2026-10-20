@@ -460,15 +460,24 @@ impl Planner<'_, '_> {
         }
         let cents = vi.centroids(self.ctx, self.roots)?;
         let old_key = self.vec_key(vi, id)?;
-        let (cid, k, val) = vector::encode_entry(vi, &cents, &v, &vi.project(&row));
+        let (cid, k, val, probe_val) = vector::encode_entries(vi, &cents, &v, &vi.project(&row));
         if val.len() + k.len() + 16 > crate::page::MAX_CELL {
             return Err(WriteError::Invalid(format!("{} entry too large", vi.name)));
         }
         if let Some(ok) = old_key.as_ref().filter(|ok| **ok != k) {
             stage_remove(self.view, vi.tree, ok);
+            if let Some(p) = &vi.probe {
+                stage_remove(self.view, p.tree, ok);
+            }
         }
         let in_base = |tree: u16, key: &[u8]| merged::base_has(self.ctx, &self.roots.get(tree), key);
-        stage_put(self.view, vi.tree, k.clone(), val.clone(), old_key.as_ref() == Some(&k) && in_base(vi.tree, &k)?);
+        let replacing = old_key.as_ref() == Some(&k) && in_base(vi.tree, &k)?;
+        stage_put(self.view, vi.tree, k.clone(), val.clone(), replacing);
+        if let (Some(p), Some(pv)) = (&vi.probe, probe_val) {
+            // (Searches score new vectors from the rerank entries; the probe entry keeps the
+            // tiers identical for anything that reads them later.)
+            stage_put(self.view, p.tree, k.clone(), pv, replacing);
+        }
         let pk = self.schema.pk_key(vi.table, id);
         stage_put(self.view, vi.by_id, pk.clone(), cid.to_be_bytes().to_vec(), in_base(vi.by_id, &pk)?);
         self.vec_changes.push(VecChange { index, pk: id.to_string(), old_key, new: Some((k, val)) });
@@ -479,6 +488,9 @@ impl Planner<'_, '_> {
         let vi = &self.roots.vectors[index];
         let Some(k) = self.vec_key(vi, id)? else { return Ok(()) };
         stage_remove(self.view, vi.tree, &k);
+        if let Some(p) = &vi.probe {
+            stage_remove(self.view, p.tree, &k);
+        }
         stage_remove(self.view, vi.by_id, &self.schema.pk_key(vi.table, id));
         self.vec_changes.push(VecChange { index, pk: id.to_string(), old_key: Some(k), new: None });
         Ok(())
