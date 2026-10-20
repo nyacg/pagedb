@@ -82,11 +82,12 @@ function fresh(id: string) {
 type Cursor = Record<string, number | string>;
 const next: Cursor | undefined = params.get("next") ? JSON.parse(params.get("next")!) : undefined;
 const offset = Number(params.get("n") ?? 0);
-const words = (params.get("q") ?? "")
-  .toLowerCase()
-  .split(/[^a-z0-9]+/)
-  .filter((w) => w.length >= 2)
-  .slice(0, 4);
+// Title words as the index has them (src/apps/hn.ts titleWords: stopwords aren't indexed).
+const STOP = new Set(
+  ("the and for with from your you are how why what when who this that its into about show ask hn of to in on is an at by as it be or my we not can do does " +
+    "vs via was will has have than but just our all out so if no up new").split(" "),
+);
+const words = [...new Set((params.get("q") ?? "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !STOP.has(w)))].slice(0, 4);
 
 function subscribe() {
   const id = params.get("id") ?? "";
@@ -144,7 +145,7 @@ function moreLink(rows: Row[], key: "time" | "score") {
 }
 
 function listView() {
-  if (page === "search" && !words.length) return `<p class="note">Search titles: words of two or more letters.</p>`;
+  if (page === "search" && !words.length) return `<p class="note">Search titles: words of two or more letters (common words like "the" aren't indexed).</p>`;
   const s = sync.get("list");
   if (!s?.ready && !s?.rows.size) return `<p class="note">Loading…</p>`;
   let rows = sync.view("list");
@@ -301,6 +302,8 @@ function render() {
   if (!primed && (sync.get("list")?.ready || sync.get("item")?.ready || sync.get("ustories")?.ready)) primed = true;
 }
 
+const qBox = document.querySelector("#q") as HTMLInputElement | null;
+if (qBox && page === "search") qBox.value = params.get("q") ?? "";
 sync.onChange(render);
 render();
 
@@ -355,8 +358,9 @@ document.addEventListener("click", async (e) => {
 });
 
 document.addEventListener("submit", async (e) => {
-  e.preventDefault();
   const form = e.target as HTMLFormElement;
+  if (!form.matches("[data-parent], [data-submit]")) return; // the search box is a plain GET form
+  e.preventDefault();
   if (form.matches("[data-parent]")) {
     const ta = form.querySelector("textarea")!;
     const text = ta.value.trim();
