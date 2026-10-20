@@ -1,0 +1,23 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; color: #1b1b1a; background: #f2f1ee; }
+body { display: grid; grid-template-rows: auto 1fr auto; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #e4e2dd; white-space: nowrap; overflow: hidden; }
+header b { font-size: 15px; } .sub { color: #6c6a66; overflow: hidden; text-overflow: ellipsis; } .grow { flex: 1; } header a { color: #4f46e5; text-decoration: none; }
+.dot { color: #d4a017; } .dot.live { color: #2bb24c; }
+main { display: grid; grid-template-columns: 1fr 300px; min-height: 0; }
+#stage { position: relative; overflow: hidden; background: #3b3b3b; cursor: crosshair; touch-action: none; }
+#wrap { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+#wrap canvas { position: absolute; left: 0; top: 0; image-rendering: pixelated; }
+#cursor { position: absolute; display: none; outline: 2px solid #fff; box-shadow: 0 0 0 3px #000; pointer-events: none; }
+aside { background: #fff; border-left: 1px solid #e4e2dd; padding: 12px 14px; overflow: auto; }
+aside h3 { margin: 0 0 8px; font-size: 14px; } aside h4 { margin: 14px 0 6px; font-size: 12px; color: #6c6a66; text-transform: uppercase; letter-spacing: .05em; }
+.palette { display: grid; grid-template-columns: repeat(8, 1fr); gap: 3px; margin-bottom: 8px; }
+.palette button { aspect-ratio: 1; border: 1px solid #0002; border-radius: 3px; cursor: pointer; padding: 0; } .palette button.on { outline: 2px solid #1b1b1a; outline-offset: 1px; }
+.primary { width: 100%; background: #4f46e5; color: #fff; border: 0; border-radius: 6px; padding: 7px; font-weight: 600; cursor: pointer; } .primary:disabled { background: #b8b5f0; cursor: default; }
+.hist div, .feed div { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+.hist a { color: #1b1b1a; cursor: pointer; font-family: ui-monospace, monospace; font-size: 12px; } .hist a:hover, .hist a.on { color: #4f46e5; text-decoration: underline; }
+.sw { display: inline-block; width: 12px; height: 12px; border: 1px solid #0003; border-radius: 2px; flex: none; }
+.t, .hint, .fine { color: #8a8883; font-size: 12px; } .x { cursor: pointer; color: #8a8883; margin-left: 6px; }
+footer { display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: #fff; border-top: 1px solid #e4e2dd; }
+footer input { flex: 1; } footer button { border: 1px solid #e4e2dd; background: #fff; border-radius: 6px; padding: 4px 10px; cursor: pointer; } #when { min-width: 300px; color: #6c6a66; }
+@media (max-width: 800px) { main { grid-template-columns: 1fr; grid-template-rows: 1fr 240px; } aside { border-left: 0; border-top: 1px solid #e4e2dd; } .sub { display: none; } }

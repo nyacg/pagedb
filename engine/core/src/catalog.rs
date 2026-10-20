@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn dataset_schemas_parse() {
-        for f in ["hn"] {
+        for f in ["hn", "place", "taxi"] {
             let path = format!("{}/../../datasets/{f}/schema.json", env!("CARGO_MANIFEST_DIR"));
             let s = Schema::parse(&std::fs::read_to_string(&path).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}"));
             assert!(!s.indexes.is_empty());

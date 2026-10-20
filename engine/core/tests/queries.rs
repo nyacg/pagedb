@@ -285,3 +285,26 @@ fn lookup_through_a_pointer_primary() {
         o => panic!("{o:?}"),
     }
 }
+
+#[test]
+fn offset_jumps_to_row_n() {
+    let (db, rows) = setup();
+    let p = "p0002";
+    let newest = oracle_issues(&rows, |r| s(&r[issue::PROJECT]) == p, usize::MAX);
+    for (desc, n, limit) in [(true, 0usize, 5usize), (true, 1, 5), (true, 777, 20), (true, 1490, 50), (false, 0, 5), (false, 3, 10), (false, 1200, 7)] {
+        let order = if desc { json!([["createdAt","desc"],["id","asc"]]) } else { json!([["createdAt","asc"],["id","desc"]]) };
+        let ast = json!({"table":"issue","where":eq("projectId", json!(p)),"orderBy":order,"limit":limit,"offset":n});
+        let (out, rounds, _) = run(&db, &ast);
+        let mut want = newest.clone();
+        if !desc {
+            want.reverse();
+        }
+        let want: Vec<String> = want.into_iter().skip(n).take(limit).collect();
+        assert_eq!(ids(&out), want, "desc {desc} offset {n}");
+        assert!(rounds <= 5, "{rounds} rounds");
+    }
+    // Past the end: nothing.
+    let (out, _, _) = run(&db, &json!({"table":"issue","where":eq("projectId", json!(p)),"orderBy":[["createdAt","desc"],["id","asc"]],"limit":5,"offset":newest.len()}));
+    assert!(ids(&out).is_empty());
+    assert!(compile(tracker(), &json!({"table":"issue","where":{"type":"and","conditions":[eq("projectId", json!(p)), cond("ILIKE","title",json!("%x%"))]},"orderBy":[["createdAt","desc"],["id","asc"]],"offset":3})).is_err());
+}

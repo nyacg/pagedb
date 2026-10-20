@@ -1,6 +1,7 @@
 #!/bin/bash
 # All of Hacker News → a pagedb base (parts + manifest in $OUT).
 #
+# Texts are cut at 16,000 characters (a row must fit a page cell; a few dozen items are longer).
 # Source: open-index/hacker-news on Hugging Face (monthly parquet, ODC-By), read remotely by
 # DuckDB, plus items newer than the dump straight from the official API. Deleted, dead and
 # poll-option items are dropped; comments under a dropped item go with it.
@@ -79,7 +80,7 @@ COPY (SELECT (SELECT count(*) FROM ip WHERE type <> 2) AS stories, (SELECT count
 " >&2
 
 STORIES="
-  SELECT r.id::VARCHAR AS id, r.\"by\", r.time, r.title, nullif(r.url, '') AS url, nullif(r.text, '') AS text, coalesce(r.score, 0) AS score,
+  SELECT r.id::VARCHAR AS id, r.\"by\", r.time, r.title, nullif(r.url, '') AS url, nullif(left(r.text, 16000), '') AS text, coalesce(r.score, 0) AS score,
          coalesce(c.n, 0) AS descendants,
          CASE r.type WHEN 5 THEN 'job' WHEN 3 THEN 'poll' ELSE
            CASE WHEN r.title ILIKE 'Ask HN%' THEN 'ask' WHEN r.title ILIKE 'Show HN%' THEN 'show' ELSE 'story' END END AS kind,
@@ -91,7 +92,7 @@ STORIES="
   FROM raw r LEFT JOIN counts c ON c.id = r.id
   WHERE r.deleted = 0 AND r.dead = 0 AND r.type IN (1, 3, 5)"
 COMMENTS="
-  SELECT r.id::VARCHAR AS id, t.root::VARCHAR AS storyId, r.parent::VARCHAR AS parent, r.\"by\", r.time, r.text
+  SELECT r.id::VARCHAR AS id, t.root::VARCHAR AS storyId, r.parent::VARCHAR AS parent, r.\"by\", r.time, left(r.text, 16000) AS text
   FROM raw r JOIN threads t ON t.id = r.id
   WHERE r.type = 2"
 

@@ -132,12 +132,12 @@ export class HnTail extends DurableObject<Env> {
     for (const it of items.sort((a, b) => a.id - b.id)) {
       const id = String(it.id);
       if (it.type === "story" || it.type === "job" || it.type === "poll") {
-        ops.push({ op: "insert", table: "story", row: storyRow({ ...it, time: it.time * 1000 }) });
+        ops.push({ op: "insert", table: "story", row: storyRow({ ...it, text: it.text?.slice(0, 16000), time: it.time * 1000 }) });
         batch.set(id, id);
       } else if (it.type === "comment" && it.parent) {
         const story = await this.storyFor(String(it.parent), batch);
         if (!story) continue; // under a dead or deleted item
-        ops.push({ op: "insert", table: "comment", row: { id, storyId: story, parent: String(it.parent), by: it.by ?? null, time: it.time * 1000, text: it.text ?? null } });
+        ops.push({ op: "insert", table: "comment", row: { id, storyId: story, parent: String(it.parent), by: it.by ?? null, time: it.time * 1000, text: it.text?.slice(0, 16000) ?? null } });
         batch.set(id, story);
       }
     }

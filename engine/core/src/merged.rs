@@ -77,3 +77,28 @@ pub fn count(ctx: &Ctx, root: &TreeRoot, range: &Range) -> Result<u64, Miss> {
     };
     Ok((base as i64 + delta).max(0) as u64)
 }
+
+/// Key at position `n` of [range.lo, range.hi) in base ⊕ overlay. The base's position is
+/// corrected by the overlay's count deltas before it (a few rounds; the overlay is small).
+pub fn nth(ctx: &Ctx, root: &TreeRoot, range: &Range, n: u64) -> Result<Option<Vec<u8>>, Miss> {
+    let base_lo = tree::rank(ctx, root, range.lo)?;
+    let mut adj: i64 = 0;
+    let mut key = None;
+    for _ in 0..8 {
+        let at = base_lo as i64 + n as i64 - adj;
+        if at < 0 {
+            return Ok(None);
+        }
+        key = tree::nth(ctx, root, at as u64)?;
+        let Some(k) = &key else { break };
+        let next: i64 = match ctx.view {
+            Some(v) => v.range(root.tree, range.lo, k).iter().map(|(_, e)| e.delta as i64).sum(),
+            None => 0,
+        };
+        if next == adj {
+            break;
+        }
+        adj = next;
+    }
+    Ok(key.filter(|k| range.hi.is_empty() || k.as_slice() < range.hi))
+}

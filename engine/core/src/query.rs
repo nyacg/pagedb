@@ -73,6 +73,9 @@ pub struct Plan {
     /// rows strictly after `start`, up to and including `end` (infinite scroll pages).
     pub start: Option<Vec<u8>>,
     pub end: Option<Vec<u8>>,
+    /// Skip this many rows (jump to row N): resolved once into a `start` bound, using the
+    /// branch pages' row counts. Only for unfiltered plans.
+    pub offset: u64,
 }
 
 impl Plan {
@@ -210,8 +213,9 @@ pub fn compile(schema: &'static Schema, ast: &J) -> Result<Plan, String> {
     for ix in schema.indexes_of(table) {
         // Covering indexes, and a pointer primary for lookups by primary key (rows are read
         // through the pointer).
-        let pk_lookup = ix.primary && ix.row_index.is_some() && eqs.iter().any(|(e, _)| *e == 0);
-        if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) && !pk_lookup {
+        // Pointer indexes (rows read through the primary): a primary only for pk lookups.
+        let pointer_ok = ix.row_index.is_some() && (!ix.primary || eqs.iter().any(|(e, _)| *e == 0));
+        if !matches!(ix.value, IndexValue::Row | IndexValue::RowTruncated(..)) && !pointer_ok {
             continue;
         }
         // A partial index serves only queries that exclude the rows it leaves out.
@@ -254,9 +258,10 @@ pub fn compile(schema: &'static Schema, ast: &J) -> Result<Plan, String> {
         if !ok {
             continue;
         }
+        let covering = |i: &Index| matches!(i.value, IndexValue::Row | IndexValue::RowTruncated(..));
         let better = match best {
             None => true,
-            Some((bp, bix, _)) => p > bp || (p == bp && ix.key.len() < bix.key.len()),
+            Some((bp, bix, _)) => p > bp || (p == bp && (covering(ix), std::cmp::Reverse(ix.key.len())) > (covering(bix), std::cmp::Reverse(bix.key.len()))),
         };
         if better {
             best = Some((p, ix, reverse.unwrap_or(false)));
@@ -312,7 +317,11 @@ pub fn compile(schema: &'static Schema, ast: &J) -> Result<Plan, String> {
         Ok(Some(k))
     };
     let (start, end) = (bound("start")?, bound("end")?);
-    Ok(Plan { schema, table, index, prefix, reverse, filters, limit, one, count, related, start, end })
+    let offset = ast.get("offset").and_then(J::as_u64).unwrap_or(0);
+    if offset > 0 && (!filters.is_empty() || count) {
+        return Err("offset needs an unfiltered list".into());
+    }
+    Ok(Plan { schema, table, index, prefix, reverse, filters, limit, one, count, related, start, end, offset })
 }
 
 /// `EXISTS (child row through a relation whose text column ILIKE …)`, e.g. issues with a
@@ -603,7 +612,34 @@ pub fn row_in_partition(plan: &Plan, row: RowRef, multi_elem: Option<&str>) -> b
     row_matches(plan, row)
 }
 
+/// A plan with its `offset` turned into a keyset `start` (the key just before row N).
+pub fn resolve_offset(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Option<Plan>, Miss> {
+    if plan.offset == 0 {
+        return Ok(None);
+    }
+    let (lo, hi) = plan.scan_range();
+    let root = roots.get(plan.index.tree);
+    // Forward: the row before N is at N-1. Reverse: count from the high end.
+    let total = merged::count(ctx, &root, &Range { lo: &lo, hi: &hi })?;
+    let mut p = plan.clone();
+    p.offset = 0;
+    if plan.offset >= total {
+        p.limit = 0;
+        return Ok(Some(p));
+    }
+    let at = if plan.reverse { total - plan.offset } else { plan.offset - 1 };
+    let Some(k) = merged::nth(ctx, &root, &Range { lo: &lo, hi: &hi }, at)? else { return Ok(Some(p)) };
+    let plen = prefix_key(plan.index, &plan.prefix).len();
+    // Forward, start is exclusive: rows after the (N-1)th. Reverse, start is the Nth from the
+    // top's key, also exclusive in scan order.
+    p.start = Some(k[plen..].to_vec());
+    Ok(Some(p))
+}
+
 pub fn execute(ctx: &Ctx, roots: &Roots, plan: &Plan) -> Result<Output, Miss> {
+    if let Some(p) = resolve_offset(ctx, roots, plan)? {
+        return execute(ctx, roots, &p);
+    }
     // A lookup by primary key whose related rows hang off that key (issue → comments): the
     // child prefix is known before the parent is read, so fault both in the same round.
     let mut speculative_miss = false;

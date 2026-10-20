@@ -43,7 +43,7 @@ while :; do
     printf '%s\n' "${batch[@]}" | xargs -P 3 -I{} bash -c 'up "$@"' _ {}
     n=$((n + ${#batch[@]}))
   fi
-  last=$(grep -E "rows|issues|pass|backfill|fetched|pages" /data/build.log | tail -1 | tr -d '"\\' | cut -c1-160)
+  last=$(grep -E "rows|issues|pass|backfill|fetched|pages|file |placements|snapshots|month|trips|sorted|GB in" /data/build.log | tail -1 | tr -d '"\\' | cut -c1-160)
   status "{\"phase\":\"building\",\"uploaded\":$n,\"finished\":$finished,\"secs\":$(( $(date +%s) - t0 )),\"base\":\"$BASE\",\"last\":\"$last\"}"
   if [ $finished = 1 ] && [ ${#ready[@]} -le 48 ]; then
     left=$(ls "$OUT/parts" 2>/dev/null | wc -l)

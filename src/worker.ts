@@ -87,6 +87,8 @@ export default {
         (env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown> }).kick().catch(() => {});
         return ssr(req, env, url, APPS.hn);
       }
+      if (url.pathname === "/place" || url.pathname === "/place/") return ssr(req, env, url, APPS.place);
+      if (url.pathname === "/sheet" || url.pathname === "/sheet/") return ssr(req, env, url, APPS.taxi);
       if (url.pathname === "/api/socket") {
         // Only the Worker decides who is admin; anything a client sends in this header is dropped.
         const isAdmin = admin(req, env) || (!!env.ADMIN_TOKEN && url.searchParams.get("token") === env.ADMIN_TOKEN);

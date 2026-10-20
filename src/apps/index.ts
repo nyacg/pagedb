@@ -4,6 +4,8 @@
  */
 import * as tracker from "./tracker";
 import * as hn from "./hn";
+import * as place from "./place";
+import * as taxi from "./taxi";
 
 type Args = Record<string, any>;
 export interface Ref {
@@ -77,10 +79,40 @@ export const APPS: Record<string, App> = {
       return { asset: "/hn", boot: { p }, prefetch: ref ? [{ key: "list", ...ref }] : [], leases: [] };
     },
   },
+  place: {
+    name: "place",
+    db: (env) => s(env, "PLACE_DB", "place"),
+    obj: (env) => s(env, "PLACE_OBJ", "place"),
+    namedQuery: place.namedQuery,
+    mutate: place.mutate,
+    user: place.visitor,
+    nightlyReset: true,
+    firstPaint: () => ({ asset: "/place", boot: {}, prefetch: [{ key: "meta", name: "meta" }], leases: [{ name: "tiles" }, { name: "recent" }] }),
+  },
+  taxi: {
+    name: "taxi",
+    db: (env) => s(env, "TAXI_DB", "taxi"),
+    obj: (env) => s(env, "TAXI_OBJ", "taxi"),
+    namedQuery: taxi.namedQuery,
+    mutate: taxi.mutate,
+    user: (raw) => (typeof raw === "string" && /^[a-z0-9-]{3,20}$/.test(raw) ? raw : "guest"),
+    nightlyReset: true,
+    firstPaint: () => ({
+      asset: "/sheet",
+      boot: {},
+      prefetch: [
+        { key: "rows", name: "rows", args: { offset: 0, limit: 100 } },
+        { key: "count", name: "count" },
+        { key: "zones", name: "zones" },
+      ],
+      leases: [],
+    }),
+  },
 };
 
 /** Which app a request is for: `?app=` on API calls, or the page path. */
 export function appFor(url: URL): App {
-  const name = url.searchParams.get("app") ?? (url.pathname === "/hn" || url.pathname.startsWith("/hn/") ? "hn" : "tracker");
+  const page = url.pathname.split("/")[1];
+  const name = url.searchParams.get("app") ?? (page === "hn" || page === "place" ? page : page === "sheet" ? "taxi" : "tracker");
   return APPS[name] ?? APPS.tracker;
 }

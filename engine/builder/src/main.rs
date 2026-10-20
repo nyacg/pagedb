@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 mod ingest;
+mod place;
 mod sink;
 use sink::{build_tree, Built, PartSink};
 
@@ -34,6 +35,10 @@ fn main() {
         let newest: Vec<String> = (0..5).map(|k| gen::issue_id(p, n - 1 - k)).collect();
         let first = gen::issue(&cfg, p, n - 1);
         println!(r#"{{"count":{n},"newest":{:?},"title":{:?},"comments":{}}}"#, newest, first.row[pagedb_core::catalog::issue::TITLE].as_str().unwrap(), first.comments);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("place-prep") {
+        place::run(&args[2..]);
         return;
     }
     if args.get(1).map(String::as_str) == Some("fetch-hn") {
