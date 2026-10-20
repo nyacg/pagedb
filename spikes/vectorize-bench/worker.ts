@@ -93,6 +93,12 @@ async function handle(req: Request, env: Env): Promise<Response> {
       }
       return Response.json({ key, vectors, mutation });
     }
+    if (url.pathname === "/has" && req.method === "POST") {
+      // Which of these ids the index holds.
+      const { ids } = (await req.json()) as { ids: string[] };
+      const found = await env.VEC.getByIds(ids.slice(0, 20));
+      return Response.json({ has: found.map((v) => v.id) });
+    }
     if (url.pathname === "/query" && req.method === "POST") {
       const { vec, topK = 10, filter } = (await req.json()) as { vec: number[]; topK?: number; filter?: VectorizeVectorMetadataFilter };
       const t0 = Date.now();
