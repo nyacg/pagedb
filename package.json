@@ -16,6 +16,7 @@
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.12",
     "esbuild": "^0.28.2",
+    "playwright": "^1.64.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "wrangler": "^4.151.0",
