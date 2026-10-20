@@ -6,8 +6,8 @@
     "wasm": "cd engine && cargo build --release -p pagedb-wasm --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/pagedb_wasm.wasm ../src/engine.wasm",
     "test:engine": "cd engine && cargo test --release",
     "typecheck": "tsc --noEmit",
-    "deploy": "npm run wasm && npm run web && wrangler deploy",
-    "deploy:preview": "npm run wasm && npm run web && wrangler deploy --env preview",
+    "deploy": "npm run wasm && npm run web && wrangler deploy && sleep 5 && node scripts/restart-stale.mjs",
+    "deploy:preview": "npm run wasm && npm run web && wrangler deploy --env preview && sleep 5 && node scripts/restart-stale.mjs https://pagedb-preview.do-pool-lab.workers.dev",
     "web": "node web/build.mjs",
     "deploy:node": "npm run wasm && node node/build.mjs && wrangler deploy -c wrangler.node.jsonc"
   },
