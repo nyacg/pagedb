@@ -20,9 +20,9 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   console.log("first paint", ms, "ms |", await firstRow(p));
   console.log("footer:", (await p.locator("#foot").textContent()).trim());
   // jump to a deep row
-  await p.fill("#jump", "1500000"); await p.press("#jump", "Enter");
+  await p.fill("#jump", "73000000"); await p.press("#jump", "Enter");
   let t0 = Date.now(); await p.waitForTimeout(200); await waitRows(p);
-  console.log("jump to 1,500,000:", Date.now() - t0, "ms |", (await firstRow(p)).slice(0, 80));
+  console.log("jump to 73,000,000:", Date.now() - t0, "ms |", (await firstRow(p)).slice(0, 80));
   // sort by tip desc
   await p.click('[data-sort="tip"]'); t0 = Date.now(); await p.waitForTimeout(100); await waitRows(p);
   const tips = await p.locator(".row:not(.loading)").evaluateAll((rs) => rs.slice(0, 8).map((r) => r.children[10].textContent));
