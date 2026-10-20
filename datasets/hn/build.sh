@@ -91,18 +91,29 @@ STORIES="
          nullif(lower(regexp_extract(r.url, '^[a-zA-Z]+://(www\.)?([^/:?#]+)', 2)), '') AS domain
   FROM raw r LEFT JOIN counts c ON c.id = r.id
   WHERE r.deleted = 0 AND r.dead = 0 AND r.type IN (1, 3, 5)"
-COMMENTS="
-  SELECT r.id::VARCHAR AS id, t.root::VARCHAR AS storyId, r.parent::VARCHAR AS parent, r.\"by\", r.time, left(r.text, 16000) AS text
-  FROM raw r JOIN threads t ON t.id = r.id
-  WHERE r.type = 2"
+# Comments, one month at a time: joining all 49M items (with their text) to the thread map at
+# once lets the planner build its hash table on the text side and spill; per month, the month is
+# the small side. All statements run in one DuckDB process writing to one stream.
+comments_sql() {
+  local src
+  for src in $(echo "${files#[}" | tr -d "]" | tr "," " ") "read_json('$WORK/backfill.ndjson', format = 'newline_delimited', columns = {id: 'UBIGINT', type: 'VARCHAR', \"by\": 'VARCHAR', time: 'BIGINT', text: 'VARCHAR', deleted: 'BOOLEAN', dead: 'BOOLEAN', parent: 'UBIGINT'})"; do
+    if [[ "$src" == read_json* ]]; then
+      echo "COPY (SELECT r.id::VARCHAR AS id, t.root::VARCHAR AS storyId, r.parent::VARCHAR AS parent, r.\"by\", r.time * 1000 AS time, left(r.text, 16000) AS text
+        FROM $src r JOIN threads t ON t.id = r.id WHERE r.type = 'comment') TO '/dev/stdout' (FORMAT JSON);"
+    else
+      echo "COPY (SELECT r.id::VARCHAR AS id, t.root::VARCHAR AS storyId, r.parent::VARCHAR AS parent, r.\"by\", epoch_ms(r.time) AS time, left(r.text, 16000) AS text
+        FROM read_parquet($src) r JOIN threads t ON t.id = r.id::UBIGINT WHERE r.type = 2) TO '/dev/stdout' (FORMAT JSON);"
+    fi
+  done
+}
 
 # Stream into the builder: stories, then comments in two passes (so only some of the comment
 # indexes' spill runs are on disk at once).
 for f in stories c1 c2; do rm -f "$WORK/$f"; mkfifo "$WORK/$f"; done
 (
   duck "COPY ($STORIES) TO '$WORK/stories' (FORMAT JSON);"
-  duck "COPY ($COMMENTS) TO '$WORK/c1' (FORMAT JSON);"
-  duck "COPY ($COMMENTS) TO '$WORK/c2' (FORMAT JSON);"
+  duck "$(comments_sql)" > "$WORK/c1"
+  duck "$(comments_sql)" > "$WORK/c2"
 ) &
 DUCK_PID=$!
 "$BUILDER" ingest --schema "$HERE/schema.json" --mem "$MEM" --tmp "$WORK/runs" --out "$OUT" \
