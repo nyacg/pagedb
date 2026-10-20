@@ -6,7 +6,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./do";
-import { storyRow } from "./apps/hn";
+import { storyRow, withVectors } from "./apps/hn";
 
 const API = "https://hacker-news.firebaseio.com/v0";
 const PER_TICK = 300;
@@ -143,7 +143,8 @@ export class HnTail extends DurableObject<Env> {
     }
     for (const [c, s] of batch) if (c !== s) this.storyOf.set(c, s);
     if (this.storyOf.size > 50_000) this.storyOf.clear();
-    return ops;
+    // New stories' embeddings (after the inserts: a vector needs its row).
+    return withVectors(ops, this.env as unknown as Record<string, unknown>);
   }
 
   /** Write in batches of 100; if a batch is refused (e.g. an item already written before a

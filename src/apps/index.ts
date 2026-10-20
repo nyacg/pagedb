@@ -30,6 +30,8 @@ export interface App {
    *  embeds its text first). */
   namedQuery(name: string, args: Args, env?: Record<string, unknown>): unknown | Promise<unknown>;
   mutate(name: string, args: Args, user: string): { ops: unknown[]; created?: string };
+  /** Add derived ops to a mutation before it's written (HN: embeddings of new stories). */
+  enrich?(ops: unknown[], env: Record<string, unknown>): Promise<unknown[]>;
   /** The acting user's handle (a label, not authentication). */
   user(raw: unknown): string;
   firstPaint(url: URL): FirstPaint | null;
@@ -71,6 +73,7 @@ export const APPS: Record<string, App> = {
     obj: (env) => s(env, "HN_OBJ", "hn"),
     namedQuery: hn.namedQuery,
     mutate: hn.mutate,
+    enrich: hn.withVectors,
     user: hn.visitor,
     nightlyReset: false,
     firstPaint(url) {

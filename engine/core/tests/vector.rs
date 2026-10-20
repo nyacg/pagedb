@@ -385,3 +385,91 @@ fn overlay_puts_and_deletes_are_seen_at_once() {
     let h = hits.iter().find(|h| h.pk == base_top[1].pk).unwrap();
     assert!(h.json.contains("edited title"), "{}", h.json);
 }
+
+/// Apply a batch the way the object does: plan through a view, then commit to the overlay.
+fn write(b: &Built, store: &Store, ov: &mut Overlay, ops: serde_json::Value) -> (Vec<pagedb_core::write::RowChange>, Vec<pagedb_core::write::VecChange>) {
+    let parsed = pagedb_core::write::parse_ops_in(b.roots.schema, &b.roots.vectors, &ops).unwrap();
+    let ((changes, vecs), writes) = {
+        let mut rounds = 0;
+        loop {
+            let view = View::new(ov);
+            let ctx = Ctx::with_view(store, &view);
+            match pagedb_core::write::plan_write_all(&ctx, &b.roots, &view, &parsed) {
+                Ok(r) => break (r, view.into_writes()),
+                Err(pagedb_core::write::WriteError::Miss) => {
+                    rounds += 1;
+                    assert!(rounds < 8);
+                    store.resident.borrow_mut().extend(ctx.take_want());
+                }
+                Err(pagedb_core::write::WriteError::Invalid(e)) => panic!("{e}"),
+            }
+        }
+    };
+    ov.apply(&writes);
+    (changes, vecs)
+}
+
+fn vec_b64(v: &[f32]) -> String {
+    b64encode(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+}
+
+#[test]
+fn vector_writes_and_live_windows() {
+    use pagedb_core::ivm::DeltaOp;
+    use pagedb_core::vector::live;
+    let b = build(6000, 60);
+    let store = Store { pages: &b.pages, resident: RefCell::new((0..b.pages.len() as PageId).collect()) };
+    let mut ov = Overlay::default();
+    let q = b.vecs[500].clone();
+    let aq = query(&b, &q, 5, 8, serde_json::Value::Null);
+    let (sub, _) = run(&store, &ov, |ctx| live::hydrate(ctx, &b.roots, aq.clone()).map(|(l, _, _)| l));
+    assert_eq!(sub.window.len(), 5);
+    assert_eq!(sub.window[0].1, "d500");
+
+    // A new row and its vector (≈ the query) in one batch: found at once, and pushed live.
+    let mut v = q.clone();
+    v[3] += 0.002;
+    let (changes, vecs) = write(&b, &store, &mut ov, serde_json::json!({"ops":[
+        {"op":"insert","table":"doc","row":{"id":"n1","title":"brand new","time":7e9,"kind":"show"}},
+        {"op":"vec_put","index":"doc_vec","id":"n1","vec":vec_b64(&v)}]}));
+    assert_eq!(vecs.len(), 1);
+    let ((w, ops), _) = run(&store, &ov, |ctx| live::compute(ctx, &b.roots, &sub, &vecs, &changes));
+    assert_eq!(w.len(), 5);
+    assert!(matches!(&ops[0], DeltaOp::Add { pk, json } if pk == "n1" && json.contains("brand new")), "{ops:?}");
+    assert!(matches!(&ops[1], DeltaOp::Remove { pk } if *pk == sub.window[4].1));
+    let ((hits, st), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+    assert!(hits.iter().take(2).any(|h| h.pk == "n1"));
+    assert_eq!(st.overlay, 1);
+    let sub = live::AnnLive { q: sub.q.clone(), window: w };
+
+    // Re-filing a base row's vector moves it: the old entry is gone, the new one is found.
+    let far = b.vecs[1].clone();
+    let (_, vecs2) = write(&b, &store, &mut ov, serde_json::json!({"ops":[{"op":"vec_put","index":"doc_vec","id":"d500","vec":vec_b64(&far)}]}));
+    assert!(vecs2[0].old_key.is_some());
+    let ((hits, _), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+    assert!(!hits.iter().any(|h| h.pk == "d500"), "d500 moved away");
+    let ((w2, ops2), _) = run(&store, &ov, |ctx| live::compute(ctx, &b.roots, &sub, &vecs2, &[]));
+    assert!(ops2.iter().any(|o| matches!(o, DeltaOp::Remove { pk } if pk == "d500")));
+    assert!(!w2.iter().any(|(_, p)| p == "d500"));
+    let aq_far = query(&b, &far, 3, 8, serde_json::Value::Null);
+    let ((hits, _), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq_far));
+    assert!(hits.iter().take(2).any(|h| h.pk == "d500"));
+
+    // Updating a row in the window re-sends it; deleting it removes it (and its vector).
+    let sub = live::AnnLive { q: sub.q.clone(), window: w2 };
+    let (changes, vecs) = write(&b, &store, &mut ov, serde_json::json!({"ops":[{"op":"update","table":"doc","id":"n1","set":{"title":"renamed"}}]}));
+    let ((_, ops), _) = run(&store, &ov, |ctx| live::compute(ctx, &b.roots, &sub, &vecs, &changes));
+    assert!(matches!(&ops[..], [DeltaOp::Edit { pk, json }] if pk == "n1" && json.contains("renamed")), "{ops:?}");
+    let (changes, vecs) = write(&b, &store, &mut ov, serde_json::json!({"ops":[{"op":"delete","table":"doc","id":"n1"}]}));
+    assert_eq!(vecs.len(), 1, "the row's vector goes with it");
+    let ((_, ops), _) = run(&store, &ov, |ctx| live::compute(ctx, &b.roots, &sub, &vecs, &changes));
+    assert!(ops.iter().any(|o| matches!(o, DeltaOp::Remove { pk } if pk == "n1")));
+    let ((hits, _), _) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+    assert!(!hits.iter().any(|h| h.pk == "n1"));
+
+    // A vector for a missing row is refused.
+    let parsed = pagedb_core::write::parse_ops_in(b.roots.schema, &b.roots.vectors, &serde_json::json!({"ops":[{"op":"vec_put","index":"doc_vec","id":"nope","vec":vec_b64(&q)}]})).unwrap();
+    let view = View::new(&ov);
+    let ctx = Ctx::with_view(&store, &view);
+    assert!(matches!(pagedb_core::write::plan_write_all(&ctx, &b.roots, &view, &parsed), Err(pagedb_core::write::WriteError::Invalid(_))));
+}

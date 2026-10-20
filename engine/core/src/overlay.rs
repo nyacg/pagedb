@@ -78,6 +78,23 @@ impl<'a> View<'a> {
         out.into_iter().filter_map(|(k, e)| e.map(|e| (k, e))).collect()
     }
 
+    /// Every entry of `tree` (committed, with `staged` — this view's staged map, borrowed by
+    /// the caller — on top), by reference: no copies, for scans over many overlay entries.
+    pub fn visit<'s>(&'s self, tree: u16, staged: &'s BTreeMap<Key, Option<Entry>>, f: &mut dyn FnMut(&'s [u8], &'s Entry)) {
+        let lo: Key = (tree, Vec::new());
+        let hi: Key = (tree + 1, Vec::new());
+        for ((_, k), e) in self.base.map.range(lo.clone()..hi.clone()) {
+            if staged.is_empty() || !staged.contains_key(&(tree, k.clone())) {
+                f(k, e);
+            }
+        }
+        for ((_, k), e) in staged.range(lo..hi) {
+            if let Some(e) = e {
+                f(k, e);
+            }
+        }
+    }
+
     pub fn is_empty_for(&self, tree: u16) -> bool {
         let lo: Key = (tree, Vec::new());
         let hi: Key = (tree + 1, Vec::new());

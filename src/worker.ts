@@ -82,7 +82,8 @@ export default {
         } catch (e) {
           return Response.json({ error: (e as Error).message }, { status: 400 });
         }
-        const r = await env.DB.getByName(app.obj(vars(env))).write(app.db(vars(env)), { ops: built.ops });
+        const ops = app.enrich ? await app.enrich(built.ops, vars(env)) : built.ops;
+        const r = await env.DB.getByName(app.obj(vars(env))).write(app.db(vars(env)), { ops });
         return Response.json({ ...r, created: built.created }, { status: "error" in r ? 400 : 200 });
       }
       if (url.pathname === "/" || url.pathname === "/index.html") return ssr(req, env, url, APPS.tracker);

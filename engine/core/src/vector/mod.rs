@@ -24,6 +24,7 @@
 //! entries and new entries are scored alongside (read-your-writes).
 
 pub mod kernels;
+pub mod live;
 
 use crate::codec::{encode_key, encode_row, json_cell, json_str, Cell, RowRef, Value};
 use crate::page::{Page, PageId};
@@ -520,10 +521,15 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
     stats.clusters = scorer.qc.len();
     stats.pages = pages.len();
 
-    // Overlay: its entries for this index (new vectors, and tombstones hiding base ones).
-    let view = ctx.view.filter(|v| !v.is_empty_for(vi.tree));
-    let ov = view.map(|v| v.range(vi.tree, &[], &[])).unwrap_or_default();
-    let shadow: HashSet<&[u8]> = ov.iter().map(|(k, _)| k.as_slice()).collect();
+    // Overlay: its entries for this index (new vectors, and tombstones hiding base ones),
+    // borrowed (an object's overlay can hold many vectors; queries shouldn't copy them).
+    let mut ov: Vec<(&[u8], &crate::overlay::Entry)> = Vec::new();
+    let staged;
+    if let Some(v) = ctx.view.filter(|v| !v.is_empty_for(vi.tree)) {
+        staged = v.staged.borrow();
+        v.visit(vi.tree, &staged, &mut |k, e| ov.push((k, e)));
+    }
+    let shadow: HashSet<&[u8]> = ov.iter().map(|(k, _)| *k).collect();
 
     // Top candidates (2k: room for rows the overlay has since deleted).
     let keep = aq.k * 2 + 8;
@@ -556,7 +562,7 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
     }
     // New vectors in the overlay: scored exactly like base entries (any cluster).
     let pos: HashMap<u32, usize> = if ov.is_empty() { HashMap::new() } else { cents.ids.iter().enumerate().map(|(i, &c)| (c, i)).collect() };
-    for (k, e) in &ov {
+    for &(k, e) in &ov {
         let Some(v) = &e.val else { continue };
         let cid = cluster_of(k);
         let qc = match scorer.qc.get(&cid) {

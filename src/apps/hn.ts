@@ -7,7 +7,7 @@
 const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const cond = (op: string, c: string, v: unknown) => ({ type: "simple", op, left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const and = (...c: unknown[]) => (c.length === 1 ? c[0] : { type: "and", conditions: c });
-import { queryVector, type EmbedEnv } from "../embed";
+import { embed, packVector, queryVector, storyText, type EmbedEnv } from "../embed";
 
 const BY_TIME = [["time", "desc"], ["id", "asc"]];
 const THREAD = [["time", "asc"], ["id", "asc"]];
@@ -153,6 +153,23 @@ export function namedQuery(name: string, a: Record<string, any> = {}, env?: Reco
       return { table: "comment", where: eq("id", need(typeof a.id === "string" && ID.test(a.id), a.id, "comment")), one: true };
   }
   throw new Error(`unknown query ${name}`);
+}
+
+/**
+ * Vector ops for story inserts among `ops` (their embeddings, so new stories are found by
+ * semantic search at once). Only when the base has the vector index (HN_VEC set). If the
+ * model is unavailable the ops go out without them.
+ */
+export async function withVectors(ops: unknown[], env: Record<string, unknown>): Promise<unknown[]> {
+  if (!env.HN_VEC) return ops;
+  const stories = ops.filter((o: any) => o?.op === "insert" && o.table === "story") as { row: Record<string, any> }[];
+  if (!stories.length) return ops;
+  try {
+    const vecs = await embed(env as EmbedEnv, stories.map((o) => storyText(o.row) || "(untitled)"));
+    return [...ops, ...stories.map((o, i) => ({ op: "vec_put", index: VEC.index, id: o.row.id, vec: packVector(vecs[i], VEC.dims) }))];
+  } catch {
+    return ops;
+  }
 }
 
 // ------------------------------------------------------------------ mutators
