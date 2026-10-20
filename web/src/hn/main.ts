@@ -7,7 +7,7 @@ import { Sync, type Row } from "../sync";
 
 declare global {
   interface Window {
-    __BOOT?: { p: string; list?: { rows: Row[] }; ms?: number; stats?: any; leases?: any[]; build?: string };
+    __BOOT?: { p: string; list?: { rows: Row[] }; ms?: number; stats?: any; leases?: any[]; build?: string; base?: { bytes: number; rows: Record<string, number> } };
   }
 }
 
@@ -302,6 +302,10 @@ function render() {
   if (!primed && (sync.get("list")?.ready || sync.get("item")?.ready || sync.get("ustories")?.ready)) primed = true;
 }
 
+if (boot.base?.bytes) {
+  const n = (boot.base.rows.story ?? 0) + (boot.base.rows.comment ?? 0);
+  $("#basesize").textContent = `${(n / 1e6).toFixed(1)} million items, ${(boot.base.bytes / 1e9).toFixed(1)} GB`;
+}
 const qBox = document.querySelector("#q") as HTMLInputElement | null;
 if (qBox && page === "search") qBox.value = params.get("q") ?? "";
 sync.onChange(render);

@@ -629,6 +629,13 @@ export class DbObject extends DurableObject<Env> {
     this.ctx.abort("evicted for a benchmark");
   }
 
+  /** The base's size and row counts (from its manifest), for pages to show. */
+  async baseStats(db: string) {
+    await this.ensure(db);
+    const m = JSON.parse(this.ctx.storage.kv.get<string>(`manifest:${db}`) ?? "{}") as { bytes?: number; rows?: Record<string, number>; pages?: number };
+    return { bytes: m.bytes ?? 0, rows: m.rows ?? {}, pages: m.pages ?? 0 };
+  }
+
   async info() {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
