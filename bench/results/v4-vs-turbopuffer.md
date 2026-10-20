@@ -21,3 +21,22 @@ the benchmarks ran from, 46 ms connect; pagevec's Worker ran in Cloudflare's SJC
 turbopuffer's lead on recall comes from a full-precision rerank of candidates (RaBitQ codes +
 f16 vectors); pagevec ranks on its 4-bit codes alone (99.9% of its results are in the true top
 100). A rerank tier is the next step (see v1-hn-recall.md).
+
+## Why turbopuffer's recall is higher (`bench/vec-rerank-probe.mjs`)
+
+Ask pagevec for its top 50, then check how many of the true top 10 are among them, and the
+recall@10 after reranking those candidates with exact vectors:
+
+| pagevec, 100 queries | served recall@10 | true top 10 among candidates | after exact rerank |
+|---|---|---|---|
+| 256 pages (deployed) | 0.896 | 0.946 | 0.945 |
+| 512 pages | 0.915 | 0.967 | 0.966 |
+| turbopuffer | 0.990 | | |
+
+The gap (0.895 → 0.990) is about half **ordering** and half **coverage**:
+- Ordering: 4-bit codes misorder near-ties. An exact rerank of pagevec's own top 20 lifts
+  0.896 → 0.945. turbopuffer keeps full-precision (here f16) vectors and reranks its candidates.
+- Coverage: ~5% of true neighbours sit in clusters pagevec never reads within its 256-page
+  budget (512 pages: ~3%). turbopuffer scores far more candidates for the same work: 1-bit
+  RaBitQ codes (128 B at 1024 dims, vs pagevec's 512 B code + ~150 B of inline row), a
+  hierarchical centroid tree, served from memory/NVMe.
