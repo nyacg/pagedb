@@ -133,9 +133,13 @@ function semanticArgs(): Record<string, string> {
 // ---------------------------------------------------------------- views
 
 function storyRows(rows: Row[], start: number, scores = false) {
+  // Similarity bars span the scores on screen (good matches all sit in a narrow band).
+  const ss = rows.map((r) => r._score ?? 0);
+  const [lo, hi] = [Math.min(...ss), Math.max(...ss)];
   return rows
     .map((r, i) => {
-      const sim = scores && r._score !== undefined ? `<span class="sim" title="cosine similarity ${r._score.toFixed(3)}"><i style="width:${Math.max(4, Math.min(100, ((r._score - 0.3) / 0.5) * 100)).toFixed(0)}%"></i></span>` : "";
+      const w = hi > lo ? 20 + (80 * ((r._score ?? 0) - lo)) / (hi - lo) : 100;
+      const sim = scores && r._score !== undefined ? `<span class="sim" title="cosine similarity ${r._score.toFixed(3)}"><i style="width:${w.toFixed(0)}%"></i></span>` : "";
       const dom = r.domain ? ` <span class="sitebit">(<a href="?p=from&site=${esc(r.domain)}">${esc(r.domain)}</a>)</span>` : "";
       const href = r.url ? esc(r.url) : `?p=item&id=${esc(r.id)}`;
       const job = r.kind === "job";
@@ -154,12 +158,14 @@ function semanticView() {
   const opt = (name: string, v: string, label: string) => `<option value="${v}"${(params.get(name) ?? "") === v ? " selected" : ""}>${label}</option>`;
   const form = `<form class="semform" action="">
     <input type="hidden" name="p" value="semantic">
-    <input name="q" value="${esc(a.q)}" placeholder="describe what you're looking for" size="44" autofocus maxlength="200">
-    <select name="since">${opt("since", "", "any time")}${opt("since", "year", "past year")}${opt("since", "month", "past month")}${opt("since", "week", "past week")}${opt("since", "day", "past day")}</select>
-    <select name="kind">${opt("kind", "", "all")}${opt("kind", "story", "stories")}${opt("kind", "ask", "Ask HN")}${opt("kind", "show", "Show HN")}${opt("kind", "job", "jobs")}</select>
-    <button>search</button></form>`;
+    <input type="search" name="q" value="${esc(a.q)}" placeholder="Describe what you're looking for…" ${a.q ? "" : "autofocus"} maxlength="200" aria-label="Search by meaning">
+    <select name="since" aria-label="When">${opt("since", "", "Any time")}${opt("since", "year", "Past year")}${opt("since", "month", "Past month")}${opt("since", "week", "Past week")}${opt("since", "day", "Past day")}</select>
+    <select name="kind" aria-label="Kind">${opt("kind", "", "All stories")}${opt("kind", "story", "Links")}${opt("kind", "ask", "Ask HN")}${opt("kind", "show", "Show HN")}${opt("kind", "job", "Jobs")}</select>
+    <button>Search</button></form>`;
+  const examples = ["running a database on object storage", "burnout as a solo founder", "why is my rust code slow", "learning to draw as an adult"];
   if (a.q.length < 2)
-    return `${form}<p class="note">Search by meaning: every story's title (and Ask HN text) is an embedding in a vector index inside the same Durable Object. Try <a href="?p=semantic&q=${encodeURIComponent("running a database on object storage")}">running a database on object storage</a>, <a href="?p=semantic&q=${encodeURIComponent("burnout as a solo founder")}">burnout as a solo founder</a> or <a href="?p=semantic&q=${encodeURIComponent("why is my rust code slow")}">why is my rust code slow</a>.</p>`;
+    return `${form}<div class="semintro"><p>Search every HN story by meaning, not keywords. Each story's title (and Ask HN text) is an embedding in a vector index that lives in the same Durable Object as the rest of HN, so new stories are searchable the moment they're posted.</p>
+      <p class="semtry">Try: ${examples.map((x) => `<a href="?p=semantic&q=${encodeURIComponent(x)}">${esc(x)}</a>`).join("")}</p></div>`;
   const s = sync.get("list");
   if (!s?.ready && !s?.rows.size) return `${form}<p class="note">Embedding your query and searching…</p>`;
   const rows = sync.view("list").sort((x, y) => (y._score ?? 0) - (x._score ?? 0));
@@ -396,8 +402,16 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+// Back to a page from the back/forward cache: its filters may still be disabled from the submit.
+addEventListener("pageshow", () => document.querySelectorAll<HTMLSelectElement>(".semform select").forEach((el) => (el.disabled = false)));
+
 document.addEventListener("submit", async (e) => {
   const form = e.target as HTMLFormElement;
+  // Search forms navigate (GET) as usual, minus empty filters (no "&since=&kind=").
+  if (form.matches(".semform")) {
+    for (const el of form.querySelectorAll("select")) el.disabled = !el.value;
+    return;
+  }
   if (!form.matches("[data-parent], [data-submit]")) return; // the search box is a plain GET form
   e.preventDefault();
   if (form.matches("[data-parent]")) {
