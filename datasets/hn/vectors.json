@@ -1,0 +1,17 @@
+{
+  "name": "story_vec",
+  "table": "story",
+  "dims": 512,
+  "codec": "sq8",
+  "cols": ["id", "by", "time", "title", "url", "score", "descendants", "kind", "domain"],
+  "tree": 20,
+  "byId": 21,
+  "centroids": 22,
+  "clusterSize": 800,
+  "supers": 64,
+  "sample": 400000,
+  "truncate": 300,
+  "nprobe": 32,
+  "maxPages": 256,
+  "model": "@cf/qwen/qwen3-embedding-0.6b"
+}

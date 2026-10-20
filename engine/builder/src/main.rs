@@ -18,9 +18,12 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
+mod embed;
 mod ingest;
 mod place;
+mod shard;
 mod sink;
+mod vec;
 use sink::{build_tree, Built, PartSink};
 
 fn main() {
@@ -74,6 +77,15 @@ fn main() {
             }
         }
         return;
+    }
+    match args.get(1).map(String::as_str) {
+        Some("vec-synth") => return vec::synth(&args[2..]),
+        Some("vec-build") => return vec::build_cmd(&args[2..]),
+        Some("vec-merge") => return vec::merge(&args[2..]),
+        Some("vec-eval") => return vec::eval(&args[2..]),
+        Some("vec-gt") => return vec::gt(&args[2..]),
+        Some("embed") => return embed::run(&args[2..]),
+        _ => {}
     }
     if args.get(1).map(String::as_str) == Some("ingest") {
         ingest::run(&args[2..]);

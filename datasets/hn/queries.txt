@@ -1,0 +1,101 @@
+running a database on object storage
+burnout as a solo founder
+why is my rust code slow
+how to hire your first engineer
+lessons from shutting down a startup
+self-hosting email in 2025
+the economics of open source maintainers
+sqlite in production
+postgres vs mysql for a new project
+vector databases and embeddings
+large language models replacing programmers
+how transformers work explained simply
+learning to draw as an adult
+the best books on writing well
+remote work and loneliness
+negotiating a salary offer
+apple vs the EU over app store rules
+nuclear fusion breakthrough
+cheap home lab server setup
+keyboard shortcuts that save time
+why are rents so high in san francisco
+writing a compiler from scratch
+garbage collection in go
+webassembly outside the browser
+durable objects and edge computing
+kubernetes is too complicated
+monolith vs microservices
+static site generators
+learning japanese with spaced repetition
+productivity systems that actually work
+the decline of google search quality
+privacy-focused alternatives to gmail
+how the stock market works
+index funds vs picking stocks
+retiring early with FIRE
+mechanical keyboards
+the history of unix
+plan 9 from bell labs
+lisp macros explained
+functional programming in practice
+type systems and correctness
+formal verification of software
+the rise of risc-v
+apple silicon performance
+designing a programming language
+memory safety and c++
+linux on the desktop
+tiling window managers
+emacs vs vim
+best terminal emulators
+git workflows for small teams
+code review best practices
+technical debt at startups
+on-call burnout
+incident postmortem examples
+the mythical man month
+why software projects fail
+estimating software projects
+startup fundraising advice
+YC application tips
+bootstrapping a SaaS business
+pricing a developer tool
+cold email that works
+building in public
+indie hackers making money
+open source business models
+license changes like elastic and redis
+mapping the human brain
+longevity research and aging
+intermittent fasting science
+sleep and memory
+the replication crisis in psychology
+climate change and carbon capture
+electric cars and battery technology
+spacex starship launch
+the james webb telescope images
+quantum computing hype
+cryptography for beginners
+password managers and security
+a major data breach
+ransomware attacks on hospitals
+end-to-end encryption debate
+the fediverse and mastodon
+twitter after the acquisition
+the attention economy and social media
+kids and smartphones
+the four day work week
+cities designed for cars
+high speed rail in the us
+how airplanes stay in the air
+3d printing at home
+raspberry pi projects
+retro computing and old hardware
+the commodore 64
+game development with godot
+procedural generation in games
+chess engines and ai
+the go game and alphago
+the math behind neural networks
+probability puzzles
+interesting physics papers

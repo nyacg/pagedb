@@ -5,7 +5,7 @@
  *   GET  /api/socket?app=                        → the app's object (subscriptions need leases)
  *   POST /api/mutate?app= {name,args,user}       → a named mutator → the object's write
  *   POST /api/query {db, ast, obj?}  POST /api/write {db, ops, obj?}   (admin: raw ASTs / ops)
- *   PUT  /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict}
+ *   PUT|HEAD|GET /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict,prewarm}
  */
 import { DbObject, type Env } from "./do";
 import { HnTail } from "./hn-tail";
@@ -16,14 +16,14 @@ export { DbObject, HnTail };
 const admin = (req: Request, env: Env) => !!env.ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 const vars = (env: Env) => env as unknown as Record<string, unknown>;
 type QueryStub = {
-  query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number }; stats: unknown }>;
+  query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number; ann?: unknown }; stats: unknown }>;
   baseStats(db: string): Promise<{ bytes: number; rows: Record<string, number>; pages: number }>;
 };
 
 async function lease(env: Env, app: App, d: Ref) {
   const key = canon({ name: d.name, args: d.args ?? {} });
   try {
-    const ast = app.namedQuery(d.name, d.args ?? {});
+    const ast = await app.namedQuery(d.name, d.args ?? {}, vars(env));
     const { token, exp } = await signLease(env.LEASE_SECRET!, { ast, db: app.db(vars(env)), obj: app.obj(vars(env)) });
     return { key, token, exp, ast };
   } catch (e) {
@@ -43,7 +43,7 @@ async function ssr(req: Request, env: Env, url: URL, app: App): Promise<Response
   const t0 = Date.now();
   try {
     const stub = env.DB.getByName(obj) as unknown as QueryStub;
-    const [results, base] = await Promise.all([Promise.all(fp.prefetch.map((p) => stub.query(db, app.namedQuery(p.name, p.args ?? {})))), stub.baseStats(db).catch(() => null)]);
+    const [results, base] = await Promise.all([Promise.all(fp.prefetch.map(async (p) => stub.query(db, await app.namedQuery(p.name, p.args ?? {}, vars(env))))), stub.baseStats(db).catch(() => null)]);
     if (base) boot.base = base;
     fp.prefetch.forEach((p, i) => {
       const r = results[i].result;
@@ -114,10 +114,16 @@ export default {
       }
       if (url.pathname.startsWith("/api/admin/")) {
         if (!admin(req, env)) return new Response("unauthorized", { status: 401 });
-        if (url.pathname.startsWith("/api/admin/r2/") && req.method === "PUT") {
+        if (url.pathname.startsWith("/api/admin/r2/")) {
           const key = decodeURIComponent(url.pathname.slice("/api/admin/r2/".length));
-          await (env.BUCKET as R2Bucket).put(key, req.body);
-          return Response.json({ ok: true, key });
+          const bucket = env.BUCKET as R2Bucket;
+          if (req.method === "PUT") {
+            await bucket.put(key, req.body);
+            return Response.json({ ok: true, key });
+          }
+          if (req.method === "HEAD") return new Response(null, { status: (await bucket.head(key)) ? 200 : 404 });
+          const obj = await bucket.get(key);
+          return obj ? new Response(obj.body) : new Response("not found", { status: 404 });
         }
         if (url.pathname === "/api/admin/hn-tail") {
           const tail = env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown>; status(): Promise<unknown> };
@@ -127,6 +133,12 @@ export default {
         const stub = env.DB.getByName(url.searchParams.get("obj") ?? db);
         if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
+        if (url.pathname === "/api/admin/remanifest") return Response.json(await stub.remanifest());
+        if (url.pathname === "/api/admin/prewarm") {
+          const n = (k: string) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : undefined);
+          return Response.json(await stub.prewarm(db, n("from"), n("to")));
+        }
+        if (url.pathname === "/api/admin/sqlite-bench") return Response.json(await stub.sqliteBench(Number(url.searchParams.get("n") ?? 100), (url.searchParams.get("how") ?? "one") as "one"));
         if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
         if (url.pathname === "/api/admin/compact") return Response.json(await (stub as unknown as { compactOverlay(): Promise<unknown> }).compactOverlay());
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));

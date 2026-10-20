@@ -26,7 +26,9 @@ export interface App {
   name: string;
   db(env: Record<string, unknown>): string;
   obj(env: Record<string, unknown>): string;
-  namedQuery(name: string, args: Args): unknown;
+  /** The AST for a named query. May be async and use the Worker's env (a semantic search
+   *  embeds its text first). */
+  namedQuery(name: string, args: Args, env?: Record<string, unknown>): unknown | Promise<unknown>;
   mutate(name: string, args: Args, user: string): { ops: unknown[]; created?: string };
   /** The acting user's handle (a label, not authentication). */
   user(raw: unknown): string;
@@ -74,8 +76,19 @@ export const APPS: Record<string, App> = {
     firstPaint(url) {
       const p = url.searchParams.get("p") ?? "news";
       const id = url.searchParams.get("id") ?? "";
+      const q = (url.searchParams.get("q") ?? "").trim();
       const ref: Ref | null =
-        p === "news" ? { name: "top" } : p === "newest" ? { name: "new" } : p === "best" ? { name: "best" } : p === "item" && /^(\d{1,10}|u-[a-z0-9]{6,24})$/.test(id) ? { name: "item", args: { id } } : null;
+        p === "news"
+          ? { name: "top" }
+          : p === "newest"
+            ? { name: "new" }
+            : p === "best"
+              ? { name: "best" }
+              : p === "item" && /^(\d{1,10}|u-[a-z0-9]{6,24})$/.test(id)
+                ? { name: "item", args: { id } }
+                : p === "semantic" && q.length >= 2 && q.length <= 200
+                  ? { name: "semantic", args: hn.semanticArgs(url.searchParams) }
+                  : null;
       return { asset: "/hn", boot: { p }, prefetch: ref ? [{ key: "list", ...ref }] : [], leases: [] };
     },
   },

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "wasm": "cd engine && cargo build --release -p pagedb-wasm --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/pagedb_wasm.wasm ../src/engine.wasm",
+    "wasm": "cd engine && RUSTFLAGS='-C target-feature=+simd128' cargo build --release -p pagedb-wasm --target wasm32-unknown-unknown && cp target/wasm32-unknown-unknown/release/pagedb_wasm.wasm ../src/engine.wasm",
     "test:engine": "cd engine && cargo test --release",
     "typecheck": "tsc --noEmit",
     "deploy": "npm run wasm && npm run web && wrangler deploy && sleep 5 && node scripts/restart-stale.mjs",

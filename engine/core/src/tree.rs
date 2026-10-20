@@ -361,6 +361,44 @@ fn scan_leaf(page: Page, range: &Range, reverse: bool, budget: &mut usize, f: &m
     true
 }
 
+/// Leaf pages that can hold keys in `range`, found through the branch pages alone (no leaf is
+/// read). Every missing branch page is recorded before returning `Miss`, so with the branch
+/// pages pinned this never misses, and a caller can gather the leaves of many ranges into one
+/// fault round.
+pub fn leaves_in(ctx: &Ctx, root: &TreeRoot, range: &Range, out: &mut Vec<PageId>) -> Result<(), Miss> {
+    match root.height {
+        0 => Ok(()),
+        1 => {
+            out.push(root.root);
+            Ok(())
+        }
+        _ => leaves_under(ctx, root.root, range, out),
+    }
+}
+
+fn leaves_under(ctx: &Ctx, id: PageId, range: &Range, out: &mut Vec<PageId>) -> Result<(), Miss> {
+    let bytes = ctx.get(id)?;
+    let page = Page(&bytes);
+    let (first, last) = child_span(page, range);
+    if first > last {
+        return Ok(());
+    }
+    let mut missed = false;
+    for i in first..=last {
+        let child = page.child(i).1;
+        if page.level() == 1 {
+            out.push(child);
+        } else if leaves_under(ctx, child, range, out).is_err() {
+            missed = true;
+        }
+    }
+    if missed {
+        Err(Miss)
+    } else {
+        Ok(())
+    }
+}
+
 /// Point lookup.
 pub fn get(ctx: &Ctx, root: &TreeRoot, key: &[u8]) -> Result<Option<Vec<u8>>, Miss> {
     if root.height == 0 {

@@ -396,11 +396,13 @@ fn compile_related(schema: &'static Schema, parent: TableId, r: &J) -> Result<Re
 pub struct Roots {
     pub trees: HashMap<u16, TreeRoot>,
     pub schema: &'static Schema,
+    /// Vector indexes (`"vectors"` in the manifest).
+    pub vectors: Vec<crate::vector::VecIndex>,
 }
 
 impl Roots {
     pub fn new(schema: &'static Schema, trees: HashMap<u16, TreeRoot>) -> Roots {
-        Roots { trees, schema }
+        Roots { trees, schema, vectors: Vec::new() }
     }
 
     pub fn get(&self, tree: u16) -> TreeRoot {
@@ -432,7 +434,8 @@ impl Roots {
                 },
             );
         }
-        Ok(Roots { trees: out, schema })
+        let vectors = crate::vector::from_manifest(schema, m)?;
+        Ok(Roots { trees: out, schema, vectors })
     }
 }
 

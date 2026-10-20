@@ -107,6 +107,8 @@ function subscribe() {
       return sync.sub("list", { name: "from", args: { domain: params.get("site") ?? "", ...(next ? { start: next } : {}) } });
     case "search":
       return words.length ? sync.sub("list", { name: "search", args: { words, ...(next ? { start: next } : {}) } }) : undefined;
+    case "semantic":
+      return semanticArgs().q.length >= 2 ? sync.sub("list", { name: "semantic", args: semanticArgs() }, seed) : undefined;
     case "user":
       sync.sub("ustories", { name: "userStories", args: { by: id, limit: 30 } });
       return sync.sub("ucomments", { name: "userComments", args: { by: id, limit: 30 } });
@@ -118,11 +120,22 @@ function subscribe() {
 }
 subscribe();
 
+/** The semantic search in the URL: ?q= (meaning, not words), &since=, &kind=. */
+function semanticArgs(): Record<string, string> {
+  const a: Record<string, string> = { q: (params.get("q") ?? "").trim().slice(0, 200) };
+  const since = params.get("since") ?? "";
+  if (["day", "week", "month", "year"].includes(since)) a.since = since;
+  const kind = params.get("kind") ?? "";
+  if (["story", "ask", "show", "job", "poll"].includes(kind)) a.kind = kind;
+  return a;
+}
+
 // ---------------------------------------------------------------- views
 
-function storyRows(rows: Row[], start: number) {
+function storyRows(rows: Row[], start: number, scores = false) {
   return rows
     .map((r, i) => {
+      const sim = scores && r._score !== undefined ? `<span class="sim" title="cosine similarity ${r._score.toFixed(3)}"><i style="width:${Math.max(4, Math.min(100, ((r._score - 0.3) / 0.5) * 100)).toFixed(0)}%"></i></span>` : "";
       const dom = r.domain ? ` <span class="sitebit">(<a href="?p=from&site=${esc(r.domain)}">${esc(r.domain)}</a>)</span>` : "";
       const href = r.url ? esc(r.url) : `?p=item&id=${esc(r.id)}`;
       const job = r.kind === "job";
@@ -130,10 +143,32 @@ function storyRows(rows: Row[], start: number) {
         ? itemLink(r.id, ago(r.time))
         : `<span class="score">${r.score} point${r.score === 1 ? "" : "s"}</span> by ${userLink(r.by)} ${itemLink(r.id, ago(r.time))} | ${itemLink(r.id, r.descendants ? `${r.descendants}&nbsp;comment${r.descendants === 1 ? "" : "s"}` : "discuss")}`;
       return `<tr class="athing${fresh(r.id)}"><td class="rank">${start + i + 1}.</td><td class="votelinks">${job ? "" : `<a class="votearrow${voted.has(r.id) ? " voted" : ""}" data-vote="${esc(r.id)}" title="upvote"></a>`}</td>
-        <td class="titleline"><a href="${href}" ${r.url ? 'rel="nofollow noreferrer" target="_blank"' : ""}>${esc(r.title)}</a>${dom}</td></tr>
+        <td class="titleline">${sim}<a href="${href}" ${r.url ? 'rel="nofollow noreferrer" target="_blank"' : ""}>${esc(r.title)}</a>${dom}</td></tr>
         <tr><td colspan="2"></td><td class="subtext">${meta}</td></tr><tr class="spacer"></tr>`;
     })
     .join("");
+}
+
+function semanticView() {
+  const a = semanticArgs();
+  const opt = (name: string, v: string, label: string) => `<option value="${v}"${(params.get(name) ?? "") === v ? " selected" : ""}>${label}</option>`;
+  const form = `<form class="semform" action="">
+    <input type="hidden" name="p" value="semantic">
+    <input name="q" value="${esc(a.q)}" placeholder="describe what you're looking for" size="44" autofocus maxlength="200">
+    <select name="since">${opt("since", "", "any time")}${opt("since", "year", "past year")}${opt("since", "month", "past month")}${opt("since", "week", "past week")}${opt("since", "day", "past day")}</select>
+    <select name="kind">${opt("kind", "", "all")}${opt("kind", "story", "stories")}${opt("kind", "ask", "Ask HN")}${opt("kind", "show", "Show HN")}${opt("kind", "job", "jobs")}</select>
+    <button>search</button></form>`;
+  if (a.q.length < 2)
+    return `${form}<p class="note">Search by meaning: every story's title (and Ask HN text) is an embedding in a vector index inside the same Durable Object. Try <a href="?p=semantic&q=${encodeURIComponent("running a database on object storage")}">running a database on object storage</a>, <a href="?p=semantic&q=${encodeURIComponent("burnout as a solo founder")}">burnout as a solo founder</a> or <a href="?p=semantic&q=${encodeURIComponent("why is my rust code slow")}">why is my rust code slow</a>.</p>`;
+  const s = sync.get("list");
+  if (!s?.ready && !s?.rows.size) return `${form}<p class="note">Embedding your query and searching…</p>`;
+  const rows = sync.view("list").sort((x, y) => (y._score ?? 0) - (x._score ?? 0));
+  if (!rows.length) return `${form}<p class="note">Nothing found.</p>`;
+  const st = s?.stats;
+  const tier = st ? (st.r2Gets ? "from R2" : st.cacheHits ? "from the city cache" : st.sqliteHits ? "from the object's SQLite" : "in memory") : "";
+  const ann = s?.ann;
+  const line = ann ? `<p class="semstats">${ann.scanned.toLocaleString()} story vectors compared in ${ann.clusters} clusters (${ann.pages} pages, ${tier})${s?.firstMs !== undefined ? `, ${Math.round(s.firstMs)} ms including the query's embedding` : ""}</p>` : "";
+  return `${form}${line}<table class="items">${storyRows(rows, 0, true)}</table>`;
 }
 
 function moreLink(rows: Row[], key: "time" | "score") {
@@ -280,7 +315,7 @@ function put(sel: string, html: string) {
 function render() {
   const active = document.activeElement as HTMLTextAreaElement | null;
   const typing = active?.matches("textarea, input") ? { form: active.closest("form")?.getAttribute("data-parent") ?? (active.closest("[data-submit]") ? "submit" : null), name: active.name, value: active.value, a: active.selectionStart, b: active.selectionEnd } : null;
-  const views: Record<string, () => string> = { comments: commentsView, user: userView, item: threadView, submit: submitView };
+  const views: Record<string, () => string> = { comments: commentsView, user: userView, item: threadView, submit: submitView, semantic: semanticView };
   put("#main", (views[page] ?? listView)());
   put("#me", esc(me));
   put("#foot", footer());

@@ -10,3 +10,4 @@ pub mod overlay;
 pub mod merged;
 pub mod write;
 pub mod ivm;
+pub mod vector;

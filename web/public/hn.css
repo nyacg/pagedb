@@ -37,3 +37,6 @@ h2.uh { color: #000; font-size: 11pt; padding: 0 10px; } h3 { color: #000; font-
 .search input[name=q] { font-size: 9pt; } #foot { margin-top: 8px; } .fine { margin-top: 8px; color: #999; }
 .live { font-size: 8pt; } .live.live { color: #2bb24c; } .live.connecting, .live.offline { color: #d4a017; }
 .hnuser { color: #828282; }
+.semform { padding: 0 10px 8px; } .semform input[name=q] { font: 10pt Verdana; padding: 2px 4px; } .semform select, .semform button { font: 9pt Verdana; }
+.semstats { color: #828282; font-size: 8pt; padding: 0 10px; margin: 0 0 8px; }
+.sim { display: inline-block; width: 28px; height: 6px; background: #e6e2d6; margin-right: 6px; vertical-align: middle; border-radius: 2px; overflow: hidden; } .sim i { display: block; height: 100%; background: #ff6600; }

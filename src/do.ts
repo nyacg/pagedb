@@ -33,6 +33,11 @@ export interface Env {
   /** Concurrent page fetches (6 in a DO; fewer in a container, see node-worker.ts). */
   FETCH_CONCURRENCY?: string;
   ADMIN_TOKEN?: string;
+  /** Workers AI (embeddings for semantic search; see src/embed.ts). */
+  AI?: { run(model: string, input: unknown): Promise<unknown> };
+  EMBED_MODEL?: string;
+  EMBED_URL?: string;
+  EMBED_KEY?: string;
 }
 
 /** The slice of R2 we use, over a real binding or (in a container) the R2 bridge. */
@@ -126,6 +131,9 @@ export class DbObject extends DurableObject<Env> {
   private engine?: Engine;
   private db?: string;
   private base?: string;
+  /** Page ranges built after the base (e.g. a vector index), each in its own R2 directory. */
+  private segments: Segment[] = [];
+  private baseChunkPages?: number;
   private sqliteHits = 0;
   private salt = "";
 
@@ -182,7 +190,7 @@ export class DbObject extends DurableObject<Env> {
       }
       this.ctx.storage.kv.put(`manifest:${db}`, manifest);
     }
-    const m = JSON.parse(manifest) as { base: string; pages: number; pinnedFrom?: number };
+    const m = JSON.parse(manifest) as { base: string; pages: number; pinnedFrom?: number; chunkPages?: number; segments?: Segment[] };
     const engine = new Engine((id, dst) => {
       const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id = ?", id).toArray()[0];
       if (!row) return false;
@@ -198,13 +206,17 @@ export class DbObject extends DurableObject<Env> {
     this.engine = engine;
     this.db = db;
     this.base = m.base;
+    this.segments = m.segments ?? [];
+    this.baseChunkPages = m.chunkPages;
     // Pinned region: small tables + every tree's interior pages, contiguous at the end of the
-    // base. With it resident, a query only ever faults leaves (one round for a list).
-    if (m.pinnedFrom !== undefined) {
+    // base (and of each segment). With it resident, a query only ever faults leaves (one round).
+    const pinned: [number, number][] = [...(m.pinnedFrom !== undefined ? [[m.pinnedFrom, m.pages] as [number, number]] : []), ...this.segments.map((g) => [g.pinnedFrom, g.pages] as [number, number])];
+    if (pinned.length) {
       const ids: number[] = [];
-      for (let id = m.pinnedFrom; id < m.pages; id++) {
-        if (!this.sql.exec("SELECT 1 FROM pages WHERE id = ?", id).toArray().length) ids.push(id);
-      }
+      for (const [from, to] of pinned)
+        for (let id = from; id < to; id++) {
+          if (!this.sql.exec("SELECT 1 FROM pages WHERE id = ?", id).toArray().length) ids.push(id);
+        }
       if (ids.length) {
         const st: QueryStats = { rounds: 0, roundMs: [], pages: 0, chunks: 0, cacheHits: 0, r2Gets: 0, bytes: 0, sqliteHits: 0, r2Ms: [], cacheMs: [], engineMs: 0, fetchMs: 0, totalMs: 0 };
         // Small pinned regions go straight into RAM. A big one (100 GB base: ~73 MB of interior
@@ -278,20 +290,31 @@ export class DbObject extends DurableObject<Env> {
     }
   }
 
-  /** Fetch the chunks holding `ids`, hand the pages to the engine and the SQLite tier. */
+  /** Pages per chunk (the unit of the colo cache and of R2 reads) for the region holding
+   *  `id`: 16 (1 MiB) by default, smaller for indexes read in many small pieces (vectors). */
+  private chunkPages(id: number): number {
+    const g = this.segments.find((g) => id >= g.firstPage && id < g.pages);
+    return (g ? g.chunkPages : this.baseChunkPages) ?? PAGES_PER_CHUNK;
+  }
+
+  /** Fetch the chunks holding `ids`, hand the pages to the engine and the SQLite tier. Chunks
+   *  are named by their first page. */
   private async resolve(ids: number[], stats: QueryStats, all = false, persistNow = false) {
-    const chunks = [...new Set(ids.map((id) => Math.floor(id / PAGES_PER_CHUNK)))].sort((a, b) => a - b);
+    // A round bigger than half the RAM tier could have wanted pages evicted before the retry
+    // reads them; written to SQLite now, they are found there instead (no fault loop).
+    if (ids.length > Number(this.env.RAM_PAGES ?? 512) / 2) persistNow = true;
+    const chunks = [...new Set(ids.map((id) => id - (id % this.chunkPages(id))))].sort((a, b) => a - b);
     stats.pages += ids.length;
     stats.chunks += chunks.length;
     const wanted = new Set(ids);
     // Chunks not already on their way, in runs of neighbours within one part: a run is one
-    // ranged GET (a big scan's pages arrive in a few large reads, not many 1 MiB ones).
-    const part = (c: number) => Math.floor((c * PAGES_PER_CHUNK) / PAGES_PER_PART);
+    // ranged GET (a big scan's pages arrive in a few large reads, not many small ones).
+    const part = (c: number) => Math.floor(c / PAGES_PER_PART);
     const runs: number[][] = [];
     for (const c of chunks) {
       if (this.inflight.has(c)) continue;
       const last = runs.at(-1);
-      if (last && last.at(-1) === c - 1 && part(c) === part(last[0])) last.push(c);
+      if (last && last.at(-1)! + this.chunkPages(c) === c && part(c) === part(last[0])) last.push(c);
       else runs.push([c]);
     }
     for (const run of runs) {
@@ -300,9 +323,8 @@ export class DbObject extends DurableObject<Env> {
     }
     const pending = chunks.map((c) => [c, this.inflight.get(c)!] as const);
     await Promise.all(
-      pending.map(async ([c, p]) => {
+      pending.map(async ([first, p]) => {
         const bytes = await p;
-        const first = c * PAGES_PER_CHUNK;
         for (let i = 0; i * PAGE < bytes.byteLength; i++) {
           const id = first + i;
           const page = new Uint8Array(bytes, i * PAGE, PAGE);
@@ -314,13 +336,22 @@ export class DbObject extends DurableObject<Env> {
     );
   }
 
+  /** R2 key of the part holding page `id` (the base's, or a segment's). */
+  private partKey(id: number): string {
+    const part = Math.floor(id / PAGES_PER_PART);
+    const g = this.segments.find((g) => id >= g.firstPage && id < g.pages);
+    return `db/${g?.db ?? this.db}/base/${g?.base ?? this.base}/part-${String(part).padStart(6, "0")}`;
+  }
+
   /** Neighbouring chunks of one part: each from the city cache if it's there, the rest from R2
-   *  in as few ranged GETs as possible (then cached as 1 MiB chunks). */
+   *  in as few ranged GETs as possible (then cached chunk by chunk). */
   private async fetchRun(run: number[], stats: QueryStats): Promise<Map<number, ArrayBuffer>> {
-    const part = Math.floor((run[0] * PAGES_PER_CHUNK) / PAGES_PER_PART);
-    const key = `db/${this.db}/base/${this.base}/part-${String(part).padStart(6, "0")}`;
-    const offsetOf = (c: number) => ((c * PAGES_PER_CHUNK) % PAGES_PER_PART) * PAGE;
-    const cacheUrl = (c: number) => `https://pagedb.cache/${key}/${offsetOf(c)}${this.salt ? `?s=${this.salt}` : ""}`;
+    const key = this.partKey(run[0]);
+    const cp = this.chunkPages(run[0]);
+    const CHUNK = cp * PAGE;
+    const offsetOf = (c: number) => (c % PAGES_PER_PART) * PAGE;
+    // (1 MiB chunks keep their original cache keys; other sizes are named by size too.)
+    const cacheUrl = (c: number) => `https://pagedb.cache/${key}/${offsetOf(c)}${cp === PAGES_PER_CHUNK ? "" : `-${cp}`}${this.salt ? `?s=${this.salt}` : ""}`;
     const out = new Map<number, ArrayBuffer>();
     const cache = await openCache();
     if (cache) {
@@ -337,7 +368,6 @@ export class DbObject extends DurableObject<Env> {
         }),
       );
     }
-    const CHUNK = PAGES_PER_CHUNK * PAGE;
     for (let i = 0; i < run.length; ) {
       if (out.has(run[i])) {
         i++;
@@ -360,6 +390,60 @@ export class DbObject extends DurableObject<Env> {
       i = j + 1;
     }
     return out;
+  }
+
+  /**
+   * Prewarm: copy page ranges (by default every segment, e.g. a vector index) into the SQLite
+   * tier in the background, whole 4 MiB parts at a time, so queries over them never wait on
+   * the network. Runs from the alarm in slices; the state survives restarts.
+   */
+  async prewarm(db: string, from?: number, to?: number) {
+    await this.ensure(db);
+    const ranges: [number, number][] = from !== undefined && to !== undefined ? [[from, to]] : this.segments.map((g) => [g.firstPage, g.pages]);
+    if (!ranges.length) return { error: "nothing to prewarm (no segments)" };
+    const st: Prewarm = { db, ranges, ri: 0, next: ranges[0][0], pages: 0, skipped: 0, started: Date.now() };
+    this.ctx.storage.kv.put("prewarm", st);
+    await this.ctx.storage.setAlarm(Date.now());
+    return st;
+  }
+
+  async alarm() {
+    const st = this.ctx.storage.kv.get<Prewarm>("prewarm");
+    if (!st || st.finished) return;
+    await this.ensure(st.db);
+    const deadline = Date.now() + 20_000;
+    const PAR = 3; // leave connections for queries
+    while (st.ri < st.ranges.length && Date.now() < deadline) {
+      const [, end] = st.ranges[st.ri];
+      const parts: number[] = [];
+      for (let id = st.next; id < end && parts.length < PAR; id = (Math.floor(id / PAGES_PER_PART) + 1) * PAGES_PER_PART) parts.push(id);
+      await Promise.all(
+        parts.map(async (first) => {
+          const last = Math.min(end, (Math.floor(first / PAGES_PER_PART) + 1) * PAGES_PER_PART);
+          const have = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages WHERE id >= ? AND id < ?", first, last).one().n;
+          if (have === last - first) {
+            st.skipped += have;
+            return;
+          }
+          const p0 = Math.floor(first / PAGES_PER_PART) * PAGES_PER_PART;
+          const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(this.partKey(first), { range: { offset: (first - p0) * PAGE, length: (last - first) * PAGE } });
+          if (!obj) throw new Error(`missing ${this.partKey(first)}`);
+          const buf = await obj.arrayBuffer();
+          this.ctx.storage.transactionSync(() => {
+            for (let i = 0; i * PAGE < buf.byteLength; i++) this.sql.exec("INSERT OR IGNORE INTO pages (id, data) VALUES (?, ?)", first + i, new Uint8Array(buf, i * PAGE, PAGE));
+          });
+          st.pages += buf.byteLength / PAGE;
+        }),
+      );
+      st.next = parts.length ? Math.min(end, (Math.floor(parts.at(-1)! / PAGES_PER_PART) + 1) * PAGES_PER_PART) : end;
+      if (st.next >= end) {
+        st.ri++;
+        if (st.ri < st.ranges.length) st.next = st.ranges[st.ri][0];
+      }
+    }
+    if (st.ri >= st.ranges.length) st.finished = Date.now();
+    this.ctx.storage.kv.put("prewarm", st);
+    if (!st.finished) await this.ctx.storage.setAlarm(Date.now() + 100);
   }
 
   /** Run an engine call to completion, resolving page faults. */
@@ -484,7 +568,7 @@ export class DbObject extends DurableObject<Env> {
         ws.send(JSON.stringify({ t: "error", id: x.id, message: String((e as Error).message ?? e) }));
       }
     }
-    const done: { id: string; q: string; r: { pid: number; rows?: unknown[]; complete?: boolean; count?: number } }[] = [];
+    const done: { id: string; q: string; r: { pid: number; rows?: unknown[]; complete?: boolean; count?: number; ann?: unknown } }[] = [];
     while (pending.length) {
       const faults = new Set<number>();
       for (let i = pending.length - 1; i >= 0; i--) {
@@ -511,7 +595,7 @@ export class DbObject extends DurableObject<Env> {
       this.untrack(cid, d.id);
       this.track(cid, d.id, d.r.pid);
     }
-    ws.send(JSON.stringify({ t: "snaps", version, stats: round(stats), list: done.map((d) => ({ id: d.id, rows: d.r.rows, complete: d.r.complete, count: d.r.count })) }));
+    ws.send(JSON.stringify({ t: "snaps", version, stats: round(stats), list: done.map((d) => ({ id: d.id, rows: d.r.rows, complete: d.r.complete, count: d.r.count, ann: d.r.ann })) }));
     for (const d of done) this.persistLater(() => this.sql.exec("INSERT OR REPLACE INTO subs (cid, id, q) VALUES (?, ?, ?)", cid, d.id, d.q));
   }
 
@@ -660,6 +744,13 @@ export class DbObject extends DurableObject<Env> {
     return { cleared: before, version };
   }
 
+  /** Read the manifest again (e.g. a segment was attached); pages already held stay valid. */
+  async remanifest() {
+    if (this.db) this.ctx.storage.kv.delete(`manifest:${this.db}`);
+    this.engine = undefined;
+    return { ok: true };
+  }
+
   /** Drop the SQLite page tier and the engine (cold benchmarks). */
   async reset() {
     this.sql.exec("DELETE FROM pages");
@@ -695,6 +786,20 @@ export class DbObject extends DurableObject<Env> {
     return out;
   }
 
+  /** SQLite page-tier microbenchmark: read `n` pages (ids from the table) `how` ways. The
+   *  object's clock doesn't advance during synchronous work, so callers time it from outside. */
+  async sqliteBench(n: number, how: "one" | "batch" | "ids") {
+    const ids = this.sql.exec<{ id: number }>("SELECT id FROM pages ORDER BY id LIMIT ?", n).toArray().map((r) => r.id);
+    let bytes = 0;
+    if (how === "one") for (const id of ids) bytes += this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id = ?", id).toArray()[0].data.byteLength;
+    else if (how === "batch")
+      for (let i = 0; i < ids.length; i += 100) {
+        const part = ids.slice(i, i + 100);
+        for (const r of this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM pages WHERE id IN (${part.map(() => "?").join(",")})`, ...part)) bytes += r.data.byteLength;
+      }
+    return { n: ids.length, bytes };
+  }
+
   /** Evict this object from memory, keeping its storage (measures wake from hibernation). */
   async evict() {
     this.ctx.abort("evicted for a benchmark");
@@ -711,7 +816,7 @@ export class DbObject extends DurableObject<Env> {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
     const log = { rows: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n, legacyEntries: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n };
-    return { db: this.db, base: this.base, overlayLog: log, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
+    return { db: this.db, base: this.base, segments: this.segments.map(({ db, base, firstPage, pages }) => ({ db, base, firstPage, pages })), prewarm: this.ctx.storage.kv.get("prewarm"), overlayLog: log, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
   }
 }
 
@@ -722,6 +827,29 @@ function newStats(): QueryStats {
 function round(s: QueryStats): QueryStats {
   for (const k of ["engineMs", "fetchMs", "totalMs"] as const) s[k] = +s[k].toFixed(2);
   return s;
+}
+
+/** Pages [firstPage, pages) of a base live in db/<db>/base/<base>/ (their pinned region from
+ *  pinnedFrom), numbered as if they continued the base. */
+interface Segment {
+  /** Another database's directory (a segment shared by several bases), else this one's. */
+  db?: string;
+  base: string;
+  firstPage: number;
+  pages: number;
+  pinnedFrom: number;
+  chunkPages?: number;
+}
+
+interface Prewarm {
+  db: string;
+  ranges: [number, number][];
+  ri: number;
+  next: number;
+  pages: number;
+  skipped: number;
+  started: number;
+  finished?: number;
 }
 
 // ---------------------------------------------------------------- live queries over WebSockets

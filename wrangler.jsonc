@@ -8,6 +8,8 @@
   "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }, { "name": "HN_TAIL", "class_name": "HnTail" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DbObject"] }, { "tag": "v2", "new_sqlite_classes": ["HnTail"] }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+  // Embeddings for semantic search (src/embed.ts).
+  "ai": { "binding": "AI" },
   // 09:00 UTC: the tracker demo resets; every minute: keep the Hacker News tail alive.
   "triggers": { "crons": ["0 9 * * *", "* * * * *"] },
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
@@ -21,6 +23,7 @@
       "name": "pagedb-preview",
       "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }, { "name": "HN_TAIL", "class_name": "HnTail" }] },
       "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+      "ai": { "binding": "AI" },
       "triggers": { "crons": ["* * * * *"] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi" }

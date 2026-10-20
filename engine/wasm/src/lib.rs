@@ -287,6 +287,9 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
         Ok(t) => t,
         Err(_) => return error("query is not UTF-8"),
     };
+    if is_ann(text) {
+        return ann_query(text);
+    }
     let plan = DB.with(|d| {
         let mut d = d.borrow_mut();
         let db = d.as_mut()?;
@@ -336,6 +339,36 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
     })
 }
 
+// ------------------------------------------------------------------ vector search
+
+/// A vector query (`{"ann":{…}}`)? Checked on the text so ordinary queries skip a parse.
+fn is_ann(text: &str) -> bool {
+    text.contains("\"ann\"")
+        && serde_json::from_str::<serde_json::Value>(text).map_or(false, |a| a.get("ann").is_some())
+}
+
+/// Run a vector query. OK payload: {"rows":[…],"complete":true,"ann":{clusters,pages,scanned,overlay}}.
+fn ann_query(text: &str) -> u32 {
+    let guard = DB.with(|d| d.as_ptr());
+    let db = match unsafe { (*guard).as_ref() } {
+        Some(db) => db,
+        None => return error("engine not initialized"),
+    };
+    let ast: serde_json::Value = match serde_json::from_str(text) {
+        Ok(a) => a,
+        Err(e) => return error(format!("bad query JSON: {e}")),
+    };
+    let aq = match pagedb_core::vector::compile(&db.roots, &ast) {
+        Ok(q) => q,
+        Err(e) => return error(e),
+    };
+    let store = Tiers;
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    let r = pagedb_core::vector::search(&ctx, &db.roots, &aq);
+    finish(&ctx, r, |(hits, stats)| pagedb_core::vector::output_json(&hits, &stats).into_bytes())
+}
+
 // ------------------------------------------------------------------ live queries and writes
 
 fn plan_for(db: &mut Db, text: &str) -> Result<Rc<pagedb_core::query::Plan>, String> {
@@ -380,6 +413,17 @@ pub unsafe extern "C" fn subscribe(ptr: *const u8, len: u32) -> u32 {
         Some(db) => db,
         None => return error("engine not initialized"),
     };
+    if is_ann(&text) {
+        // Not live yet: answered once, with pid 0 (unsubscribing it is a no-op).
+        let status = ann_query(&text);
+        if status == 0 {
+            let body = OUT.with(|o| o.borrow().clone());
+            let mut out = b"{\"pid\":0,".to_vec();
+            out.extend_from_slice(&body[1..]);
+            set_out(out);
+        }
+        return status;
+    }
     let plan = match plan_for(db, &text) {
         Ok(p) => p,
         Err(e) => return error(e),
