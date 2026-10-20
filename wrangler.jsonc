@@ -23,7 +23,7 @@
       "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
       "triggers": { "crons": ["* * * * *"] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
-      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn-small", "HN_OBJ": "hn-small", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi-small", "TAXI_OBJ": "taxi-small" }
+      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi-small", "TAXI_OBJ": "taxi-small" }
     }
   }
 }

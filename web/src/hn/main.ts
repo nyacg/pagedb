@@ -48,10 +48,12 @@ function ago(t: number) {
 function clean(html: string | null | undefined): string {
   if (!html) return "";
   const doc = new DOMParser().parseFromString(`<div>${html.replace(/<p>/g, "</p><p>")}</div>`, "text/html");
-  const walk = (n: Node): string => {
+  // (Depth-capped: some comments' markup nests absurdly deep; past that, plain text.)
+  const walk = (n: Node, depth = 0): string => {
     if (n.nodeType === Node.TEXT_NODE) return esc(n.textContent);
     if (!(n instanceof Element)) return "";
-    const inner = [...n.childNodes].map(walk).join("");
+    if (depth > 40) return esc(n.textContent);
+    const inner = [...n.childNodes].map((c) => walk(c, depth + 1)).join("");
     const tag = n.tagName.toLowerCase();
     if (tag === "a") {
       const href = n.getAttribute("href") ?? "";
@@ -60,7 +62,7 @@ function clean(html: string | null | undefined): string {
     if (["p", "i", "pre", "code", "b"].includes(tag)) return `<${tag}>${inner}</${tag}>`;
     return inner;
   };
-  return [...doc.body.firstChild!.childNodes].map(walk).join("").replace(/<p><\/p>/g, "");
+  return [...doc.body.firstChild!.childNodes].map((c) => walk(c)).join("").replace(/<p><\/p>/g, "");
 }
 
 const itemLink = (id: string, text: string) => `<a href="?p=item&id=${esc(id)}">${text}</a>`;
@@ -169,6 +171,7 @@ function commentsView() {
 
 function userView() {
   const id = params.get("id") ?? "";
+  if (!sync.get("ustories")?.ready || !sync.get("ucomments")?.ready) return `<h2 class="uh">${esc(id)}</h2><p class="note">Loading…</p>`;
   const st = sync.view("ustories").sort((a, b) => b.time - a.time);
   const cm = sync.view("ucomments").sort((a, b) => b.time - a.time);
   return `<h2 class="uh">${esc(id)}</h2><h3>Submissions</h3>${st.length ? `<table class="items">${storyRows(st, 0)}</table>` : `<p class="note">None loaded.</p>`}
@@ -195,7 +198,12 @@ function threadView() {
     if (c) location.replace(`?p=item&id=${encodeURIComponent(c.storyId)}&focus=${encodeURIComponent(c.id)}`);
     return `<p class="note">${s?.ready && sync.get("lookup")?.ready ? "No such item." : "Loading…"}</p>`;
   }
-  const comments: Row[] = [...(story.comments ?? []), ...extra.filter((e) => !(story.comments ?? []).some((c: Row) => c.id === e.id))];
+  // Big threads: the first 1000 come with the story; the newest (and new replies, live) from
+  // "latest"; anything between, on demand.
+  if ((story.descendants ?? 0) > (story.comments?.length ?? 0) && !sync.get("latest")) sync.sub("latest", { name: "latest", args: { story: story.id } });
+  const byId = new Map<string, Row>();
+  for (const c of [...(story.comments ?? []), ...extra, ...sync.view("latest")]) byId.set(c.id, c);
+  const comments: Row[] = [...byId.values()];
   const kids = new Map<string, Row[]>();
   const ids = new Set(comments.map((c) => c.id));
   for (const c of comments) {
@@ -218,7 +226,7 @@ function threadView() {
   walk(story.id, 0);
   const dom = story.domain ? ` <span class="sitebit">(<a href="?p=from&site=${esc(story.domain)}">${esc(story.domain)}</a>)</span>` : "";
   const loaded = comments.length;
-  const more = loaded < (story.descendants ?? 0) && loaded >= 1000 ? `<p><a data-more class="morelink">Load more comments (${loaded} of ${story.descendants})</a></p>` : "";
+  const more = loaded < (story.descendants ?? 0) && (story.comments?.length ?? 0) >= 1000 ? `<p><a data-more class="morelink">Load more comments (${loaded} of ${story.descendants})</a></p>` : "";
   return `<table class="items fatitem"><tr class="athing"><td class="votelinks"><a class="votearrow${voted.has(story.id) ? " voted" : ""}" data-vote="${esc(story.id)}"></a></td>
       <td class="titleline"><a href="${story.url ? esc(story.url) : "#"}" rel="nofollow noreferrer" target="_blank">${esc(story.title)}</a>${dom}</td></tr>
       <tr><td></td><td class="subtext"><span class="score">${story.score} points</span> by ${userLink(story.by)} ${ago(story.time)} | ${story.descendants ?? 0} comments</td></tr>

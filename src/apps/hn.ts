@@ -113,6 +113,10 @@ export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
         a.start,
         ["time", "id"],
       );
+    case "latest":
+      // The newest comments of a thread (big threads: the first 1000 are in "item"; new replies
+      // arrive here, live).
+      return { table: "comment", where: eq("storyId", need(typeof a.story === "string" && ID.test(a.story), a.story, "story")), orderBy: [["time", "desc"], ["id", "desc"]], limit: limit(a.limit, 200, 500) };
     case "comment":
       return { table: "comment", where: eq("id", need(typeof a.id === "string" && ID.test(a.id), a.id, "comment")), one: true };
   }
