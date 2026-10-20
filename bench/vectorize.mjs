@@ -1,9 +1,10 @@
 // Vectorize side of the pagevec benchmark (spikes/vectorize-bench).
 //   node bench/vectorize.mjs load <prefix> <shards> [--from 0] [--par 4]   load PVEC shards
+//       (shards already loaded, per data/vectorize-loaded.json, are skipped; missing ones too)
 //   node bench/vectorize.mjs info
 //   node bench/vectorize.mjs query <gt.json> [--n 50] [--filter]           recall@10 + latency
 //   node bench/vectorize.mjs visibility [--n 5]                             write → visible
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const opt = (k, d) => (args.includes(k) ? args[args.indexOf(k) + 1] : d);
@@ -32,13 +33,19 @@ if (cmd === "load") {
   const [prefix, shards] = [args[1], Number(args[2])];
   const from = Number(opt("--from", 0));
   const par = Number(opt("--par", 4));
+  const log = "data/vectorize-loaded.json";
+  const loaded = new Set(existsSync(log) ? JSON.parse(readFileSync(log, "utf8")) : []);
   let next = from;
   let done = 0;
   const t0 = Date.now();
   await Promise.all(
     Array.from({ length: par }, async () => {
       for (let s = next++; s < shards; s = next++) {
-        const r = await call(`/load?prefix=${encodeURIComponent(prefix)}&shard=${s}`, {});
+        if (loaded.has(s)) continue;
+        const r = await fetch(`${url}/load?prefix=${encodeURIComponent(prefix)}&shard=${s}`, { method: "POST", headers: auth }).then((x) => x.json()).catch((e) => ({ error: String(e) }));
+        if (r.error) continue; // not embedded yet (or a transient error): next run
+        loaded.add(s);
+        writeFileSync(log, JSON.stringify([...loaded].sort((a, b) => a - b)));
         done += r.vectors;
         process.stdout.write(`\rshard ${s}: ${done} vectors upserted, ${(done / ((Date.now() - t0) / 1000)).toFixed(0)}/s   `);
       }
@@ -75,7 +82,7 @@ if (cmd === "visibility") {
   const n = Number(opt("--n", 5));
   const rows = [];
   for (let i = 0; i < n; i++) {
-    const v = unit(Array.from({ length: 512 }, () => Math.random() - 0.5));
+    const v = unit(Array.from({ length: 1024 }, () => Math.random() - 0.5));
     const r = await call("/visibility", { vec: v, id: `probe-${Date.now()}-${i}` });
     rows.push(r);
     console.log(JSON.stringify(r));

@@ -194,13 +194,26 @@ export class DbObject extends DurableObject<Env> {
       this.ctx.storage.kv.put(`manifest:${db}`, manifest);
     }
     const m = JSON.parse(manifest) as { base: string; baseDb?: string; pages: number; pinnedFrom?: number; chunkPages?: number; segments?: Segment[] };
-    const engine = new Engine((id, dst) => {
-      const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id = ?", id).toArray()[0];
-      if (!row) return false;
-      dst.set(new Uint8Array(row.data));
-      this.sqliteHits++;
-      return true;
-    });
+    const engine = new Engine(
+      (id, dst) => {
+        const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id = ?", id).toArray()[0];
+        if (!row) return false;
+        dst.set(new Uint8Array(row.data));
+        this.sqliteHits++;
+        return true;
+      },
+      // A search about to read many pages: one statement per 100 (about twice as fast as one
+      // statement per page, measured).
+      (ids, put) => {
+        for (let i = 0; i < ids.length; i += 100) {
+          const part = ids.slice(i, i + 100);
+          for (const r of this.sql.exec<{ id: number; data: ArrayBuffer }>(`SELECT id, data FROM pages WHERE id IN (${part.map(() => "?").join(",")})`, ...part)) {
+            put(r.id, new Uint8Array(r.data));
+            this.sqliteHits++;
+          }
+        }
+      },
+    );
     engine.init(manifest);
     engine.setRamBudget(Number(this.env.RAM_PAGES ?? 512)); // 512 = 32 MiB (a DO); GBs in a container
     const { records, version, logRows } = this.readOverlay(db);

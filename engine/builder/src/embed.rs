@@ -3,8 +3,9 @@
 //!   pagedb-builder embed --text story --prefix vec/<model>/stories [--batch 100] [--threads 32]
 //!       [--rpm 2800] [--shard 16384] [--limit N] [--from-shard A] [--to-shard B] < rows.ndjson
 //!
-//! `--from-shard`/`--to-shard` split one stream between several jobs (each skips the rows of
-//! the others' shards; a shard another job already wrote is skipped too).
+//! `--from-shard`/`--to-shard` split one stream between several jobs, and jobs may overlap: a
+//! job claims a shard (`shard-N.claim`) before embedding it and skips shards that are claimed
+//! or written. A job that dies leaves a claim behind; `--ignore-claims` fills such holes.
 //!
 //! Rows (JSON lines, in a stable order) are cut into shards of `--shard` rows. Each shard is
 //! embedded in batches, `--threads` requests in flight under a requests-per-minute budget, and
@@ -280,6 +281,7 @@ pub fn run(args: &[String]) {
     let limit: u64 = arg("--limit").map(|v| v.parse().unwrap()).unwrap_or(u64::MAX);
     let from_shard: usize = arg("--from-shard").map(|v| v.parse().unwrap()).unwrap_or(0);
     let to_shard: usize = arg("--to-shard").map(|v| v.parse().unwrap()).unwrap_or(usize::MAX);
+    let ignore_claims = args.iter().any(|a| a == "--ignore-claims");
     assert_eq!(arg("--text").as_deref().unwrap_or("story"), "story", "only story text is defined");
     let e = from_env();
     let bucket = Bucket { next: Mutex::new(Instant::now()), gap: Duration::from_micros(60_000_000 / rpm.max(1)) };
@@ -314,10 +316,12 @@ pub fn run(args: &[String]) {
         if n_shard - 1 >= to_shard {
             break;
         }
-        if exists(&key) {
+        let claim = format!("{key}.claim");
+        if exists(&key) || (!ignore_claims && exists(&claim)) {
             skipped.fetch_add(rows.len() as u64, Ordering::Relaxed);
             continue;
         }
+        put(&claim, b"1");
         let texts: Vec<String> = rows.iter().map(|l| story_text(&serde_json::from_str::<J>(l).unwrap_or(J::Null))).map(|t| if t.trim().is_empty() { "(untitled)".to_string() } else { t }).collect();
         tokens.fetch_add(texts.iter().map(|t| t.len() as u64 / 4 + 1).sum(), Ordering::Relaxed);
         let batches: Vec<&[String]> = texts.chunks(batch).collect();

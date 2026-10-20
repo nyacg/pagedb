@@ -52,6 +52,16 @@ function decode(buf: ArrayBuffer): { row: any; vec: number[] }[] {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    try {
+      return await handle(req, env);
+    } catch (e) {
+      return Response.json({ error: String((e as Error).stack ?? e) }, { status: 500 });
+    }
+  },
+};
+
+async function handle(req: Request, env: Env): Promise<Response> {
+  {
     if (!env.ADMIN_TOKEN || req.headers.get("authorization") !== `Bearer ${env.ADMIN_TOKEN}`) return new Response("unauthorized", { status: 401 });
     const url = new URL(req.url);
     if (url.pathname === "/info") return Response.json(await env.VEC.describe());
@@ -89,5 +99,5 @@ export default {
       return Response.json({ id, ackMs: acked, visibleMs: null });
     }
     return new Response("not found", { status: 404 });
-  },
-};
+  }
+}

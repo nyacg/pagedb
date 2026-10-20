@@ -17,6 +17,7 @@ interface Exports {
   init(ptr: number, len: number): number;
   query(ptr: number, len: number): number;
   page_put(lo: number, hi: number, ptr: number): number;
+  page_put_trusted(lo: number, hi: number, ptr: number): void;
   set_ram_budget(pages: number): void;
   stats(): number;
   subscribe(ptr: number, len: number): number;
@@ -32,12 +33,18 @@ const dec = new TextDecoder();
 export class Engine {
   private x: Exports;
 
-  /** `pageGet` = the synchronous tier below RAM (DO SQLite): fill `dst` and return true if held. */
-  constructor(pageGet: (id: number, dst: Uint8Array) => boolean) {
+  /** `pageGet` = the synchronous tier below RAM (DO SQLite): fill `dst` and return true if held.
+   *  `pagesGet` (optional) = the same for many pages at once, calling `put` for each one held. */
+  constructor(pageGet: (id: number, dst: Uint8Array) => boolean, pagesGet?: (ids: number[], put: (id: number, page: Uint8Array) => void) => void) {
     const instance = new WebAssembly.Instance(wasmModule, {
       host: {
         host_page_get: (lo: number, hi: number, dst: number) =>
           pageGet(hi * 2 ** 32 + lo, new Uint8Array(this.x.memory.buffer, dst, PAGE)) ? 1 : 0,
+        host_pages_prefetch: (ptr: number, n: number) => {
+          if (!pagesGet) return;
+          const ids = [...new BigUint64Array(this.x.memory.buffer, ptr, n)].map(Number);
+          pagesGet(ids, (id, page) => this.withBytes(page, (p) => this.x.page_put_trusted(id % 2 ** 32, Math.floor(id / 2 ** 32), p)));
+        },
       },
     });
     this.x = instance.exports as unknown as Exports;

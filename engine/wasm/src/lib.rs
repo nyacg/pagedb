@@ -22,6 +22,9 @@ use std::rc::Rc;
 extern "C" {
     /// Copy page `id` into `dst` (PAGE_SIZE bytes) if the host's synchronous tier has it.
     fn host_page_get(id_lo: u32, id_hi: u32, dst: *mut u8) -> u32;
+    /// Pages (u64 ids at `ids`) about to be read: the host loads the ones its synchronous tier
+    /// has in batches, handing each back through `page_put_trusted`.
+    fn host_pages_prefetch(ids: *const u64, n: u32);
 }
 
 // ------------------------------------------------------------------ RAM tier
@@ -81,6 +84,16 @@ thread_local! {
 struct Tiers;
 
 impl PageStore for Tiers {
+    fn prefetch(&self, ids: &[PageId]) {
+        let missing: Vec<u64> = RAM.with(|r| {
+            let r = r.borrow();
+            ids.iter().copied().filter(|id| !r.pages.contains_key(id)).collect()
+        });
+        if missing.len() > 8 {
+            unsafe { host_pages_prefetch(missing.as_ptr(), missing.len() as u32) };
+        }
+    }
+
     fn get(&self, id: PageId) -> Option<Rc<[u8]>> {
         let hit = RAM.with(|r| {
             let mut r = r.borrow_mut();
@@ -152,6 +165,18 @@ pub unsafe extern "C" fn page_put(id_lo: u32, id_hi: u32, ptr: *const u8) -> u32
     let id = (id_hi as u64) << 32 | id_lo as u64;
     RAM.with(|r| r.borrow_mut().insert(id, bytes.to_vec().into()));
     1
+}
+
+/// A page from the host's own synchronous tier (checked when it first arrived): no checksum.
+#[no_mangle]
+pub unsafe extern "C" fn page_put_trusted(id_lo: u32, id_hi: u32, ptr: *const u8) {
+    let bytes = std::slice::from_raw_parts(ptr, PAGE_SIZE);
+    let id = (id_hi as u64) << 32 | id_lo as u64;
+    RAM.with(|r| {
+        let mut r = r.borrow_mut();
+        r.host_hits += 1;
+        r.insert(id, bytes.to_vec().into())
+    });
 }
 
 #[no_mangle]

@@ -170,6 +170,8 @@ pub fn separator(prev: &[u8], next: &[u8]) -> Vec<u8> {
 /// A synchronous page tier (RAM, DO SQLite). `None` = not resident here.
 pub trait PageStore {
     fn get(&self, id: PageId) -> Option<Rc<[u8]>>;
+    /// A hint: these pages are about to be read (a tier below RAM can load them in one batch).
+    fn prefetch(&self, _ids: &[PageId]) {}
 }
 
 /// The page we needed isn't resident; its id has been recorded in `Ctx::want`.
@@ -207,6 +209,9 @@ impl<'a> Ctx<'a> {
 
     /// Ask for all of `ids`; Ok only if every one is resident (misses are all recorded).
     pub fn get_all(&self, ids: &[PageId]) -> Result<Vec<Rc<[u8]>>, Miss> {
+        if ids.len() > 8 {
+            self.store.prefetch(ids);
+        }
         let mut out = Vec::with_capacity(ids.len());
         let mut missed = false;
         for &id in ids {
