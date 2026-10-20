@@ -14,11 +14,11 @@ BUILDER="${BUILDER:-pagedb-builder}"
 YEAR="${YEAR:-2015}"
 OUT="${OUT:-/data/out}"
 WORK="${WORK:-/data/work}"
-MEM="${MEM:-5000}"
+MEM="${MEM:-4000}"
 mkdir -p "$WORK" "$OUT"
 DB="$WORK/taxi.duckdb"
 rm -f "$DB" "$DB.wal"
-duck() { "$DUCKDB" "$DB" -c "SET memory_limit='${DUCK_MEM:-5GB}'; SET threads=4; SET preserve_insertion_order=true; SET temp_directory='$WORK/duck-tmp'; LOAD httpfs; $1"; }
+duck() { "$DUCKDB" "$DB" -c "SET memory_limit='${DUCK_MEM:-3GB}'; SET threads=4; SET preserve_insertion_order=true; SET temp_directory='$WORK/duck-tmp'; LOAD httpfs; $1"; }
 "$DUCKDB" -c "INSTALL httpfs;" >/dev/null
 files=$(for m in 01 02 03 04 05 06 07 08 09 10 11 12; do printf "'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_%s-%s.parquet'," "$YEAR" "$m"; done)
 duck "CREATE TABLE zone AS SELECT LocationID::VARCHAR AS id, Borough AS borough, Zone AS zone, service_zone AS service
