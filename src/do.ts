@@ -77,6 +77,9 @@ const PAGES_PER_PART = 64;
 const PAGES_PER_CHUNK = 16; // 1 MiB: R2 latency is flat up to ~1 MiB, so over-fetch is free
 const CONCURRENCY = 6; // a DO request may hold 6 outgoing connections
 const MAX_ROUNDS = 16;
+/** Overlay log: rows stay well under SQLite's 2 MB limit; compact after this many rows. */
+const LOG_ROW_BYTES = 1_500_000;
+const COMPACT_AT = 5_000;
 
 export interface QueryStats {
   rounds: number;
@@ -117,6 +120,8 @@ export class DbObject extends DurableObject<Env> {
   private gate: Gate;
   /** Chunks being fetched right now: concurrent faults on the same chunk share one GET. */
   private inflight = new Map<number, Promise<ArrayBuffer>>();
+  /** Rows in the overlay log since its last compaction. */
+  private logRows = 0;
   private live: Live = { subs: new Map(), pidOf: new Map() };
   private engine?: Engine;
   private db?: string;
@@ -131,6 +136,11 @@ export class DbObject extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS pages (id INTEGER PRIMARY KEY, data BLOB NOT NULL)");
     // Writes since the base: durable here on acknowledgement (like any DO write).
     this.sql.exec("CREATE TABLE IF NOT EXISTS ovl (tree INTEGER NOT NULL, key BLOB NOT NULL, val BLOB, delta INTEGER NOT NULL, PRIMARY KEY (tree, key)) WITHOUT ROWID");
+    // The overlay as a log: one row per write (all its index entries, encoded), compacted now
+    // and then. SQLite rows written are billed per row whatever their size, so one row per write
+    // instead of one per entry (~7) keeps a busy object inside the free allowance. (`ovl` above
+    // is the old one-row-per-entry form: still loaded, and emptied by the first compaction.)
+    this.sql.exec("CREATE TABLE IF NOT EXISTS ovlog (seq INTEGER PRIMARY KEY, recs BLOB NOT NULL, version INTEGER NOT NULL)");
     // Live subscriptions, so they survive hibernation: (socket id, client query id) → AST.
     this.sql.exec("CREATE TABLE IF NOT EXISTS subs (cid TEXT NOT NULL, id TEXT NOT NULL, q TEXT NOT NULL, PRIMARY KEY (cid, id))");
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"t":"ping"}', '{"t":"pong"}'));
@@ -182,11 +192,9 @@ export class DbObject extends DurableObject<Env> {
     });
     engine.init(manifest);
     engine.setRamBudget(Number(this.env.RAM_PAGES ?? 512)); // 512 = 32 MiB (a DO); GBs in a container
-    const recs: OvRecord[] = this.sql
-      .exec<{ tree: number; key: ArrayBuffer; val: ArrayBuffer | null; delta: number }>("SELECT tree, key, val, delta FROM ovl")
-      .toArray()
-      .map((r) => ({ tree: r.tree, key: new Uint8Array(r.key), kind: 1, delta: r.delta, val: r.val ? new Uint8Array(r.val) : null }));
-    engine.loadOverlay(encodeRecords(recs), this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0);
+    const { records, version, logRows } = this.readOverlay(db);
+    engine.loadOverlay(records, version);
+    this.logRows = logRows;
     this.engine = engine;
     this.db = db;
     this.base = m.base;
@@ -517,6 +525,71 @@ export class DbObject extends DurableObject<Env> {
   }
 
   /** Apply a batch of row ops. Durable before the version is returned and the pokes go out. */
+  /** The persisted overlay: old per-entry rows, then the log in order (later records win). */
+  private readOverlay(db: string): { records: Uint8Array; version: number; logRows: number } {
+    const legacy: OvRecord[] = this.sql
+      .exec<{ tree: number; key: ArrayBuffer; val: ArrayBuffer | null; delta: number }>("SELECT tree, key, val, delta FROM ovl")
+      .toArray()
+      .map((r) => ({ tree: r.tree, key: new Uint8Array(r.key), kind: 1, delta: r.delta, val: r.val ? new Uint8Array(r.val) : null }));
+    const parts: Uint8Array[] = [encodeRecords(legacy)];
+    let version = this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0;
+    let logRows = 0;
+    for (const r of this.sql.exec<{ recs: ArrayBuffer; version: number }>("SELECT recs, version FROM ovlog ORDER BY seq").toArray()) {
+      parts.push(new Uint8Array(r.recs));
+      version = Math.max(version, r.version);
+      logRows++;
+    }
+    const records = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) (records.set(p, at), (at += p.length));
+    return { records, version, logRows };
+  }
+
+  /** Append encoded overlay records as log rows (split under SQLite's 2 MB row limit). */
+  private appendLog(records: Uint8Array, version: number) {
+    if (records.length <= LOG_ROW_BYTES) {
+      this.sql.exec("INSERT INTO ovlog (recs, version) VALUES (?, ?)", records, version);
+      this.logRows++;
+      return;
+    }
+    let chunk: OvRecord[] = [];
+    let size = 0;
+    for (const r of decodeRecords(records)) {
+      const n = 13 + r.key.length + (r.val?.length ?? 0);
+      if (size + n > LOG_ROW_BYTES && chunk.length) {
+        this.sql.exec("INSERT INTO ovlog (recs, version) VALUES (?, ?)", encodeRecords(chunk), version);
+        this.logRows++;
+        (chunk = []), (size = 0);
+      }
+      chunk.push(r);
+      size += n;
+    }
+    if (chunk.length) {
+      this.sql.exec("INSERT INTO ovlog (recs, version) VALUES (?, ?)", encodeRecords(chunk), version);
+      this.logRows++;
+    }
+  }
+
+  /** Collapse the log (and any old per-entry rows) into the current state: a few big rows. */
+  compactOverlay() {
+    const db = this.db ?? this.ctx.storage.kv.get<string>("boundDb");
+    if (!db) return { compacted: false };
+    const { records, version, logRows } = this.readOverlay(db);
+    const state = new Map<string, OvRecord>();
+    for (const r of decodeRecords(records)) {
+      const k = `${r.tree}:${Array.from(r.key, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+      if (r.kind === 0) state.delete(k);
+      else state.set(k, r);
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec("DELETE FROM ovlog");
+      this.sql.exec("DELETE FROM ovl");
+      this.logRows = 0;
+      this.appendLog(encodeRecords([...state.values()]), version);
+    });
+    return { compacted: true, logRows, entries: state.size, rows: this.logRows };
+  }
+
   async write(db: string, ops: unknown): Promise<{ version: number; changes: number; ms: number; rounds: number } | { error: string }> {
     const t0 = performance.now();
     await this.ensure(db);
@@ -529,14 +602,9 @@ export class DbObject extends DurableObject<Env> {
     }
     const jsonLen = new DataView(out.buffer, out.byteOffset).getUint32(0, true);
     const result = JSON.parse(new TextDecoder().decode(out.subarray(4, 4 + jsonLen))) as { version: number; changes: number; pokes: Record<string, unknown[]> };
-    const recs = decodeRecords(out.subarray(4 + jsonLen));
-    this.ctx.storage.transactionSync(() => {
-      for (const r of recs) {
-        if (r.kind === 0) this.sql.exec("DELETE FROM ovl WHERE tree = ? AND key = ?", r.tree, r.key);
-        else this.sql.exec("INSERT OR REPLACE INTO ovl (tree, key, val, delta) VALUES (?, ?, ?, ?)", r.tree, r.key, r.val, r.delta);
-      }
-      this.ctx.storage.kv.put(`version:${db}`, result.version);
-    });
+    // One log row for the whole write (its version rides along: no separate version write).
+    this.ctx.storage.transactionSync(() => this.appendLog(out.subarray(4 + jsonLen), result.version));
+    if (this.logRows > COMPACT_AT) this.compactOverlay();
     // One message per socket with every op for its subscriptions (output gate holds these
     // until the overlay write above is durable).
     const perSocket = new Map<string, Record<string, unknown[]>>();
@@ -574,9 +642,12 @@ export class DbObject extends DurableObject<Env> {
    * Every live partition is rebuilt from scratch and open tabs are told to resubscribe.
    */
   async resetOverlay(db: string) {
-    const before = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n;
+    const before = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n + this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n;
+    const last = this.readOverlay(db).version;
     this.sql.exec("DELETE FROM ovl");
-    const version = (this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0) + 1;
+    this.sql.exec("DELETE FROM ovlog");
+    this.logRows = 0;
+    const version = last + 1;
     this.ctx.storage.kv.put(`version:${db}`, version);
     this.engine = undefined; // next use reloads the (now empty) overlay
     this.live = { subs: new Map(), pidOf: new Map() };
@@ -639,7 +710,8 @@ export class DbObject extends DurableObject<Env> {
   async info() {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
-    return { db: this.db, base: this.base, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
+    const log = { rows: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n, legacyEntries: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n };
+    return { db: this.db, base: this.base, overlayLog: log, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
   }
 }
 
