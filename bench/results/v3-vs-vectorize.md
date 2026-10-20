@@ -35,6 +35,27 @@ Scripts: `bench/vectorize.mjs` (+ `spikes/vectorize-bench`), `bench/vec-query.mj
 | data next to the vectors | the whole HN database (rows, threads, counts) | metadata up to 10 KiB per vector |
 | export | the index is files in R2 | IDs 1,000 at a time, then `getByIds` |
 
+## Head to head, all 4.85M stories, Vectorize idle (fully indexed)
+
+The 100 hand-written queries, recall@10 against exact search over all 4.85M vectors.
+
+| | recall@10 vs exact | client ms p50 / p90 | in the server |
+|---|---|---|---|
+| **pagevec**, prewarmed object (RAM tier) | **0.895** | **59 / 116** | ~7 ms of engine time |
+| **pagevec**, prewarmed object (SQLite tier) | 0.895 | 193 / 309 | |
+| **Vectorize** | 0.786 | 506 / 738 | 465 / 677 ms in the Worker |
+
+Filtered (`time < 2011-04-27`, ~8% of stories; 20 queries, recall against exact search over
+the stories that pass):
+
+| | recall@10 | client ms p50 / p90 |
+|---|---|---|
+| pagevec, ≤ 256 pages | 0.790 | 149 / 338 |
+| Vectorize | 0.720 | 10,778 / 14,724 (10.7 s in the Worker) |
+
+(Over all 300 queries, titles included, pagevec's recall@10 is 0.859; the 100 hand-written
+queries are easier for both.)
+
 ## Search latency and recall (4.85M stories)
 
 pagevec, `bench/vec-warm.mjs` (the app's object, index prewarmed into its SQLite) and
@@ -60,7 +81,7 @@ stories that pass the filter.
 | pagevec (prewarmed), ≤ 512 pages | 0.856 | 128 / 180 |
 | Vectorize (in-Worker 17.2 / 20.4 s) | 0.748 | 17,298 / 20,388 |
 
-Caveat: Vectorize was ingesting the rest of the corpus during this run (~3.5M of 4.85M vectors
+Caveat for this table: Vectorize was ingesting the rest of the corpus during this run (~3.5M of 4.85M vectors
 indexed, its indexing ~50 minutes behind its writes, upserts throttled with "Too Many
 Requests" above ~1,000 vectors/s), which may inflate its latency. An unfiltered query on the
 same index took 818 ms in the Worker; a filtered one 10 s, run alone.

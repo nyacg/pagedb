@@ -125,6 +125,7 @@ Measured on all 4,848,803 HN stories (1024-d Qwen3 embeddings, 14,276 clusters, 
 | search, cold (nothing resident) | 1.04 s from R2, 366 ms from the city cache (server, 1 fault round) |
 | per search | ~253 pages, ~20k vectors scored (~7 ms of SIMD in the object) |
 | a write searchable | on the next search (Vectorize: 1–66 s, p50 14 s) |
+| vs Vectorize, same vectors, 100 queries | recall@10 **0.895 vs 0.786**; warm 59 ms vs 506 ms (p50, laptop); with a date filter 149 ms vs 10.8 s |
 | embedding all stories / building the index | ~50 min on Workers AI (9 jobs), ~$1.60 / 100 s on a laptop |
 | storage | 3.6 GB in R2 ($0.05/mo) + the object's SQLite once prewarmed ($0.70/mo) |
 

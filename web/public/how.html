@@ -81,8 +81,9 @@
 <p style="font-size:13px;margin-top:14px"><b>Semantic search</b> (all 4.85 million HN stories, compared with Cloudflare Vectorize on the same vectors):</p>
 <table>
   <tr><th>Measured</th><th>pagevec</th><th>Vectorize</th></tr>
-  <tr><td>Recall@10 against exact search (300 queries)</td><td class="n">0.859</td><td class="n" id="vz-recall">see bench/results</td></tr>
-  <tr><td>Search, warm (laptop → Cloudflare)</td><td class="n">91 ms p50 (SQLite), 49 ms (RAM)</td><td class="n" id="vz-ms">see bench/results</td></tr>
+  <tr><td>Recall@10 against exact search (100 queries, same vectors)</td><td class="n win">0.895</td><td class="n">0.786</td></tr>
+  <tr><td>Search, warm (laptop → Cloudflare, p50)</td><td class="n win">59 ms (RAM), 91–193 ms (SQLite)</td><td class="n">506 ms</td></tr>
+  <tr><td>Search with a date filter (~8% of stories)</td><td class="n win">149 ms, recall 0.79</td><td class="n">10.8 s, recall 0.72</td></tr>
   <tr><td>Search, cold</td><td class="n">1.04 s from R2, 0.37 s from the city cache</td><td class="n">—</td></tr>
   <tr><td>A write is searchable</td><td class="n win">on the next search</td><td class="n">after 1–66 s (p50 14 s)</td></tr>
   <tr><td>Results update live</td><td class="n win">yes</td><td class="n">no</td></tr>
