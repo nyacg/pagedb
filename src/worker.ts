@@ -128,6 +128,7 @@ export default {
         if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
         if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
+        if (url.pathname === "/api/admin/compact") return Response.json(await (stub as unknown as { compactOverlay(): Promise<unknown> }).compactOverlay());
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));
       }
       return env.ASSETS.fetch(req);

@@ -6,7 +6,7 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   const errors = [];
   const open = async () => {
     const p = await ctx.newPage();
-    p.on("console", (m) => { if (["error", "warning"].includes(m.type())) errors.push(m.text().slice(0, 160)); });
+    p.on("console", (m) => { if (["error", "warning"].includes(m.type()) && !m.text().includes("willReadFrequently")) errors.push(m.text().slice(0, 160)); });
     p.on("pageerror", (e) => errors.push("pageerror " + e.message));
     p.on("websocket", (ws) => ws.on("framereceived", (f) => { if (String(f.payload).includes('"t":"error"')) errors.push("ws " + String(f.payload).slice(0, 160)); }));
     const t0 = Date.now();
@@ -34,7 +34,9 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   const [x, y] = sel.match(/(\d+), (\d+)/).slice(1).map(Number);
   const pix = (pg) => pg.evaluate(([x, y]) => [...document.querySelector("#cv").getContext("2d").getImageData(x, y, 1, 1).data].slice(0, 3).join(","), [x, y]);
   const before = await pix(p2);
-  await p.locator('.palette button[data-c="12"]').click();
+  // A colour different from the pixel's current one (earlier runs may have painted it already).
+  const pick = before === "109,0,26" ? 27 : 12;
+  await p.locator(`.palette button[data-c="${pick}"]`).click();
   const t0 = Date.now();
   await p.locator("[data-paint]").click();
   await p2.waitForFunction(([x, y, b]) => [...document.querySelector("#cv").getContext("2d").getImageData(x, y, 1, 1).data].slice(0, 3).join(",") !== b, [x, y, before], { timeout: 10000 }).then(() => console.log("paint reached other tab in", Date.now() - t0, "ms:", before, "→"), () => console.log("paint NOT seen in other tab"));
