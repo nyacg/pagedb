@@ -82,7 +82,8 @@ export class BuilderBox extends DurableObject<Env> {
     const c = this.ctx.container as any;
     if (!c?.running || typeof c.exec !== "function") return { error: "not running or no exec" };
     const r = await c.exec(["sh", "-c", "tail -8 /data/build.log; ls /data/out/parts | wc -l; df -h /data | tail -1; free -m | head -2"]);
-    return { out: typeof r?.stdout === "string" ? r.stdout : JSON.stringify(r) };
+    const text = async (x: unknown) => (typeof x === "string" ? x : x instanceof ReadableStream ? await new Response(x).text() : x ? JSON.stringify(x) : "");
+    return { out: await text(r?.stdout ?? r?.output ?? r), err: await text(r?.stderr), keys: r && typeof r === "object" ? Object.keys(r) : [] };
   }
 }
 
