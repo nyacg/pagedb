@@ -7,7 +7,7 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   const open = async (q) => {
     const p = await ctx.newPage();
     p.on("console", (m) => { if (["error", "warning"].includes(m.type())) errors.push(`${q} ${m.text().slice(0, 160)}`); });
-    p.on("pageerror", (e) => errors.push(`${q} pageerror ${e.message}`));
+    p.on("pageerror", (e) => errors.push(`${q} pageerror ${e.message} @ ${(e.stack || "").split("\n").slice(1, 9).join(" <- ")}`));
     p.on("websocket", (ws) => ws.on("framereceived", (f) => { if (String(f.payload).includes('"t":"error"')) errors.push(`${q} ws ${String(f.payload).slice(0, 160)}`); }));
     const t0 = Date.now();
     await p.goto(`${B}?${q}`);
@@ -31,11 +31,11 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   console.log(`thread ${itemHref} ${ms}ms: ${await p.locator(".cmt").count()} comments shown | ${(await p.locator(".fatitem .subtext").textContent()).trim()}`);
   // second tab on the same thread to watch a reply arrive live
   const { p: p2 } = await open(itemHref.replace("?", ""));
-  const before = await p2.locator(".cmt").count();
-  await p.locator("form.replyform textarea").first().fill("Testing pagedb's live HN mirror: this reply should show up in the other tab.");
+  const reply = `Testing pagedb's live HN mirror (${Date.now() % 100000}): this reply should show up in the other tab.`;
+  await p.locator("form.replyform textarea").first().fill(reply);
   const t0 = Date.now();
   await p.locator("form.replyform button").first().click();
-  await p2.waitForFunction((n) => document.querySelectorAll(".cmt").length > n, before, { timeout: 10000 }).then(() => console.log("reply reached the other tab in", Date.now() - t0, "ms"), () => console.log("reply NOT seen in other tab"));
+  await p2.waitForFunction((t) => [...document.querySelectorAll(".commtext")].some((e) => e.textContent.includes(t)), reply, { timeout: 10000 }).then(() => console.log("reply reached the other tab in", Date.now() - t0, "ms"), () => console.log("reply NOT seen in other tab"));
   console.log("fresh highlight in other tab:", await p2.locator(".cmt.fresh").count());
   // upvote
   const s0 = await p.locator(".fatitem .score").textContent();

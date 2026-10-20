@@ -211,9 +211,23 @@ function threadView() {
     if (!kids.has(p)) kids.set(p, []);
     kids.get(p)!.push(c);
   }
+  // Replies under each comment, counted once (the data has a few odd parent links: a comment is
+  // placed at most once, so a cycle can't recurse forever).
+  const placed = new Set<string>();
+  const counts = new Map<string, number>();
+  const countAll = (id: string, seen = new Set<string>()): number => {
+    if (counts.has(id)) return counts.get(id)!;
+    if (seen.has(id)) return 0;
+    seen.add(id);
+    const n = (kids.get(id) ?? []).reduce((acc, k) => acc + 1 + countAll(k.id, seen), 0);
+    counts.set(id, n);
+    return n;
+  };
   const out: string[] = [];
   const walk = (pid: string, depth: number) => {
     for (const c of (kids.get(pid) ?? []).sort((a, b) => a.time - b.time || (a.id < b.id ? -1 : 1))) {
+      if (placed.has(c.id) || depth > 200) continue;
+      placed.add(c.id);
       const n = countAll(c.id);
       const isFolded = folded.has(c.id);
       out.push(`<div class="cmt${fresh(c.id)}${focusId === c.id ? " focus" : ""}${c.id.startsWith("u-") && sync.pendingOps().some((p) => p.child?.row.id === c.id) ? " pend" : ""}" id="c-${esc(c.id)}" style="margin-left:${depth * 40}px">
@@ -222,7 +236,6 @@ function threadView() {
       if (!isFolded) walk(c.id, depth + 1);
     }
   };
-  const countAll = (id: string): number => (kids.get(id) ?? []).reduce((n, k) => n + 1 + countAll(k.id), 0);
   walk(story.id, 0);
   const dom = story.domain ? ` <span class="sitebit">(<a href="?p=from&site=${esc(story.domain)}">${esc(story.domain)}</a>)</span>` : "";
   const loaded = comments.length;
