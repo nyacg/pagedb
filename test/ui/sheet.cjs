@@ -39,14 +39,16 @@ const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + 
   const { p: p2 } = await open();
   const id = await p.locator(".row:not(.loading) [data-cell=note]").first().getAttribute("data-id");
   await p.locator(`[data-cell=note][data-id="${id}"]`).dblclick();
-  await p.fill("input[data-edit]", `edited live ${Date.now() % 10000}`);
+  const note = `edited live ${Date.now() % 100000}`;
+  await p.fill("input[data-edit]", note);
   t0 = Date.now(); await p.press("input[data-edit]", "Enter");
-  await p2.waitForFunction((id) => document.querySelector(`[data-cell=note][data-id="${id}"]`)?.textContent?.startsWith("edited live"), id, { timeout: 10000 }).then(() => console.log("note reached other tab in", Date.now() - t0, "ms"), () => console.log("note NOT seen"));
+  await p2.waitForFunction(([id, note]) => document.querySelector(`[data-cell=note][data-id="${id}"]`)?.textContent === note, [id, note], { timeout: 10000 }).then(() => console.log("note reached other tab in", Date.now() - t0, "ms"), () => console.log("note NOT seen"));
   // tip edit
   await p.locator(`[data-cell=tip][data-id="${id}"]`).dblclick();
-  await p.fill("input[data-edit]", "12.34");
+  const tip = (1 + Math.floor(Math.random() * 9000) / 100).toFixed(2);
+  await p.fill("input[data-edit]", tip);
   t0 = Date.now(); await p.press("input[data-edit]", "Enter");
-  await p2.waitForFunction((id) => document.querySelector(`[data-cell=tip][data-id="${id}"]`)?.textContent === "$12.34", id, { timeout: 10000 }).then(() => console.log("tip reached other tab in", Date.now() - t0, "ms"), () => console.log("tip NOT seen"));
+  await p2.waitForFunction(([id, tip]) => document.querySelector(`[data-cell=tip][data-id="${id}"]`)?.textContent === `$${tip}`, [id, tip], { timeout: 10000 }).then(() => console.log("tip reached other tab in", Date.now() - t0, "ms"), () => console.log("tip NOT seen"));
   await p.screenshot({ path: require("path").join(require("os").tmpdir(), "pagedb-" + require("path").basename(__filename, ".cjs") + ".png") });
   console.log("errors:", errors.length ? errors : "none");
   await browser.close();
