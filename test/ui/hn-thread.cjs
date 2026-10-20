@@ -1,0 +1,24 @@
+const { chromium } = require("playwright");
+const B = (process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev") + "/hn";
+(async () => {
+  const browser = await chromium.launch();
+  const p = await (await browser.newContext({ viewport: { width: 1300, height: 900 } })).newPage();
+  const errors = []; p.on("pageerror", (e) => errors.push(e.message));
+  await p.goto(`${B}?p=search&q=${process.env.Q || "gpt"}`);
+  await p.waitForSelector("tr.athing");
+  const links = await p.locator("td.subtext a[href*='p=item']").evaluateAll((as) => as.map((a) => [a.getAttribute("href"), a.textContent]));
+  const best = links.filter(([, t]) => /comment/.test(t)).sort((a, b) => parseInt(b[1]) - parseInt(a[1]))[0];
+  console.log("thread:", best);
+  const t0 = Date.now();
+  await p.goto(`${B}${best[0]}`);
+  await p.waitForFunction(() => document.querySelectorAll(".cmt").length > 10, null, { timeout: 30000 });
+  console.log("comments rendered:", await p.locator(".cmt").count(), "in", Date.now() - t0, "ms |", (await p.locator("#foot").textContent()).trim().slice(0, 90));
+  console.log("more link:", await p.locator("[data-more]").textContent().catch(() => "none"));
+  const html = await p.locator(".commtext").first().innerHTML();
+  console.log("first comment html:", html.slice(0, 160));
+  await p.locator(".togg").first().click(); await p.waitForTimeout(200);
+  console.log("after fold:", await p.locator(".cmt").count(), "| fold label:", await p.locator(".togg").first().textContent());
+  await p.screenshot({ path: require("path").join(require("os").tmpdir(), "pagedb-" + require("path").basename(__filename, ".cjs") + ".png") });
+  console.log("errors:", errors.length ? errors : "none");
+  await browser.close();
+})();

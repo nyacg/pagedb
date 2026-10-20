@@ -50,31 +50,38 @@
 <h2>4 · You can only ask for what the app allows</h2>
 <p>Every list, column and thread is a <b>named query</b> (issues of a project with these filters; a count; an issue's thread). The page asks the Worker for a <b>lease</b>. The Worker checks the arguments, builds the query and signs it (HMAC, valid for 60 s, bound to this database). The socket subscribes with the lease, and the object only runs a query it can verify it signed. So a visitor can't send a query that scans 100 GB, reads another database, or skips a limit. The first view's leases come inside the HTML, so they cost no extra round trip. Writes work the same way: named mutators, validated by the Worker.</p>
 
-<h2>5 · Measured</h2>
-<table>
-  <tr><th>Deployed, 1 GB base (284k issues)</th><th>pagedb</th><th>r2db demo</th></tr>
-  <tr><td>Object waking from sleep</td><td class="n win">~0 ms of I/O (state in its SQLite)</td><td class="n">3.2 s</td></tr>
-  <tr><td>Issue list, new object, page in city cache</td><td class="n win">44 ms (start + 1 round)</td><td class="n">172 ms</td></tr>
-  <tr><td>Issue list, nothing cached anywhere (R2)</td><td class="n">≈ 570 ms (3 sequential R2 reads)</td><td class="n">—</td></tr>
-  <tr><td>Count of a project's issues</td><td class="n win">3.6 µs engine time</td><td class="n">3 ms</td></tr>
-  <tr><td>First page's HTML (same laptop)</td><td class="n win">85–227 ms, with the issues in it</td><td class="n">195–496 ms, no data yet</td></tr>
-  <tr><td>First live result over the socket (same laptop)</td><td class="n win">114–223 ms</td><td class="n">371–1,015 ms</td></tr>
-  <tr><td>Your own edit visible</td><td class="n win">instant (optimistic)</td><td class="n">after the server round trip</td></tr>
-  <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
-</table>
-<p style="font-size:13px">r2db numbers are from their published source comments and our measurements of their public demo. The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
+<h2>5 · Four apps, one engine</h2>
+<p>The schema is data: tables, indexes and relations live in each base's manifest. The same engine and the same Durable Object code serve four databases:</p>
+<ul>
+  <li><b><a href="/hn">Hacker News, live</a></b>: every story and comment since 2006. A small Durable Object tails the HN API and writes new items through the normal write path, so new stories and replies appear in every open tab.</li>
+  <li><b><a href="/place">r/place 2022</a></b>: all ~160 million pixel placements. Click a pixel for everyone who ever placed it (an index by pixel); click a user to see all their pixels (an index by user); scrub the timelapse; paint with everyone else.</li>
+  <li><b><a href="/sheet">146 million taxi trips</a></b>: a spreadsheet you can scroll from the first row to the last. Jumping to row 73,000,000 reads only one path down the tree: branch pages count the rows under each child. Group counts are answered the same way, without reading a row.</li>
+</ul>
 
-<h2>6 · The same object in a container</h2>
+<h2>6 · Measured</h2>
+<table>
+  <tr><th>Measured</th><th>pagedb</th><th>r2db demo</th></tr>
+  <tr><td>Issues on screen after opening the page (both 100 GB bases, same laptop, median of 8 loads)</td><td class="n win">0.25 s</td><td class="n">1.09 s</td></tr>
+  <tr><td>Every list, board column and count query from cold (100 GB)</td><td class="n win">1 fault round</td><td class="n">rounds = dependency depth</td></tr>
+  <tr><td>Warm queries from a laptop (100 GB)</td><td class="n">35–49 ms</td><td class="n">—</td></tr>
+  <tr><td>Count of a project's issues</td><td class="n win">3.6 µs engine time</td><td class="n">3 ms (their published number)</td></tr>
+  <tr><td>Your own edit visible</td><td class="n win">instant (optimistic)</td><td class="n">after the server round trip</td></tr>
+  <tr><td>Object waking from sleep (1 GB base)</td><td class="n">~0 ms of I/O (state in its SQLite)</td><td class="n">—</td></tr>
+  <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s (1 GB base)</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
+</table>
+<p style="font-size:13px">Comparisons are against r2db's public demo, measured the same way from the same laptop, both on 100 GB bases (r2db as a returning visitor with its intro panel closed). The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
+
+<h2>7 · The same object in a container</h2>
 <p>The database object is ordinary Durable Object code, so it also runs inside <b>workerd in a Cloudflare Container</b> (4 vCPU, 12 GiB). There it gets a 6 GiB page tier instead of 32 MiB and a dedicated CPU. Measured on the 10 GB base: warm queries are the same (~45 ms from a laptop), and fan-out to 1,000 sockets is about twice as fast (write → every tab: p50 <b>128 ms</b> vs 255 ms; p99 296 ms vs 684 ms). The trade-offs: a container takes at most 4,096 connections, its cold start takes seconds, and it reaches R2 through a bridge.</p>
 
-<h2>7 · Limits (honest list)</h2>
+<h2>8 · Limits (honest list)</h2>
 <ul>
   <li><b>Only indexed queries.</b> A query must be answerable from an index (equalities, then the index order); anything else is refused rather than scanning 100 GB.</li>
   <li><b>One object's CPU.</b> All reads, writes and pushes for a database run on one thread. Read replicas (more objects sharing the base) are the next step.</li>
   <li><b>Cold reads cost R2 latency</b> (~200 ms+ per round for parts nobody has read recently).</li>
   <li><b>Base data is generated</b> and users/projects are read-only in the demo; the activity feed's index holds the newest 500k comments of the base plus everything written since.</li>
 </ul>
-<h2>8 · Layout</h2>
+<h2>9 · Layout</h2>
 <pre>engine/core     Rust: codec, 64 KiB pages, B+tree, overlay, queries, writes, IVM (tests: oracle + fault-injection fuzz)
 engine/wasm     the engine as WebAssembly for the Durable Object
 engine/builder  native: generates the dataset, writes 4 MiB parts (runs in a Cloudflare Container for 100 GB)

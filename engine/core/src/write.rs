@@ -19,7 +19,9 @@ use std::collections::HashMap;
 #[derive(Clone, Debug)]
 pub enum Op {
     Insert { table: TableId, row: Vec<Value> },
-    Update { table: TableId, id: String, set: Vec<(usize, Value)> },
+    /// `set` replaces values; `add` increments number columns (counters without a read);
+    /// `splice` overwrites part of a string column in place (a pixel in a tile of pixels).
+    Update { table: TableId, id: String, set: Vec<(usize, Value)>, add: Vec<(usize, f64)>, splice: Vec<(usize, usize, String)> },
     Delete { table: TableId, id: String },
 }
 
@@ -64,7 +66,7 @@ fn col_value(schema: &Schema, table: TableId, col: usize, v: &J) -> Result<Value
     })
 }
 
-/// `{"ops":[{"op":"insert","table":"issue","row":{…}}, {"op":"update","table":"issue","id":"…","set":{…}}, {"op":"delete","table":"comment","id":"…"}]}`
+/// `{"ops":[{"op":"insert","table":"issue","row":{…}}, {"op":"update","table":"issue","id":"…","set":{…},"add":{"n":1}}, {"op":"delete","table":"comment","id":"…"}]}`
 pub fn parse_ops(schema: &Schema, j: &J) -> Result<Vec<Op>, String> {
     let mut out = Vec::new();
     for o in j.get("ops").and_then(J::as_array).ok_or("missing ops")? {
@@ -95,14 +97,40 @@ pub fn parse_ops(schema: &Schema, j: &J) -> Result<Vec<Op>, String> {
             "update" => {
                 let id = o.get("id").and_then(J::as_str).ok_or("update without id")?.to_string();
                 let mut set = Vec::new();
-                for (name, v) in o.get("set").and_then(J::as_object).ok_or("update without set")? {
+                let mut add = Vec::new();
+                for (name, v) in o.get("add").and_then(J::as_object).into_iter().flatten() {
+                    let c = tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"))?;
+                    if tdef.columns[c].immutable || tdef.columns[c].ty != ColType::Num {
+                        return Err(format!("{name} cannot be incremented"));
+                    }
+                    add.push((c, v.as_f64().ok_or_else(|| format!("add.{name} needs a number"))?));
+                }
+                let mut splice = Vec::new();
+                for (name, v) in o.get("splice").and_then(J::as_object).into_iter().flatten() {
+                    let c = tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"))?;
+                    let (at, text) = match v.as_array().map(Vec::as_slice) {
+                        Some([at, text]) => (at.as_u64().ok_or("splice offset")? as usize, text.as_str().ok_or("splice text")?.to_string()),
+                        _ => return Err(format!("splice.{name} is [offset, text]")),
+                    };
+                    if tdef.columns[c].immutable || tdef.columns[c].ty != ColType::Str || !text.is_ascii() {
+                        return Err(format!("{name} cannot be spliced"));
+                    }
+                    splice.push((c, at, text));
+                }
+                let empty = serde_json::Map::new();
+                let sets = match o.get("set") {
+                    Some(v) => v.as_object().ok_or("set must be an object")?,
+                    None if !add.is_empty() || !splice.is_empty() => &empty,
+                    None => return Err("update without set".into()),
+                };
+                for (name, v) in sets {
                     let c = tdef.col(name).ok_or_else(|| format!("unknown column {tname}.{name}"))?;
                     if tdef.columns[c].immutable {
                         return Err(format!("{name} cannot be updated"));
                     }
                     set.push((c, col_value(schema, table, c, v)?));
                 }
-                out.push(Op::Update { table, id, set });
+                out.push(Op::Update { table, id, set, add, splice });
             }
             "delete" => out.push(Op::Delete { table, id: o.get("id").and_then(J::as_str).ok_or("delete without id")?.to_string() }),
             other => return Err(format!("unknown op {other}")),
@@ -190,6 +218,17 @@ impl Planner<'_, '_> {
         Ok(read_row(self.ctx, self.roots, table, id)?)
     }
 
+    /// Every index entry of a new row must fit a page cell (the base's limit, kept for the
+    /// overlay so a future fold into a new base can't fail).
+    fn check_size(&self, table: TableId, row: &[Value]) -> Result<(), WriteError> {
+        for ix in self.schema.indexes_of(table) {
+            if index_entries(ix, row).iter().any(|(k, v)| k.len() + v.len() + 16 > crate::page::MAX_CELL) {
+                return Err(WriteError::Invalid(format!("{} row too large", self.schema.table(table).name)));
+            }
+        }
+        Ok(())
+    }
+
     /// Stage a row change and record it (coalesced per row: first old → last new). Later reads
     /// in the batch see it, because they go through the view.
     fn apply(&mut self, ch: RowChange) {
@@ -235,6 +274,7 @@ impl Planner<'_, '_> {
             }
             parents.push((rel, pid));
         }
+        self.check_size(table, &row)?;
         self.apply(RowChange { table, old: None, new: Some(row.clone()) });
         for (rel, pid) in parents {
             self.bump(rel, &pid, &row, 1.0)?;
@@ -262,11 +302,21 @@ impl Planner<'_, '_> {
         Ok(())
     }
 
-    fn update(&mut self, table: TableId, id: &str, set: &[(usize, Value)]) -> Result<(), WriteError> {
+    fn update(&mut self, table: TableId, id: &str, set: &[(usize, Value)], add: &[(usize, f64)], splice: &[(usize, usize, String)]) -> Result<(), WriteError> {
         let old = self.read(table, id)?.ok_or_else(|| WriteError::Invalid(format!("no {} {id}", self.schema.table(table).name)))?;
         let mut new = old.clone();
         for (c, v) in set {
             new[*c] = v.clone();
+        }
+        for (c, d) in add {
+            new[*c] = Value::Num(new[*c].as_num().unwrap_or(0.0) + d);
+        }
+        for (c, at, text) in splice {
+            let cur = new[*c].as_str().unwrap_or("");
+            if !cur.is_ascii() || at + text.len() > cur.len() {
+                return Err(WriteError::Invalid(format!("splice outside {}", self.schema.table(table).columns[*c].name)));
+            }
+            new[*c] = Value::Str(format!("{}{}{}", &cur[..*at], text, &cur[at + text.len()..]));
         }
         if new != old {
             self.replace(table, old, new)?;
@@ -276,6 +326,7 @@ impl Planner<'_, '_> {
 
     /// Replace a row, then bring copied columns on its children up to date.
     fn replace(&mut self, table: TableId, old: Vec<Value>, new: Vec<Value>) -> Result<(), WriteError> {
+        self.check_size(table, &new)?;
         self.apply(RowChange { table, old: Some(old.clone()), new: Some(new.clone()) });
         let id = new[0].as_str().unwrap_or("").to_string();
         for rel in self.schema.relations.iter().filter(|r| r.parent == table && !r.copy.is_empty()) {
@@ -326,7 +377,7 @@ pub fn plan_write(ctx: &Ctx, roots: &Roots, view: &View, ops: &[Op]) -> Result<V
     for op in ops {
         match op {
             Op::Insert { table, row } => p.insert(*table, row)?,
-            Op::Update { table, id, set } => p.update(*table, id, set)?,
+            Op::Update { table, id, set, add, splice } => p.update(*table, id, set, add, splice)?,
             Op::Delete { table, id } => p.delete(*table, id, None)?,
         }
     }

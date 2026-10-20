@@ -298,7 +298,7 @@ function detailView() {
     </div>
     <div class="thread">${comments
       .map(
-        (c, i) => `<div class="cm ${i === 0 ? "desc" : ""} ${c.id.startsWith("u-c") && sync.pendingOps().some((p) => p.comment?.id === c.id) ? "pend" : ""}">${avatar(c.author)}<div class="cm-b"><div class="cm-h"><b>${esc(c.author?.name ?? "You")}</b> <span class="date">${ago(c.createdAt)}</span>${i === 0 ? ` <span class="badge">description</span>` : ""}${c.id.startsWith("u-c") ? ` <button class="link" data-uncomment="${esc(c.id)}">delete</button>` : ""}</div><div class="cm-text">${esc(c.body)}</div></div></div>`,
+        (c, i) => `<div class="cm ${i === 0 ? "desc" : ""} ${c.id.startsWith("u-c") && sync.pendingOps().some((p) => p.child?.row.id === c.id) ? "pend" : ""}">${avatar(c.author)}<div class="cm-b"><div class="cm-h"><b>${esc(c.author?.name ?? "You")}</b> <span class="date">${ago(c.createdAt)}</span>${i === 0 ? ` <span class="badge">description</span>` : ""}${c.id.startsWith("u-c") ? ` <button class="link" data-uncomment="${esc(c.id)}">delete</button>` : ""}</div><div class="cm-text">${esc(c.body)}</div></div></div>`,
       )
       .join("")}</div>
     <form class="composer" data-comment="${esc(r.id)}"><textarea placeholder="Leave a comment…  (⌘↵ to send)" rows="3" maxlength="2000"></textarea><button class="primary">Comment</button></form>
@@ -562,7 +562,7 @@ document.addEventListener("click", (e) => {
   }
   if (el("[data-uncomment]")) {
     const id = el("[data-uncomment]")!.dataset.uncomment!;
-    run("deleteComment", { id }, { uncomment: id });
+    run("deleteComment", { id }, { unchild: { list: "comments", id } });
     return;
   }
   if (el("[data-delete]")) {
@@ -695,7 +695,7 @@ document.addEventListener("submit", (e) => {
     if (!body) return;
     const id = `u-c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     ta.value = "";
-    run("addComment", { id, issueId: form.dataset.comment, body }, { comment: { id, issueId: form.dataset.comment, body, createdAt: Date.now(), authorId: me, author: sync.view("me")[0] } });
+    run("addComment", { id, issueId: form.dataset.comment, body }, { child: { parent: form.dataset.comment!, list: "comments", count: "commentCount", row: { id, issueId: form.dataset.comment, body, createdAt: Date.now(), authorId: me, author: sync.view("me")[0] } } });
   }
   if (form.matches("[data-create]")) {
     const d = new FormData(form);

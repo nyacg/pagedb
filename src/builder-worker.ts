@@ -2,6 +2,7 @@
  * pagedb-builder: runs the dataset builder in a Cloudflare Container so a 100 GB base is
  * written straight into R2 (a laptop uploads at ~11 MB/s; this doesn't).
  *   POST /start?db=db100g&projects=2710&comments=6.8   (Bearer ADMIN_TOKEN)
+ *   POST /start?db=hn&job=hn                          (a dataset job: datasets/<job>/build.sh)
  *   GET  /status?db=db100g
  * When done, the manifest is written as db/<db>/manifest-<base>.json; promote it to
  * db/<db>/manifest.json once checked (POST /promote?db=…&base=…).
@@ -12,6 +13,10 @@ interface Env {
   BUCKET: R2Bucket;
   BOX: DurableObjectNamespace<BuilderBox>;
   ADMIN_TOKEN?: string;
+  /** R2 S3 credentials for dataset jobs' uploads (secrets). */
+  R2_AK?: string;
+  R2_SK?: string;
+  R2_ENDPOINT?: string;
 }
 
 /** The container's only egress: PUT http://r2.internal/put/<key> → R2. */
@@ -30,7 +35,7 @@ export class R2Put extends WorkerEntrypoint<Env> {
 }
 
 export class BuilderBox extends DurableObject<Env> {
-  async start(db: string, projects: number, comments: number, resumeBase?: string) {
+  async start(db: string, projects: number, comments: number, resumeBase?: string, job?: string) {
     const c = this.ctx.container!;
     if (c.running) return { running: true, base: this.ctx.storage.kv.get("base") };
     // Resuming reuses a base id: the builder is deterministic, so parts already in R2 are skipped.
@@ -38,9 +43,18 @@ export class BuilderBox extends DurableObject<Env> {
     this.ctx.storage.kv.put("base", base);
     c.start({
       image: c.images.builder,
-      enableInternet: false,
+      // Dataset jobs read public data from the internet; the generated tracker needs none.
+      enableInternet: !!job,
       instance: { vcpu: 4, memoryMib: 12288, diskMb: 20000 },
-      env: { DB: db, PROJECTS: String(projects), COMMENTS: String(comments), BASE: base },
+      // Dataset jobs upload straight to R2's S3 API (much faster than the intercepted route).
+      env: {
+        DB: db,
+        PROJECTS: String(projects),
+        COMMENTS: String(comments),
+        BASE: base,
+        ...(job ? { JOB: job } : {}),
+        ...(job && this.env.R2_AK ? { R2_AK: this.env.R2_AK, R2_SK: this.env.R2_SK!, R2_ENDPOINT: this.env.R2_ENDPOINT! } : {}),
+      },
     } as any);
     await c.interceptOutboundHttp("r2.internal", (this.ctx.exports as any).R2Put({ props: {} }));
     // A container lives and dies with its object, and the container's uploads never touch the
@@ -79,8 +93,9 @@ export class BuilderBox extends DurableObject<Env> {
     // Tail of the build log, read through the container's own exec.
     const c = this.ctx.container as any;
     if (!c?.running || typeof c.exec !== "function") return { error: "not running or no exec" };
-    const r = await c.exec(["sh", "-c", "tail -5 /data/build.log; ls /data/out/parts | wc -l; df -h /data | tail -1"]);
-    return { out: typeof r?.stdout === "string" ? r.stdout : JSON.stringify(r) };
+    const r = await c.exec(["sh", "-c", "tail -8 /data/build.log; ls /data/out/parts | wc -l; df -h /data | tail -1; free -m | head -2"]);
+    const text = async (x: unknown) => (typeof x === "string" ? x : x instanceof ReadableStream ? await new Response(x).text() : x ? JSON.stringify(x) : "");
+    return { out: await text(r?.stdout ?? r?.output ?? r), err: await text(r?.stderr), keys: r && typeof r === "object" ? Object.keys(r) : [] };
   }
 }
 
@@ -91,14 +106,16 @@ export default {
     const db = url.searchParams.get("db") ?? "db100g";
     // (RPC return types are deep; a narrow view keeps the checker fast.)
     const box = env.BOX.getByName(db) as unknown as {
-      start(db: string, p: number, c: number, base?: string): Promise<unknown>;
+      start(db: string, p: number, c: number, base?: string, job?: string): Promise<unknown>;
       info(): Promise<unknown>;
       stop(): Promise<unknown>;
       reattach(): Promise<unknown>;
       logs(): Promise<unknown>;
     };
     if (url.pathname === "/start" && req.method === "POST")
-      return Response.json(await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8), url.searchParams.get("base") ?? undefined));
+      return Response.json(
+        await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8), url.searchParams.get("base") ?? undefined, url.searchParams.get("job") ?? undefined),
+      );
     if (url.pathname === "/status") {
       const s = await env.BUCKET.get(`db/${db}/build-status.json`);
       return Response.json({ box: await box.info(), status: s ? await s.json() : null });

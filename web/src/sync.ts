@@ -66,8 +66,11 @@ interface Pending {
   patch?: { id: string; set: Row };
   insert?: Row;
   remove?: string;
-  comment?: Row;
-  uncomment?: string;
+  /** A child row shown nested in its parent (a comment in an issue's or story's thread):
+   *  added to `parent[list]`, and `parent[count]` raised, until the server's version lands. */
+  child?: { parent: string; list: string; count?: string; row: Row };
+  /** A child row removed from whichever parent lists it. */
+  unchild?: { list: string; id: string };
 }
 
 type Listener = () => void;
@@ -91,7 +94,7 @@ export class Sync {
   onStale?: () => void;
   build?: string;
 
-  constructor(private url: string, seed: Lease[] = []) {
+  constructor(private url: string, seed: Lease[] = [], private app = "tracker") {
     for (const l of seed) if (l.token) this.leases.set(l.key, l);
     this.connect();
     setInterval(() => this.gc(), 500);
@@ -151,7 +154,7 @@ export class Sync {
     // One request for every lease not already fresh or on its way; then wait for all of them.
     const missing = new Map(list.filter((x) => !fresh(x.key) && !this.leasing.has(x.key)).map((x) => [x.key, x.ref]));
     if (missing.size) {
-      const req = fetch("/api/lease", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ list: [...missing.values()] }) })
+      const req = fetch(`/api/lease?app=${this.app}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ list: [...missing.values()] }) })
         .then((res) => res.json() as Promise<{ leases?: Lease[] }>)
         .then((body) => {
           for (const l of body.leases ?? []) this.leases.set(l.key, l);
@@ -276,7 +279,7 @@ export class Sync {
     this.emit();
     const t0 = performance.now();
     try {
-      const res = await fetch("/api/mutate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, args, user }) });
+      const res = await fetch(`/api/mutate?app=${this.app}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, args, user }) });
       const body = await res.json();
       if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
       p.version = body.version;
@@ -305,15 +308,18 @@ export class Sync {
       }
       if (p.insert) rows.set(p.insert.id, p.insert);
       if (p.remove) rows.delete(p.remove);
-      if (p.comment) {
-        const parent = rows.get(p.comment.issueId);
+      if (p.child) {
+        const { parent: pid, list, count, row } = p.child;
+        const parent = rows.get(pid);
         if (parent) {
-          const comments = parent.comments ? [...parent.comments.filter((c: Row) => c.id !== p.comment!.id), p.comment] : undefined;
-          rows.set(parent.id, { ...parent, comments, commentCount: (parent.commentCount ?? 0) + (s.rows.get(parent.id)?.comments?.some((c: Row) => c.id === p.comment!.id) ? 0 : 1) });
+          const kids = parent[list] ? [...parent[list].filter((c: Row) => c.id !== row.id), row] : undefined;
+          const landed = s.rows.get(pid)?.[list]?.some((c: Row) => c.id === row.id);
+          rows.set(pid, { ...parent, [list]: kids, ...(count ? { [count]: (parent[count] ?? 0) + (landed ? 0 : 1) } : {}) });
         }
       }
-      if (p.uncomment) {
-        for (const [k, r] of rows) if (r.comments?.some((c: Row) => c.id === p.uncomment)) rows.set(k, { ...r, comments: r.comments.filter((c: Row) => c.id !== p.uncomment) });
+      if (p.unchild) {
+        const { list, id } = p.unchild;
+        for (const [k, r] of rows) if (r[list]?.some((c: Row) => c.id === id)) rows.set(k, { ...r, [list]: r[list].filter((c: Row) => c.id !== id) });
       }
     }
     let out = [...rows.values()];

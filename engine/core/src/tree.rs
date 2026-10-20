@@ -384,6 +384,34 @@ pub fn get(ctx: &Ctx, root: &TreeRoot, key: &[u8]) -> Result<Option<Vec<u8>>, Mi
     }
 }
 
+/// Key of the entry at position `n` (0-based), in O(height) pages using the branch row counts.
+pub fn nth(ctx: &Ctx, root: &TreeRoot, mut n: u64) -> Result<Option<Vec<u8>>, Miss> {
+    if root.height == 0 || n >= root.rows {
+        return Ok(None);
+    }
+    let mut id = root.root;
+    loop {
+        let bytes = ctx.get(id)?;
+        let page = Page(&bytes);
+        if page.kind() == LEAF {
+            return Ok((n < page.count() as u64).then(|| page.key(n as usize).to_vec()));
+        }
+        let mut next = None;
+        for i in 0..page.count() {
+            let (_, child, rows) = page.child(i);
+            if n < rows {
+                next = Some(child);
+                break;
+            }
+            n -= rows;
+        }
+        match next {
+            Some(c) => id = c,
+            None => return Ok(None),
+        }
+    }
+}
+
 /// Number of entries with key < `key`, in O(height) pages using the branch row counts.
 pub fn rank(ctx: &Ctx, root: &TreeRoot, key: &[u8]) -> Result<u64, Miss> {
     if root.height == 0 {
@@ -501,6 +529,18 @@ mod tests {
             // Interior levels fault one per round; all leaves of the scan share one round.
             assert!(rounds <= root.height as usize, "rounds {rounds} > height {} (reads {reads})", root.height);
         }
+    }
+
+    #[test]
+    fn nth_matches_reference() {
+        let (pages, root, reference) = build(25_000, 60);
+        let keys: Vec<&Vec<u8>> = reference.keys().collect();
+        for n in [0usize, 1, 777, 12_345, 24_999] {
+            let (k, _) = with_faults(&pages, |ctx| nth(ctx, &root, n as u64));
+            assert_eq!(k.as_ref(), Some(keys[n]));
+        }
+        let (none, _) = with_faults(&pages, |ctx| nth(ctx, &root, 25_000));
+        assert!(none.is_none());
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{
+  "name": "place",
+  "tables": [
+    {"name": "placement", "columns": ["id", {"name": "pos", "type": "number"},
+      {"name": "c", "type": "number"}, "u", {"name": "t", "type": "number"}]},
+    {"name": "tile", "columns": ["id", {"name": "tx", "type": "number", "immutable": true}, {"name": "ty", "type": "number", "immutable": true}, "px", {"name": "t", "type": "number"}]},
+    {"name": "snap", "readOnly": true, "columns": ["id", {"name": "k", "type": "number"}, {"name": "tx", "type": "number"}, {"name": "ty", "type": "number"}, {"name": "t", "type": "number"}, "png"]},
+    {"name": "meta", "readOnly": true, "pinned": true, "columns": ["id", "info"]}
+  ],
+  "indexes": [
+    {"tree": 1, "name": "placement_by_id", "table": "placement", "key": ["id"], "primary": true, "cols": ["id", "pos", "t"], "rowIndex": "placement_by_pos"},
+    {"tree": 2, "name": "placement_by_pos", "table": "placement", "key": ["pos", "-t", "id"]},
+    {"tree": 3, "name": "placement_by_user", "table": "placement", "key": ["u", "-t", "id"]},
+    {"tree": 4, "name": "placement_by_time", "table": "placement", "key": ["-t", "id"], "baseLimit": 2000},
+    {"tree": 5, "name": "tile_by_id", "table": "tile", "key": ["id"], "primary": true},
+    {"tree": 6, "name": "snap_by_id", "table": "snap", "key": ["id"], "primary": true, "cols": ["id", "k"], "rowIndex": "snap_by_k"},
+    {"tree": 7, "name": "snap_by_k", "table": "snap", "key": ["k", "id"]},
+    {"tree": 8, "name": "meta_by_id", "table": "meta", "key": ["id"], "primary": true}
+  ]
+}

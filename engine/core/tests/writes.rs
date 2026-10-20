@@ -218,6 +218,9 @@ fn writes_and_live_queries_stay_consistent() {
     let mut overlay = Overlay::default();
     // Infinite-scroll pages over p0000: (10th, 30th] bounded, and an open "next 15" after the 30th.
     let mut asts = queries();
+    // A lookup through the comment table's pointer primary, on a comment whose issue gets edits.
+    let watched = model.comments.values().find(|c| c[comment::ISSUE].as_str() == Some("i000000399")).map(|c| c[comment::ID].as_str().unwrap().to_string()).unwrap();
+    asts.push(json!({"table":"comment","where":eq("id", json!(watched)),"one":true}));
     {
         let newest = model.list("p0000", |_| true, 40);
         let key = |id: &str| { let r = &model.issues[id]; json!({"createdAt": r[issue::CREATED].as_num().unwrap(), "id": id}) };

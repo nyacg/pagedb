@@ -11,7 +11,15 @@ It's our take on [r2db](https://demo.r2db.dev), rebuilt from its public behaviou
 with benchmarks against it. The engine is Rust: WebAssembly inside the Durable Object, and native
 for the dataset builder. The Durable Object shell, sync protocol and UI are TypeScript.
 
-- Demo (Linear-style tracker on the 100 GB base): https://pagedb.do-pool-lab.workers.dev
+Four apps run on the same engine, each one database in R2 and one object serving it:
+
+| App | Data | What's live |
+|---|---|---|
+| [Issue tracker](https://pagedb.do-pool-lab.workers.dev) | 27.1M generated issues, 96 GB | lists, board, threads, search (titles, tags, comments) |
+| [Hacker News](https://pagedb.do-pool-lab.workers.dev/hn) | every story and comment since 2006 (~49M items) | new items stream in from the HN API; front page, threads, comments, votes |
+| [r/place 2022](https://pagedb.do-pool-lab.workers.dev/place) | all ~160M pixel placements | each pixel's history, each user's pixels, a timelapse, painting |
+| [Taxi sheet](https://pagedb.do-pool-lab.workers.dev/sheet) | every NYC yellow-cab trip of 2015 (~146M) | sort, jump to any row, group counts, shared cell edits |
+
 - How it works: https://pagedb.do-pool-lab.workers.dev/how
 - The same object in a container: https://pagedb-node.do-pool-lab.workers.dev/api/…
 
@@ -19,15 +27,13 @@ for the dataset builder. The Durable Object shell, sync protocol and UI are Type
 
 | | pagedb | r2db demo |
 |---|---|---|
-| Object waking from sleep | ~0 ms of I/O: manifest, interior pages and cache are in its SQLite | 3.2 s |
-| Issue list on a new object, page in the city cache | 44 ms (start + 1 fault round) | 172 ms |
-| Every demo query from cold | **1 fault round**: list, board column, count, filter, detail, feed | rounds = dependency depth |
-| Count of a project's issues | 3.6 µs of engine time (counted branch pages) | 3 ms |
-| HTML of the first page (same laptop) | 85–227 ms, issues inlined | 195–496 ms, no data |
-| First live result over the socket (same laptop) | 114–223 ms | 371–1,015 ms |
+| Issues on screen after opening the page (both 100 GB, same laptop, median of 8 loads) | **0.25 s** | 1.09 s |
+| Every demo query from cold (100 GB) | **1 fault round**: list, board column, count, filter, detail, feed | rounds = dependency depth |
+| Warm queries from a laptop (100 GB) | 35–49 ms | — |
+| Count of a project's issues | 3.6 µs of engine time (counted branch pages) | 3 ms (published) |
 | Your own edit | instant (optimistic UI) | after the server round trip |
-| Fan-out, 1,000 sockets, 5 writes/s (laptop ↔ Cloudflare) | p50 255 ms, p99 684 ms; **container: 128 / 296 ms** | — |
-| 100 GB base (27.1 M issues), every demo query | 1 fault round; warm 35–49 ms; results match the generator | — |
+| Object waking from sleep (1 GB base) | ~0 ms of I/O: manifest, interior pages and cache are in its SQLite | — |
+| Fan-out, 1,000 sockets, 5 writes/s (1 GB base, laptop ↔ Cloudflare) | p50 255 ms, p99 684 ms; **container: 128 / 296 ms** | — |
 | Builder | 96 GB, 27.1 M issues, 1.47 M pages in 28 min on one Cloudflare vCPU | offline |
 
 Details: `bench/results/*.md`.
@@ -98,6 +104,26 @@ pagedb-builder ingest --schema schema.json --input story=stories.ndjson --input 
 
 It produces byte-identical output to the tracker's hand-written builder for the same rows.
 
+## The apps
+
+Each app is a schema (`datasets/<app>/schema.json`), a dataset build (`datasets/<app>/build.sh`,
+run in the builder container: `POST /start?db=<app>&job=<app>` on pagedb-builder), and named
+queries + mutators (`src/apps/<app>.ts`). The Worker routes `/hn`, `/place` and `/sheet` to them;
+leases, sockets and mutations carry `?app=`.
+
+- **Hacker News**: DuckDB reads the open-index monthly parquet over HTTPS, resolves every
+  comment's story (walking parents up, one level per pass), and streams stories and comments
+  into the builder; items newer than the dump come from the HN API (`pagedb-builder fetch-hn`).
+  `HnTail` (a Durable Object) then tails the API every 10 s and mirrors the front page into a
+  partial index (`topRank`). Story → comment is a relation: `descendants` is a maintained count.
+- **r/place**: `pagedb-builder place-prep` reads Reddit's CSVs, sorts ~160M placements in memory
+  (16 bytes each), replays them onto the canvas, and emits placements (history per pixel and per
+  user), the pre-whiteout canvas as 128×128 tiles (one character per pixel) and PNG snapshots
+  every 30 minutes. A paint is a placement plus a `splice` of one character into its tile.
+- **Taxi**: DuckDB numbers the trips in pickup order (the primary key, so row N is trip N);
+  sort indexes are covering, group indexes are pointers. `offset` queries find row N from the
+  branch pages' counts; a cell edit is a `set` (note) or an `add` (tip and total).
+
 ## Layout
 
 ```
@@ -107,7 +133,9 @@ engine/core      Rust: key/row codec, 64 KiB pages, B+tree (bulk build + fault-a
 engine/wasm      the engine as WebAssembly (raw exports, synchronous host import for SQLite pages)
 engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container)
 src/do.ts        DbObject: tiers, fault rounds, sockets, overlay persistence, hibernation
-src/app.ts       the tracker's named queries and validated mutators
+src/apps/        the apps' named queries and validated mutators (tracker, hn, place, taxi)
+src/hn-tail.ts   HnTail: keeps the HN base live from the official API
+datasets/        per-app schema.json and build.sh (run in the builder container)
 src/lease.ts     signed queries: lease signing and verification
 src/worker.ts    edge Worker: SSR first paint, /api/socket, /api/mutate, admin, nightly reset
 src/node-*.ts    the same DbObject in workerd in a Container (pagedb-node)

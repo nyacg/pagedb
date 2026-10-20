@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hacker News, live · pagedb</title>
+<meta name="description" content="Every Hacker News story and comment since 2006, in R2, served live by one Cloudflare Durable Object.">
+<link rel="stylesheet" href="/hn.css"><!--BOOT--></head>
+<body><center><table id="hnmain">
+<tr><td class="top"><table class="pagetop-t"><tr>
+  <td class="logo"><a href="?p=news"><span>P</span></a></td>
+  <td class="pagetop"><b class="hnname"><a href="?p=news">Hacker News</a></b> <span class="livebadge">live</span>
+    <a data-page="newest" href="?p=newest">new</a> | <a data-page="best" href="?p=best">best</a> | <a data-page="comments" href="?p=comments">comments</a> |
+    <a data-page="ask" href="?p=ask">ask</a> | <a data-page="show" href="?p=show">show</a> | <a data-page="jobs" href="?p=jobs">jobs</a> | <a data-page="submit" href="?p=submit">submit</a></td>
+  <td class="pagetop right"><span id="me"></span></td></tr></table></td></tr>
+<tr><td class="banner">Every HN story and comment since 2006, about 50 GB in R2, served by <b>one Durable Object</b>. New items stream in from the HN API; every page is a live query.
+  <a href="/how">How it works</a> · <a href="https://github.com/nyacg/pagedb">code</a> · <a href="/">the issue tracker demo</a></td></tr>
+<tr><td id="main"></td></tr>
+<tr><td class="footer"><form action="" class="search"><input type="hidden" name="p" value="search">Search titles: <input name="q" size="20"></form><div id="foot"></div>
+  <div class="fine">A demo mirror of <a href="https://news.ycombinator.com">news.ycombinator.com</a>, built on <a href="https://github.com/nyacg/pagedb">pagedb</a> from the <a href="https://huggingface.co/datasets/open-index/hacker-news">open-index</a> dump (ODC-By) and the official HN API. Comments, votes and submissions here stay here.</div></td></tr>
+</table></center>
+<script type="module" src="/hn.js"></script>
+</body></html>

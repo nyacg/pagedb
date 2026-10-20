@@ -38,6 +38,11 @@ pub struct Partition {
 
 /// Hydrate a partition: its state plus the rows/count to send to a new subscriber.
 pub fn hydrate(ctx: &Ctx, roots: &Roots, plan: Rc<Plan>) -> Result<(Partition, Output), Miss> {
+    // A jump to row N becomes a keyset window starting there.
+    let plan = match crate::query::resolve_offset(ctx, roots, &plan)? {
+        Some(p) => Rc::new(p),
+        None => plan,
+    };
     let out = execute(ctx, roots, &plan)?;
     let state = match &out {
         Output::Count(n) => State::Count(*n),

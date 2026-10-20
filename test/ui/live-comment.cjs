@@ -1,0 +1,27 @@
+const { chromium } = require("playwright");
+const B = process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev";
+(async () => {
+  const browser = await chromium.launch();
+  const p = await (await browser.newContext({ viewport: { width: 1300, height: 900 } })).newPage();
+  if (process.env.LOCAL) await p.route("**/app.js*", (r) => r.fulfill({ contentType: "text/javascript", body: require("fs").readFileSync("/Users/robertchandler/conductor/repos/pagedb/web/public/app.js", "utf8") }));
+  await p.goto(B + "/?project=p0005");
+  await p.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50, null, { timeout: 30000 });
+  const word = `zebra${Date.now().toString(36)}`;
+  const t0 = Date.now();
+  await p.click("[data-search]"); await p.keyboard.type(`comment:${word}`); await p.keyboard.press("Enter");
+  await p.waitForFunction(() => window.__pagedb.subs().find((s) => s.id === "list:0")?.ready, null, { timeout: 60000, polling: 50 });
+  const st = await p.evaluate(() => window.__pagedb.subs().find((s) => s.id === "list:0"));
+  console.log(`no match anywhere (whole project, cold): ${st.rows} rows, ${Math.round(st.ms)} ms, ${st.rounds} rounds (wall ${Date.now() - t0} ms)`);
+  const issue = "i000500200";
+  const cid = `u-c${Date.now().toString(36)}`;
+  const mut = (name, args) => p.evaluate(([n, a]) => fetch("/api/mutate", { method: "POST", body: JSON.stringify({ name: n, args: a }) }).then((r) => r.json()), [name, args]);
+  let t1 = Date.now();
+  console.log("add comment:", JSON.stringify(await mut("addComment", { id: cid, issueId: issue, body: `seen this ${word} again` })).slice(0, 80));
+  const appeared = await p.waitForFunction((id) => window.__pagedb.listRows().some((r) => r.id === id), issue, { timeout: 10000 }).then(() => Date.now() - t1, () => "NO");
+  console.log("issue entered the list:", appeared, "ms");
+  t1 = Date.now();
+  console.log("delete comment:", JSON.stringify(await mut("deleteComment", { id: cid })).slice(0, 80));
+  const left = await p.waitForFunction((id) => !window.__pagedb.listRows().some((r) => r.id === id), issue, { timeout: 10000 }).then(() => Date.now() - t1, () => "NO");
+  console.log("issue left the list:", left, "ms");
+  await browser.close();
+})().catch((e) => { console.error("FAIL", e); process.exit(1); });

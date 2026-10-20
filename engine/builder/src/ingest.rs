@@ -4,6 +4,11 @@
 //!   pagedb-builder ingest --schema schema.json --input story=stories.ndjson --input comment=- \
 //!       [--mem 6000] [--tmp DIR] --out DIR
 //!
+//! `--input comment=PATH@comment_by_story,comment_by_id` builds only those indexes from that
+//! input: a big table can be read in several passes, so its spill runs never all sit on disk.
+//! `--input trip=PATH@trip_by_id:sorted` streams rows already in that index's key order straight
+//! into its tree (no sort, no spill; out-of-order input is an error).
+//!
 //! Each input line is a JSON object keyed by column name (missing columns are null; lists are
 //! JSON arrays of strings). Maintained columns (relation counts, copies) must already be right
 //! in the input: the base is taken as given.
@@ -62,6 +67,8 @@ pub fn parse_row(schema: &Schema, table: TableId, line: &str) -> Result<Vec<Valu
 /// Sorts (key, value) entries with bounded memory: an arena of entries, spilled as sorted LZ4
 /// runs when it outgrows its budget, then merged. Equal keys keep the first one pushed.
 pub struct Sorter {
+    /// An index that keeps only its first n keys (`baseLimit`): a bounded heap, no spilling.
+    top: Option<(usize, BinaryHeap<(Vec<u8>, u64, Vec<u8>)>)>,
     arena: Vec<u8>,
     items: Vec<(u64, u32, u32)>,
     budget: usize,
@@ -72,10 +79,26 @@ pub struct Sorter {
 
 impl Sorter {
     pub fn new(tmp: &Path, budget: usize) -> Sorter {
-        Sorter { arena: Vec::new(), items: Vec::new(), budget: budget.max(1 << 20), runs: Vec::new(), tmp: tmp.to_path_buf(), pushed: 0 }
+        Sorter { top: None, arena: Vec::new(), items: Vec::new(), budget: budget.max(1 << 20), runs: Vec::new(), tmp: tmp.to_path_buf(), pushed: 0 }
+    }
+
+    pub fn bounded(tmp: &Path, n: usize) -> Sorter {
+        Sorter { top: Some((n, BinaryHeap::new())), ..Sorter::new(tmp, 0) }
     }
 
     pub fn push(&mut self, k: &[u8], v: &[u8]) {
+        if let Some((n, heap)) = &mut self.top {
+            // Max-heap of the n smallest keys (push order breaks ties: the first one wins).
+            let seq = self.pushed;
+            self.pushed += 1;
+            if heap.len() < *n {
+                heap.push((k.to_vec(), seq, v.to_vec()));
+            } else if heap.peek().is_some_and(|m| k < &m.0[..]) {
+                heap.pop();
+                heap.push((k.to_vec(), seq, v.to_vec()));
+            }
+            return;
+        }
         self.items.push((self.arena.len() as u64, k.len() as u32, v.len() as u32));
         self.arena.extend_from_slice(k);
         self.arena.extend_from_slice(v);
@@ -115,6 +138,20 @@ impl Sorter {
     /// Every entry in key order (duplicates dropped). Returns how many were dropped.
     pub fn drain(mut self, f: &mut dyn FnMut(&[u8], &[u8])) -> u64 {
         let mut dropped = 0;
+        if let Some((_, heap)) = self.top.take() {
+            let mut all = heap.into_vec();
+            all.sort();
+            let mut last: Option<Vec<u8>> = None;
+            for (k, _, v) in all {
+                if last.as_deref() == Some(&k[..]) {
+                    dropped += 1;
+                    continue;
+                }
+                f(&k, &v);
+                last = Some(k);
+            }
+            return dropped;
+        }
         if self.runs.is_empty() {
             self.sorted();
             let mut last: Option<&[u8]> = None;
@@ -216,12 +253,16 @@ pub fn run(args: &[String]) {
     let out = PathBuf::from(arg("--out").expect("--out DIR"));
     let tmp = arg("--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp"));
     let mem_mb: usize = arg("--mem").map(|v| v.parse().unwrap()).unwrap_or(4000);
-    let inputs: Vec<(TableId, String)> = args
+    let inputs: Vec<(TableId, String, Option<Vec<String>>)> = args
         .windows(2)
         .filter(|w| w[0] == "--input")
         .map(|w| {
-            let (t, p) = w[1].split_once('=').expect("--input table=PATH");
-            (schema.table_named(t).unwrap_or_else(|| panic!("unknown table {t}")), p.to_string())
+            let (t, p) = w[1].split_once('=').expect("--input table=PATH[@index,…]");
+            let (p, only) = match p.rsplit_once('@') {
+                Some((p, ix)) => (p, Some(ix.split(',').map(str::to_string).collect::<Vec<String>>())),
+                None => (p, None),
+            };
+            (schema.table_named(t).unwrap_or_else(|| panic!("unknown table {t}")), p.to_string(), only)
         })
         .collect();
     let pinned: Vec<bool> = schema_json["tables"].as_array().unwrap().iter().map(|t| t.get("pinned").and_then(J::as_bool).unwrap_or(false)).collect();
@@ -234,12 +275,51 @@ pub fn run(args: &[String]) {
     let mut rows_per_table = vec![0u64; schema.tables.len()];
     let mut deferred: Vec<(&Index, Sorter)> = Vec::new();
 
-    for (table, path) in &inputs {
+    for (table, path, only) in &inputs {
         let t0 = Instant::now();
-        let ixs: Vec<&Index> = schema.indexes_of(*table).collect();
+        // One index marked `:sorted`: its entries stream into the tree as rows arrive.
+        if let Some([one]) = only.as_deref() {
+            if let Some(name) = one.strip_suffix(":sorted") {
+                let ix = schema.index_named(name).unwrap_or_else(|| panic!("unknown index {name}"));
+                let mut last: Vec<u8> = Vec::new();
+                let mut n = 0u64;
+                let mut bad = 0u64;
+                let b = build_tree(&mut sink, ix.tree, &ix.name, &mut |f| {
+                    for line in open_input(path).lines() {
+                        let line = line.expect("read input");
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok(row) = parse_row(schema, *table, &line) else {
+                            bad += 1;
+                            continue;
+                        };
+                        for (k, v) in index_entries(ix, &row) {
+                            assert!(n == 0 || k > last, "{}: input not in key order at row {n}", ix.name);
+                            f(&k, &v);
+                            last = k;
+                        }
+                        n += 1;
+                        if n % 10_000_000 == 0 {
+                            eprintln!("   {n} rows of {} ({:.0}s)", schema.table(*table).name, t0.elapsed().as_secs_f64());
+                        }
+                    }
+                });
+                rows_per_table[*table] = n;
+                eprintln!("{}: {n} sorted rows streamed in {:.1}s ({bad} skipped)", schema.table(*table).name, t0.elapsed().as_secs_f64());
+                built.push(b);
+                continue;
+            }
+        }
+        let ixs: Vec<&Index> = schema.indexes_of(*table).filter(|ix| only.as_ref().map_or(true, |o| o.contains(&ix.name))).collect();
+        rows_per_table[*table] = 0;
         let budget = mem_mb * (1 << 20) / ixs.len().max(1);
-        let mut sorters: Vec<Sorter> = ixs.iter().map(|ix| Sorter::new(&tmp.join(&ix.name), budget)).collect();
+        let mut sorters: Vec<Sorter> = ixs.iter().map(|ix| match ix.base_limit {
+            Some(n) => Sorter::bounded(&tmp, n),
+            None => Sorter::new(&tmp.join(&ix.name), budget),
+        }).collect();
         let mut bad = 0u64;
+        let mut too_big = 0u64;
         for line in open_input(path).lines() {
             let line = line.expect("read input");
             if line.trim().is_empty() {
@@ -255,17 +335,23 @@ pub fn run(args: &[String]) {
                     continue;
                 }
             };
+            // A row whose entry wouldn't fit a page cell is skipped (counted), not fatal.
+            let entries: Vec<Vec<(Vec<u8>, Vec<u8>)>> = ixs.iter().map(|ix| index_entries(ix, &row)).collect();
+            if entries.iter().flatten().any(|(k, v)| k.len() + v.len() + 16 > pagedb_core::page::MAX_CELL) {
+                too_big += 1;
+                continue;
+            }
             rows_per_table[*table] += 1;
             if rows_per_table[*table] % 5_000_000 == 0 {
                 eprintln!("   {} rows of {} ({:.0}s)", rows_per_table[*table], schema.table(*table).name, t0.elapsed().as_secs_f64());
             }
-            for (ix, s) in ixs.iter().zip(sorters.iter_mut()) {
-                for (k, v) in index_entries(ix, &row) {
+            for (es, s) in entries.into_iter().zip(sorters.iter_mut()) {
+                for (k, v) in es {
                     s.push(&k, &v);
                 }
             }
         }
-        eprintln!("{}: {} rows read in {:.1}s ({bad} skipped)", schema.table(*table).name, rows_per_table[*table], t0.elapsed().as_secs_f64());
+        eprintln!("{}: {} rows read in {:.1}s ({bad} unreadable, {too_big} too large, skipped)", schema.table(*table).name, rows_per_table[*table], t0.elapsed().as_secs_f64());
         for (ix, s) in ixs.into_iter().zip(sorters) {
             if pinned[*table] {
                 deferred.push((ix, s));
@@ -309,7 +395,7 @@ pub fn run(args: &[String]) {
                 b.root.height,
                 b.secs
             );
-            serde_json::json!({"tree": b.root.tree, "name": b.name, "root": b.root.root, "height": b.root.height, "rows": b.root.rows,
+            serde_json::json!({"tree": b.root.tree, "name": b.name, "root": if b.root.height == 0 { J::Null } else { J::from(b.root.root) }, "height": b.root.height, "rows": b.root.rows,
                 "firstPage": b.first_page, "pages": b.pages, "leafPages": b.root.leaves})
         })
         .collect();

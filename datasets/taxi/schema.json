@@ -1,0 +1,23 @@
+{
+  "name": "taxi",
+  "tables": [
+    {"name": "trip", "columns": ["id", {"name": "pickup", "type": "number", "immutable": true}, {"name": "dropoff", "type": "number", "immutable": true},
+      {"name": "duration", "type": "number", "immutable": true}, {"name": "vendor", "type": "number", "immutable": true},
+      {"name": "passengers", "type": "number", "immutable": true}, {"name": "distance", "type": "number", "immutable": true},
+      {"name": "pu", "type": "number", "immutable": true}, {"name": "do", "type": "number", "immutable": true}, {"name": "borough", "immutable": true},
+      {"name": "payment", "type": "number", "immutable": true}, {"name": "fare", "type": "number", "immutable": true},
+      {"name": "tip", "type": "number"}, {"name": "tolls", "type": "number", "immutable": true}, {"name": "total", "type": "number"}, "note"]},
+    {"name": "zone", "readOnly": true, "pinned": true, "columns": ["id", "borough", "zone", "service"]}
+  ],
+  "indexes": [
+    {"tree": 1, "name": "trip_by_id", "table": "trip", "key": ["id"], "primary": true},
+    {"tree": 2, "name": "trip_by_total", "table": "trip", "key": ["-total", "id"]},
+    {"tree": 3, "name": "trip_by_tip", "table": "trip", "key": ["-tip", "id"]},
+    {"tree": 4, "name": "trip_by_distance", "table": "trip", "key": ["-distance", "id"]},
+    {"tree": 5, "name": "trip_by_duration", "table": "trip", "key": ["-duration", "id"]},
+    {"tree": 6, "name": "trip_by_payment", "table": "trip", "key": ["payment", "id"], "cols": ["id"], "rowIndex": "trip_by_id"},
+    {"tree": 7, "name": "trip_by_borough", "table": "trip", "key": ["borough", "id"], "cols": ["id"], "rowIndex": "trip_by_id"},
+    {"tree": 8, "name": "trip_by_passengers", "table": "trip", "key": ["passengers", "id"], "cols": ["id"], "rowIndex": "trip_by_id"},
+    {"tree": 9, "name": "zone_by_id", "table": "zone", "key": ["id"], "primary": true}
+  ]
+}
