@@ -134,6 +134,9 @@ export class DbObject extends DurableObject<Env> {
   /** Page ranges built after the base (e.g. a vector index), each in its own R2 directory. */
   private segments: Segment[] = [];
   private baseChunkPages?: number;
+  /** The database whose directory holds the base's parts, if not this one (a database that
+   *  reuses another's base, e.g. with a vector index attached). */
+  private baseDb?: string;
   private sqliteHits = 0;
   private salt = "";
 
@@ -190,7 +193,7 @@ export class DbObject extends DurableObject<Env> {
       }
       this.ctx.storage.kv.put(`manifest:${db}`, manifest);
     }
-    const m = JSON.parse(manifest) as { base: string; pages: number; pinnedFrom?: number; chunkPages?: number; segments?: Segment[] };
+    const m = JSON.parse(manifest) as { base: string; baseDb?: string; pages: number; pinnedFrom?: number; chunkPages?: number; segments?: Segment[] };
     const engine = new Engine((id, dst) => {
       const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id = ?", id).toArray()[0];
       if (!row) return false;
@@ -208,6 +211,7 @@ export class DbObject extends DurableObject<Env> {
     this.base = m.base;
     this.segments = m.segments ?? [];
     this.baseChunkPages = m.chunkPages;
+    this.baseDb = m.baseDb;
     // Pinned region: small tables + every tree's interior pages, contiguous at the end of the
     // base (and of each segment). With it resident, a query only ever faults leaves (one round).
     const pinned: [number, number][] = [...(m.pinnedFrom !== undefined ? [[m.pinnedFrom, m.pages] as [number, number]] : []), ...this.segments.map((g) => [g.pinnedFrom, g.pages] as [number, number])];
@@ -340,7 +344,7 @@ export class DbObject extends DurableObject<Env> {
   private partKey(id: number): string {
     const part = Math.floor(id / PAGES_PER_PART);
     const g = this.segments.find((g) => id >= g.firstPage && id < g.pages);
-    return `db/${g?.db ?? this.db}/base/${g?.base ?? this.base}/part-${String(part).padStart(6, "0")}`;
+    return `db/${g?.db ?? this.baseDb ?? this.db}/base/${g?.base ?? this.base}/part-${String(part).padStart(6, "0")}`;
   }
 
   /** Neighbouring chunks of one part: each from the city cache if it's there, the rest from R2

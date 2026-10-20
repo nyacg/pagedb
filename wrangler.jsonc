@@ -27,6 +27,17 @@
       "triggers": { "crons": ["* * * * *"] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi" }
+    },
+    // `npx wrangler deploy --env vec` → https://pagedb-vec.do-pool-lab.workers.dev: semantic search
+    // over HN (a base with the stories' vector index attached: db "hnv"), its own objects.
+    "vec": {
+      "name": "pagedb-vec",
+      "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }, { "name": "HN_TAIL", "class_name": "HnTail" }] },
+      "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+      "ai": { "binding": "AI" },
+      "triggers": { "crons": ["* * * * *"] },
+      "version_metadata": { "binding": "CF_VERSION_METADATA" },
+      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g-vec", "HN_DB": "hnv", "HN_OBJ": "hnv", "HN_VEC": "story_vec", "PLACE_DB": "place", "PLACE_OBJ": "place-vec", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi-vec" }
     }
   }
 }

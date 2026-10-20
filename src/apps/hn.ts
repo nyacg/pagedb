@@ -79,8 +79,8 @@ function after(q: Record<string, unknown>, start: unknown, cols: string[]) {
 const stories = (where: unknown, a: Record<string, any>, dflt = 30) =>
   after({ table: "story", ...(where ? { where } : {}), orderBy: BY_TIME, limit: limit(a.limit, dflt, 100) }, a.start, ["time", "id"]);
 
-/** The stories' vector index (datasets/hn/vectors.json). */
-export const VEC = { index: "story_vec", dims: 512 };
+/** The stories' vector index (datasets/hn/vectors.json): all 1024 dims, 4-bit residuals. */
+export const VEC = { index: "story_vec", dims: 1024 };
 const SINCE: Record<string, number> = { day: 86400e3, week: 7 * 86400e3, month: 30 * 86400e3, year: 365 * 86400e3 };
 
 /** A semantic search's arguments from a page URL (?q=…&since=…&kind=…). */

@@ -1,7 +1,10 @@
 //! Embeddings for a table's rows, as PVEC shards in R2.
 //!
 //!   pagedb-builder embed --text story --prefix vec/<model>/stories [--batch 100] [--threads 32]
-//!       [--rpm 2800] [--shard 16384] [--limit N] < rows.ndjson
+//!       [--rpm 2800] [--shard 16384] [--limit N] [--from-shard A] [--to-shard B] < rows.ndjson
+//!
+//! `--from-shard`/`--to-shard` split one stream between several jobs (each skips the rows of
+//! the others' shards; a shard another job already wrote is skipped too).
 //!
 //! Rows (JSON lines, in a stable order) are cut into shards of `--shard` rows. Each shard is
 //! embedded in batches, `--threads` requests in flight under a requests-per-minute budget, and
@@ -275,6 +278,8 @@ pub fn run(args: &[String]) {
     let rpm: u64 = arg("--rpm").map(|v| v.parse().unwrap()).unwrap_or(2800);
     let shard_rows: usize = arg("--shard").map(|v| v.parse().unwrap()).unwrap_or(16_384);
     let limit: u64 = arg("--limit").map(|v| v.parse().unwrap()).unwrap_or(u64::MAX);
+    let from_shard: usize = arg("--from-shard").map(|v| v.parse().unwrap()).unwrap_or(0);
+    let to_shard: usize = arg("--to-shard").map(|v| v.parse().unwrap()).unwrap_or(usize::MAX);
     assert_eq!(arg("--text").as_deref().unwrap_or("story"), "story", "only story text is defined");
     let e = from_env();
     let bucket = Bucket { next: Mutex::new(Instant::now()), gap: Duration::from_micros(60_000_000 / rpm.max(1)) };
@@ -303,6 +308,12 @@ pub fn run(args: &[String]) {
         }
         let key = format!("{prefix}/shard-{n_shard:06}.bin");
         n_shard += 1;
+        if n_shard - 1 < from_shard {
+            continue;
+        }
+        if n_shard - 1 >= to_shard {
+            break;
+        }
         if exists(&key) {
             skipped.fetch_add(rows.len() as u64, Ordering::Relaxed);
             continue;
@@ -339,7 +350,10 @@ pub fn run(args: &[String]) {
         );
     }
     let summary = json!({"prefix": prefix, "shards": n_shard, "rows": total, "embedded": done.load(Ordering::Relaxed), "skipped": skipped.load(Ordering::Relaxed), "model": e.model(), "secs": t0.elapsed().as_secs_f64()});
-    put(&format!("{prefix}/index.json"), summary.to_string().as_bytes());
+    // The shard index (count, rows) comes from the job that read the whole stream.
+    if to_shard == usize::MAX && total < limit {
+        put(&format!("{prefix}/index.json"), summary.to_string().as_bytes());
+    }
     println!("{summary}");
 }
 

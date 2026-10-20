@@ -715,10 +715,16 @@ impl pagedb_core::tree::PageStore for FileStore {
 }
 
 /// Recall and cost of vector search on a local base, for a grid of probe settings.
-///   pagedb-builder vec-eval --manifest M --dir DIR[@FIRSTPAGE] … --gt gt.json [--nprobe 8,16,32] [--pages 128,256]
+///   pagedb-builder vec-eval --manifest M [--schema S] --dir DIR[@FIRSTPAGE] … --gt gt.json [--nprobe 8,16,32] [--pages 128,256]
 pub fn eval(args: &[String]) {
     use pagedb_core::tree::Ctx;
-    let manifest: J = serde_json::from_str(&fs::read_to_string(arg(args, "--manifest").expect("--manifest FILE")).unwrap()).unwrap();
+    let mut manifest: J = serde_json::from_str(&fs::read_to_string(arg(args, "--manifest").expect("--manifest FILE")).unwrap()).unwrap();
+    // A segment's manifest has no schema: take the base's (--schema).
+    if manifest.get("schema").is_none() {
+        if let Some(p) = arg(args, "--schema") {
+            manifest["schema"] = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        }
+    }
     let roots = pagedb_core::query::Roots::from_manifest(&manifest).unwrap();
     let dirs: Vec<(u64, PathBuf)> = args
         .windows(2)

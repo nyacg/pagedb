@@ -1,9 +1,19 @@
 {
   "name": "story_vec",
   "table": "story",
-  "dims": 512,
-  "codec": "sq8",
-  "cols": ["id", "by", "time", "title", "url", "score", "descendants", "kind", "domain"],
+  "dims": 1024,
+  "codec": "sq4",
+  "cols": [
+    "id",
+    "by",
+    "time",
+    "title",
+    "url",
+    "score",
+    "descendants",
+    "kind",
+    "domain"
+  ],
   "tree": 20,
   "byId": 21,
   "centroids": 22,
