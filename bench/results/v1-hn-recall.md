@@ -28,3 +28,30 @@ exact top 10 at all 1024 dims, i.e. against the model's best answer.
 
 Decision: the HN index is **SQ4 at 1024 dims** (`datasets/hn/vectors.json`). The Vectorize
 comparison uses the same full 1024-d vectors (Vectorize allows up to 1536).
+
+## All stories: 4,848,803 (every HN story through Oct 19, 2026)
+
+Embedding: 296 shards in R2 (10.4 GB of f16 vectors + rows), ~150M tokens. Workers AI gave
+one job ~200 stories/s (requests queue ~16 s at 32 in flight); nine claim-sharing jobs reached
+~1,500/s, ~50 minutes for the corpus. Build (`vec-build`, laptop, 14 cores): 96–110 s for
+k-means on a 410k sample, 4.85M assignments, 3.6 GB of parts.
+
+Ground truth: 300 queries (100 hand-written + 200 titles), exact over all 4.85M at 1024 dims (34 s).
+
+| clusters (target size) | nprobe | max pages | recall@10 | in true top 100 | clusters read | pages | vectors scored |
+|---|---|---|---|---|---|---|---|
+| 6,061 (800) | 8 | 128 | 0.762 | 0.994 | 8 | 93 | 7.9k |
+| 6,061 (800) | 32 | 256 | 0.838 | 1.000 | 23 | 250 | 21.2k |
+| 6,061 (800) | 64 | 384 | 0.854 | 1.000 | 35 | 378 | 32.1k |
+| **14,276 (400)** | 16 | 256 | 0.802 | 0.997 | 16 | 94 | 7.6k |
+| **14,276 (400)** | 32 | 256 | 0.843 | 0.998 | 32 | 181 | 14.5k |
+| **14,276 (400)** | **64** | **256** | **0.859** | 0.999 | 46 | 253 | 20.3k |
+| **14,276 (400)** | 128 | 384 | 0.879 | 1.000 | 71 | 381 | 30.7k |
+
+Smaller clusters spend the page budget better. The deployed index: 400 per cluster, nprobe 64,
+256 pages. Deployed, over the same 300 queries, recall@10 is **0.859**: the object's search
+(wasm) returns exactly what the native eval does.
+
+What limits recall now is the 4-bit codes' order among near-ties (99.9% of results are in the
+true top 100), not the probing. The next lever is a rerank of the top candidates with finer
+codes (SQ8 recovered 0.92+ on the subset at ~1.7× the pages).

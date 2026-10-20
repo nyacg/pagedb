@@ -17,11 +17,11 @@
   "tree": 20,
   "byId": 21,
   "centroids": 22,
-  "clusterSize": 800,
+  "clusterSize": 400,
   "supers": 64,
   "sample": 400000,
   "truncate": 300,
-  "nprobe": 32,
+  "nprobe": 64,
   "maxPages": 256,
   "model": "@cf/qwen/qwen3-embedding-0.6b"
 }

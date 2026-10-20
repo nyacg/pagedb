@@ -127,7 +127,8 @@ export default {
           return obj ? new Response(obj.body) : new Response("not found", { status: 404 });
         }
         if (url.pathname === "/api/admin/hn-tail") {
-          const tail = env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown>; status(): Promise<unknown> };
+          const tail = env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown>; status(): Promise<unknown>; rewind(): Promise<unknown> };
+          if (req.method === "POST" && url.searchParams.has("rewind")) return Response.json(await tail.rewind());
           return Response.json(req.method === "POST" ? await tail.kick() : await tail.status());
         }
         const db = url.searchParams.get("db") ?? "db1g";

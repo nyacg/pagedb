@@ -560,16 +560,15 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
             offer(scorer.score(qc, code), k, v, &mut heap);
         }
     }
-    // New vectors in the overlay: scored exactly like base entries (any cluster).
-    let pos: HashMap<u32, usize> = if ov.is_empty() { HashMap::new() } else { cents.ids.iter().enumerate().map(|(i, &c)| (c, i)).collect() };
+    // New vectors in the overlay: scored exactly like base entries (any cluster; ids are sorted).
     for &(k, e) in &ov {
         let Some(v) = &e.val else { continue };
         let cid = cluster_of(k);
         let qc = match scorer.qc.get(&cid) {
             Some(&qc) => qc,
-            None => match pos.get(&cid) {
-                Some(&i) => q_dot_centroid(&cents, i, &aq.q),
-                None => continue,
+            None => match cents.ids.binary_search(&cid) {
+                Ok(i) => q_dot_centroid(&cents, i, &aq.q),
+                Err(_) => continue,
             },
         };
         stats.overlay += 1;

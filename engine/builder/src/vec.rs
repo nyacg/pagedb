@@ -199,7 +199,23 @@ impl Model {
             }
             let pts: Vec<f32> = members.iter().flat_map(|&i| sample[i * d..(i + 1) * d].iter().copied()).collect();
             let k = ((members.len() as f64 / n as f64) * nlist as f64).round().max(1.0) as usize;
-            let (fc, _) = kmeans(&pts, d, k, 12, 0xf1e + si as u64);
+            let (mut fc, fa) = kmeans(&pts, d, k, 12, 0xf1e + si as u64);
+            // Split clusters far bigger than their share (a dense topic, near-duplicate titles):
+            // a probe of one would spend a query's page budget on it alone.
+            let target = members.len() as f64 / (fc.len() / d) as f64;
+            let mut split: Vec<f32> = Vec::new();
+            for c in 0..fc.len() / d {
+                let own: Vec<usize> = (0..members.len()).filter(|&j| fa[j] as usize == c).collect();
+                if (own.len() as f64) > 2.5 * target && own.len() >= 4 {
+                    let sub: Vec<f32> = own.iter().flat_map(|&j| pts[j * d..(j + 1) * d].iter().copied()).collect();
+                    let parts = (own.len() as f64 / target).ceil() as usize;
+                    let (sc, _) = kmeans(&sub, d, parts, 10, 0x5911 + c as u64);
+                    split.extend(sc);
+                } else {
+                    split.extend_from_slice(&fc[c * d..(c + 1) * d]);
+                }
+            }
+            fc = split;
             let k = fc.len() / d;
             // Chain: start nearest the super's centroid, then always the nearest unvisited.
             let sup = &supers[si * d..(si + 1) * d];

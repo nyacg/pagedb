@@ -59,7 +59,8 @@ COPY (
   FROM raw WHERE deleted = 0 AND dead = 0 AND type IN (1, 3, 5)
 ) TO '/dev/stdout' (FORMAT JSON);" \
   | "$BUILDER" embed --prefix "$PREFIX" --threads "${EMBED_THREADS:-32}" --batch "${EMBED_BATCH:-100}" --rpm "${EMBED_RPM:-2800}" \
-      ${EMBED_FROM:+--from-shard "$EMBED_FROM"} ${EMBED_TO:+--to-shard "$EMBED_TO"} ${IGNORE_CLAIMS:+--ignore-claims} > "$WORK/embed.json"
+      ${EMBED_FROM:+--from-shard "$EMBED_FROM"} ${EMBED_TO:+--to-shard "$EMBED_TO"} ${IGNORE_CLAIMS:+--ignore-claims} > "$WORK/embed.json" \
+  || [ -n "${EMBED_TO:-}" ]  # a range job stops reading early: DuckDB's broken pipe is expected
 
 # run.sh reports a job done when it leaves a manifest; this one is the shard index.
 cp "$WORK/embed.json" "$OUT/manifest.json"

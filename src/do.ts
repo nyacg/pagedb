@@ -139,6 +139,8 @@ export class DbObject extends DurableObject<Env> {
   private baseDb?: string;
   private sqliteHits = 0;
   private salt = "";
+  /** The next start reads the manifest from R2, not the colo cache. */
+  private freshManifest = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -183,7 +185,9 @@ export class DbObject extends DurableObject<Env> {
       // The manifest is the one mutable object; the colo cache holds it briefly.
       const cache = await openCache();
       const url = `https://pagedb.cache/db/${db}/manifest.json${this.salt ? `?s=${this.salt}` : ""}`;
-      const hit = await cache?.match(url);
+      // (After a reset or remanifest, straight from R2: the cached copy may be the old one.)
+      const hit = this.freshManifest ? undefined : await cache?.match(url);
+      this.freshManifest = false;
       if (hit) manifest = await hit.text();
       else {
         const obj = await blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN).get(`db/${db}/manifest.json`);
@@ -765,6 +769,7 @@ export class DbObject extends DurableObject<Env> {
   async remanifest() {
     if (this.db) this.ctx.storage.kv.delete(`manifest:${this.db}`);
     this.engine = undefined;
+    this.freshManifest = true;
     return { ok: true };
   }
 
@@ -772,7 +777,9 @@ export class DbObject extends DurableObject<Env> {
   async reset() {
     this.sql.exec("DELETE FROM pages");
     this.ctx.storage.kv.delete(`manifest:${this.db}`);
+    this.ctx.storage.kv.delete("prewarm");
     this.engine = undefined;
+    this.freshManifest = true;
     return { ok: true };
   }
 

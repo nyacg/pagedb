@@ -62,6 +62,12 @@ export class HnTail extends DurableObject<Env> {
     return this.status();
   }
 
+  /** Start over from the newest item in the base (after the base under the object changed). */
+  async rewind() {
+    this.ctx.storage.kv.delete("last");
+    return this.kick();
+  }
+
   async status() {
     const kv = this.ctx.storage.kv;
     return { last: kv.get("last"), lastRun: kv.get("lastRun"), lastFront: kv.get("lastFront"), written: kv.get("written") ?? 0, error: kv.get("error") ?? null };
