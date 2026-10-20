@@ -116,6 +116,18 @@ node scripts/attach-vec.mjs data/seg hn hnv                      # base + segmen
 npm run deploy:vec                                               # pagedb-vec Worker (HN_DB=hnv)
 ```
 
+Measured on all 4,848,803 HN stories (1024-d Qwen3 embeddings, 14,276 clusters, 3.6 GB):
+
+| | pagevec |
+|---|---|
+| recall@10 vs exact search over all 4.85M (300 queries) | 0.859 (99.9% of results in the true top 100) |
+| search, prewarmed object (laptop → Cloudflare) | 91 ms p50 (SQLite tier), 49 ms (RAM) |
+| search, cold (nothing resident) | 1.04 s from R2, 366 ms from the city cache (server, 1 fault round) |
+| per search | ~253 pages, ~20k vectors scored (~7 ms of SIMD in the object) |
+| a write searchable | on the next search (Vectorize: 1–66 s, p50 14 s) |
+| embedding all stories / building the index | ~50 min on Workers AI (9 jobs), ~$1.60 / 100 s on a laptop |
+| storage | 3.6 GB in R2 ($0.05/mo) + the object's SQLite once prewarmed ($0.70/mo) |
+
 Results: `bench/results/v0-vec-synth.md`, `v1-hn-recall.md`, `v3-vs-vectorize.md`.
 
 ## Schemas and datasets

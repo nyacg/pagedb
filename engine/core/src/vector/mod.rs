@@ -65,6 +65,8 @@ pub struct VecIndex {
     pub table: TableId,
     pub dims: usize,
     pub codec: Codec,
+    /// Residuals are rotated (kernels::rotate) before quantization; queries likewise.
+    pub rotate: bool,
     /// Table columns stored in each entry, in order; `cols[0]` is the primary key.
     pub cols: Vec<usize>,
     pub tree: TreeId,
@@ -101,6 +103,9 @@ impl VecIndex {
         if steps.len() != dims || dims == 0 {
             return Err(format!("{name}: steps must have dims ({dims}) entries"));
         }
+        if j.get("rotate").and_then(J::as_bool) == Some(true) && !dims.is_power_of_two() {
+            return Err(format!("{name}: rotate needs dims that are a power of two"));
+        }
         let codec = match j.get("codec").and_then(J::as_str).unwrap_or("sq8") {
             "sq8" => Codec::Sq8,
             "sq4" if dims % 32 == 0 => Codec::Sq4,
@@ -113,6 +118,7 @@ impl VecIndex {
             table,
             dims,
             codec,
+            rotate: j.get("rotate").and_then(J::as_bool).unwrap_or(false),
             cols,
             tree,
             by_id,
@@ -159,11 +165,21 @@ impl VecIndex {
     /// Code of normalized `v`'s residual against the (dequantized) centroid `c`.
     pub fn encode_code(&self, v: &[f32], c: &[f32]) -> Vec<u8> {
         let l = self.codec.levels();
-        let q = v.iter().zip(c).zip(&self.steps).map(|((v, c), s)| ((v - c) / s).round().clamp(-l, l));
+        let r = self.residual(v, c);
+        let q = r.iter().zip(&self.steps).map(|(r, s)| (r / s).round().clamp(-l, l));
         match self.codec {
             Codec::Sq8 => q.map(|x| x as i8 as u8).collect(),
             Codec::Sq4 => pack_u4(&q.map(|x| (x as i8 + 8) as u8).collect::<Vec<u8>>()),
         }
+    }
+
+    /// v − c, rotated if the index rotates.
+    pub fn residual(&self, v: &[f32], c: &[f32]) -> Vec<f32> {
+        let mut r: Vec<f32> = v.iter().zip(c).map(|(v, c)| v - c).collect();
+        if self.rotate {
+            kernels::rotate(&mut r);
+        }
+        r
     }
 
     /// An entry's code and row.
@@ -444,6 +460,11 @@ pub struct Scorer {
 
 impl Scorer {
     pub fn new(vi: &VecIndex, q: &[f32]) -> Scorer {
+        // q·r = (Rq)·(Rr) for the rotation R, so a rotating index scores the rotated query.
+        let mut q = q.to_vec();
+        if vi.rotate {
+            kernels::rotate(&mut q);
+        }
         let qs: Vec<f32> = q.iter().zip(&vi.steps).map(|(a, b)| a * b).collect();
         let (q8, alpha) = quantize(&qs);
         let q8_sum = q8.iter().map(|&x| x as i32).sum();

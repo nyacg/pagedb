@@ -78,6 +78,16 @@
   <tr><td>Object waking from sleep (1 GB base)</td><td class="n">~0 ms of I/O (state in its SQLite)</td><td class="n">—</td></tr>
   <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s (1 GB base)</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
 </table>
+<p style="font-size:13px;margin-top:14px"><b>Semantic search</b> (all 4.85 million HN stories, compared with Cloudflare Vectorize on the same vectors):</p>
+<table>
+  <tr><th>Measured</th><th>pagevec</th><th>Vectorize</th></tr>
+  <tr><td>Recall@10 against exact search (300 queries)</td><td class="n">0.859</td><td class="n" id="vz-recall">see bench/results</td></tr>
+  <tr><td>Search, warm (laptop → Cloudflare)</td><td class="n">91 ms p50 (SQLite), 49 ms (RAM)</td><td class="n" id="vz-ms">see bench/results</td></tr>
+  <tr><td>Search, cold</td><td class="n">1.04 s from R2, 0.37 s from the city cache</td><td class="n">—</td></tr>
+  <tr><td>A write is searchable</td><td class="n win">on the next search</td><td class="n">after 1–66 s (p50 14 s)</td></tr>
+  <tr><td>Results update live</td><td class="n win">yes</td><td class="n">no</td></tr>
+  <tr><td>Monthly cost at this size, before queries</td><td class="n win">~$0.75</td><td class="n">~$52</td></tr>
+</table>
 <p style="font-size:13px">Comparisons are against r2db's public demo, measured the same way from the same laptop, both on 100 GB bases (r2db as a returning visitor with its intro panel closed). The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
 
 <h2>8 · The same object in a container</h2>

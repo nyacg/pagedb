@@ -55,3 +55,8 @@ Smaller clusters spend the page budget better. The deployed index: 400 per clust
 What limits recall now is the 4-bit codes' order among near-ties (99.9% of results are in the
 true top 100), not the probing. The next lever is a rerank of the top candidates with finer
 codes (SQ8 recovered 0.92+ on the subset at ~1.7× the pages).
+
+A randomized Hadamard rotation of the residuals before quantization (`"rotate": true`, the
+idea behind RaBitQ; queries are rotated once, dot products are unchanged) adds only +0.006
+(0.865 at 256 pages, 0.886 at 384): per-dimension steps already capture most of it at 4 bits.
+It's available, off by default.

@@ -178,6 +178,8 @@ pub struct Model {
     /// Fine centroid indexes belonging to each super: [start, end).
     pub ranges: Vec<(usize, usize)>,
     pub steps: Vec<f32>,
+    /// Residuals are rotated before quantization (steps measured after rotation).
+    pub rotate: bool,
 }
 
 impl Model {
@@ -238,7 +240,7 @@ impl Model {
         let fine = Centroids::from_f32(d, ids, &fine_all);
         let fine_f32: Vec<f32> = (0..fine.len()).flat_map(|i| fine.decode(i)).collect();
         eprintln!("   {} fine clusters in {:.1}s", fine.len(), t0.elapsed().as_secs_f64());
-        let mut m = Model { d, supers, fine, fine_f32, ranges, steps: vec![1.0; d] };
+        let mut m = Model { d, supers, fine, fine_f32, ranges, steps: vec![1.0; d], rotate: false };
         m.steps = m.steps_at(sample, 0.999, 127.0);
         m
     }
@@ -252,8 +254,12 @@ impl Model {
         for i in 0..n {
             let v = &sample[i * d..(i + 1) * d];
             let c = &self.fine_f32[self.assign(v) * d..][..d];
+            let mut r: Vec<f32> = v.iter().zip(c).map(|(a, b)| a - b).collect();
+            if self.rotate {
+                pagedb_core::vector::kernels::rotate(&mut r);
+            }
             for j in 0..d {
-                res[j].push((v[j] - c[j]).abs());
+                res[j].push(r[j].abs());
             }
         }
         res.iter_mut()
@@ -313,9 +319,10 @@ pub fn build(cfg: &Cfg, schema: &'static Schema, src: &dyn Source, n_est: usize,
     let nlist = (n_est / cfg.cluster_size).max(1);
     eprintln!("{}: {ns} sampled (every {every}), {nlist} clusters for ~{n_est} vectors", cfg.name);
     let mut m = Model::train(&sample, d, nlist, cfg.supers);
-    if cfg.codec == "sq4" {
-        // 4-bit codes: clip at the 99th percentile (fewer levels: spend them on the bulk).
-        m.steps = m.steps_at(&sample, 0.99, 7.0);
+    m.rotate = cfg.json.get("rotate").and_then(J::as_bool).unwrap_or(false);
+    if m.rotate || cfg.codec == "sq4" {
+        // 4-bit codes clip at the 99th percentile (fewer levels: spend them on the bulk).
+        m.steps = if cfg.codec == "sq4" { m.steps_at(&sample, 0.99, 7.0) } else { m.steps_at(&sample, 0.999, 127.0) };
     }
     drop(sample);
     let mut vj = cfg.json.clone();

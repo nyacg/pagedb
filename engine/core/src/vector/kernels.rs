@@ -81,6 +81,36 @@ pub fn pack_u4(n: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A fixed random rotation: random sign flips, then the fast Walsh–Hadamard transform, scaled to
+/// be orthonormal (len must be a power of two). Dot products are preserved, but energy spreads
+/// evenly over the dimensions, so per-dimension quantization loses less.
+pub fn rotate(v: &mut [f32]) {
+    let n = v.len();
+    debug_assert!(n.is_power_of_two());
+    let mut x = 0x9e37_79b9u32;
+    for a in v.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        if x & 1 == 1 {
+            *a = -*a;
+        }
+    }
+    let mut h = 1;
+    while h < n {
+        for i in (0..n).step_by(h * 2) {
+            for j in i..i + h {
+                let (a, b) = (v[j], v[j + h]);
+                v[j] = a + b;
+                v[j + h] = a - b;
+            }
+        }
+        h *= 2;
+    }
+    let s = 1.0 / (n as f32).sqrt();
+    v.iter_mut().for_each(|a| *a *= s);
+}
+
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod simd {
     use core::arch::wasm32::*;
@@ -143,6 +173,17 @@ mod tests {
         }
         let a = vec![127i8; 1024];
         assert_eq!(dot_i8(&a, &a), 127 * 127 * 1024);
+    }
+
+    #[test]
+    fn rotation_preserves_dot_products() {
+        let a: Vec<f32> = (0..64).map(|i| ((i * 37 % 11) as f32 - 5.0) / 7.0).collect();
+        let b: Vec<f32> = (0..64).map(|i| ((i * 53 % 13) as f32 - 6.0) / 9.0).collect();
+        let (mut ra, mut rb) = (a.clone(), b.clone());
+        rotate(&mut ra);
+        rotate(&mut rb);
+        assert!((dot_f32(&a, &b) - dot_f32(&ra, &rb)).abs() < 1e-4);
+        assert!((dot_f32(&a, &a) - dot_f32(&ra, &ra)).abs() < 1e-4);
     }
 
     #[test]
