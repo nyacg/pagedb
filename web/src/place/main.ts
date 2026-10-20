@@ -6,7 +6,7 @@ import { Sync, type Row } from "../sync";
 
 declare global {
   interface Window {
-    __BOOT?: { meta?: { rows: Row[] }; leases?: any[]; build?: string; ms?: number };
+    __BOOT?: { meta?: { rows: Row[] }; leases?: any[]; build?: string; ms?: number; base?: { bytes: number; rows: Record<string, number> } };
   }
 }
 const boot = window.__BOOT ?? {};
@@ -343,7 +343,8 @@ sync.onChange(() => {
   userPanel();
   $("#live").className = `dot ${sync.state}`;
 });
-$("#count").textContent = (meta.placements ?? 0).toLocaleString();
+$("#count").textContent = (boot.base?.rows?.placement ?? meta.placements ?? 0).toLocaleString();
+if (boot.base?.bytes) $("#size").textContent = `${(boot.base.bytes / 1e9).toFixed(1)} GB`;
 $("#me").textContent = me;
 fit();
 label();

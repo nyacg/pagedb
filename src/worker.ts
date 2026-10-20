@@ -15,7 +15,10 @@ export { DbObject, HnTail };
 
 const admin = (req: Request, env: Env) => !!env.ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 const vars = (env: Env) => env as unknown as Record<string, unknown>;
-type QueryStub = { query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number }; stats: unknown }> };
+type QueryStub = {
+  query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number }; stats: unknown }>;
+  baseStats(db: string): Promise<{ bytes: number; rows: Record<string, number>; pages: number }>;
+};
 
 async function lease(env: Env, app: App, d: Ref) {
   const key = canon({ name: d.name, args: d.args ?? {} });
@@ -40,7 +43,8 @@ async function ssr(req: Request, env: Env, url: URL, app: App): Promise<Response
   const t0 = Date.now();
   try {
     const stub = env.DB.getByName(obj) as unknown as QueryStub;
-    const results = await Promise.all(fp.prefetch.map((p) => stub.query(db, app.namedQuery(p.name, p.args ?? {}))));
+    const [results, base] = await Promise.all([Promise.all(fp.prefetch.map((p) => stub.query(db, app.namedQuery(p.name, p.args ?? {})))), stub.baseStats(db).catch(() => null)]);
+    if (base) boot.base = base;
     fp.prefetch.forEach((p, i) => {
       const r = results[i].result;
       boot[p.key] = r.rows === undefined && r.count !== undefined ? r.count : r;

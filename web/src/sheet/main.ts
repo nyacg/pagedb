@@ -7,7 +7,7 @@ import { Sync, type Row } from "../sync";
 
 declare global {
   interface Window {
-    __BOOT?: { rows?: { rows: Row[] }; count?: number; zones?: { rows: Row[] }; leases?: any[]; build?: string; ms?: number };
+    __BOOT?: { rows?: { rows: Row[] }; count?: number; zones?: { rows: Row[] }; leases?: any[]; build?: string; ms?: number; base?: { bytes: number } };
   }
 }
 const boot = window.__BOOT ?? {};
@@ -280,5 +280,6 @@ document.addEventListener("focusout", (e) => {
 });
 
 $("#me").textContent = me;
+if (boot.base?.bytes) $("#size").textContent = `${(boot.base.bytes / 1e9).toFixed(1)} GB`;
 subscribe();
 render();
