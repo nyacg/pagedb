@@ -676,6 +676,15 @@ pub fn gt(args: &[String]) {
     let cfg = Cfg::from_json(schema, &cfg_json);
     let list: Vec<String> = fs::read_to_string(arg(args, "--shards").expect("--shards LIST")).unwrap().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
     let src = Shards { list: list.clone(), schema, table: cfg.table };
+    // The same queries as an earlier ground truth (--reuse gt.json), over these shards.
+    if let Some(p) = arg(args, "--reuse") {
+        let prev: Vec<J> = serde_json::from_str(&fs::read_to_string(p).unwrap()).unwrap();
+        let qs: Vec<Vec<f32>> = prev.iter().map(|g| g["q"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()).collect();
+        let ids = exact_top(&qs.iter().map(|q| prep(q, cfg.dims).unwrap()).collect::<Vec<_>>(), &src, cfg.dims, 100);
+        let rows: Vec<J> = prev.iter().zip(ids).map(|(g, ids)| json!({"text": g["text"], "q": g["q"], "ids": ids})).collect();
+        fs::write(arg(args, "--out").expect("--out FILE"), serde_json::to_string(&rows).unwrap()).unwrap();
+        return;
+    }
     let mut texts: Vec<String> = fs::read_to_string(arg(args, "--queries").expect("--queries FILE")).unwrap().lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
     // Titles as queries: one story from each of `titles` shards spread through the list.
     let titles: usize = arg(args, "--titles").map(|v| v.parse().unwrap()).unwrap_or(200);

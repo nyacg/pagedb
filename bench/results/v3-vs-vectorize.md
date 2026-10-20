@@ -47,3 +47,23 @@ round trip); server numbers are inside the object.
 | pagevec, prewarmed (SQLite tier) | 0.859 | — (synchronous) | 91 / 159 ms |
 | pagevec, colo cache | | 366 ms | 617 / 761 ms |
 | pagevec, R2 (nothing resident) | | 1,041 ms (22 GETs, 20.7 MB) | 1,100 / 1,249 ms |
+
+### Filtered search, head to head (`bench/vec-compare.mjs`)
+
+Same 100 queries, same filter `time < 2011-04-27` (the stories of the first 23 shards, 376,832
+of 4.85M, ~8%; both systems hold every one of them), recall@10 against exact search over the
+stories that pass the filter.
+
+| | recall@10 vs exact | client ms p50 / p90 |
+|---|---|---|
+| pagevec (prewarmed), ≤ 256 pages | 0.823 | 89 / 174 |
+| pagevec (prewarmed), ≤ 512 pages | 0.856 | 128 / 180 |
+| Vectorize (in-Worker 17.2 / 20.4 s) | 0.748 | 17,298 / 20,388 |
+
+Caveat: Vectorize was ingesting the rest of the corpus during this run (~3.5M of 4.85M vectors
+indexed, its indexing ~50 minutes behind its writes, upserts throttled with "Too Many
+Requests" above ~1,000 vectors/s), which may inflate its latency. An unfiltered query on the
+same index took 818 ms in the Worker; a filtered one 10 s, run alone.
+
+Ingest, for reference: pagevec builds the whole index offline in ~100 s and serves it as soon as
+the parts are in R2; Vectorize took the vectors at ~335–1,100/s and indexed them asynchronously.
