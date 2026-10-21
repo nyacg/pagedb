@@ -4,7 +4,7 @@
 // Tiers, per query: R2 (SQLite pages dropped, fresh cache salt), colo cache (SQLite dropped,
 // cache warm), SQLite (object evicted, its storage intact), RAM (the same query again).
 // Server ms are measured inside the object (its clock only advances on I/O, so engine CPU
-// shows up only in the client numbers: compare RAM-tier client ms with a point lookup's).
+// is missing there); "in the Worker" is the Worker's round trip to the object, CPU included.
 import { readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
@@ -74,13 +74,14 @@ const pct = (xs, p) => {
 };
 const f = (x) => (x === undefined ? "-" : x.toFixed(0));
 console.log(`\n${db}: ${gt.length} queries, k=10, nprobe=${nprobe}, maxPages=${maxPages}; recall@10 ${(found / (gt.length * 10)).toFixed(3)}`);
-console.log(`| tier | rounds | pages | R2 GETs | cache hits | SQLite hits | server ms p50 / p90 | client ms p50 / p90 |`);
-console.log(`|---|---|---|---|---|---|---|---|`);
+console.log(`| tier | rounds | pages | R2 GETs | cache hits | SQLite hits | server ms p50 / p90 | in the Worker p50 / p90 | client ms p50 / p90 |`);
+console.log(`|---|---|---|---|---|---|---|---|---|`);
 for (const [tier, rs] of Object.entries(rows)) {
   const avg = (k) => (rs.reduce((a, r) => a + (r.stats[k] ?? 0), 0) / rs.length).toFixed(1);
   const server = rs.map((r) => r.stats.totalMs);
   const client = rs.map((r) => r.clientMs);
-  console.log(`| ${tier} | ${avg("rounds")} | ${avg("pages")} | ${avg("r2Gets")} | ${avg("cacheHits")} | ${avg("sqliteHits")} | ${f(pct(server, 0.5))} / ${f(pct(server, 0.9))} | ${f(pct(client, 0.5))} / ${f(pct(client, 0.9))} |`);
+  const worker = rs.map((r) => r.workerMs);
+  console.log(`| ${tier} | ${avg("rounds")} | ${avg("pages")} | ${avg("r2Gets")} | ${avg("cacheHits")} | ${avg("sqliteHits")} | ${f(pct(server, 0.5))} / ${f(pct(server, 0.9))} | ${f(pct(worker, 0.5))} / ${f(pct(worker, 0.9))} | ${f(pct(client, 0.5))} / ${f(pct(client, 0.9))} |`);
 }
 console.log(`point lookup (RAM), client ms p50 / p90: ${f(pct(lookups, 0.5))} / ${f(pct(lookups, 0.9))}`);
 const a = rows.ram[0].result.ann;

@@ -766,17 +766,25 @@ export class DbObject extends DurableObject<Env> {
   }
 
   /** Read the manifest again (e.g. a segment was attached); pages already held stay valid. */
-  async remanifest() {
-    if (this.db) this.ctx.storage.kv.delete(`manifest:${this.db}`);
+  async remanifest(db: string) {
+    // (By name: a freshly started object doesn't know its database until it serves a request.)
+    this.ctx.storage.kv.delete(`manifest:${db}`);
     this.engine = undefined;
     this.freshManifest = true;
     return { ok: true };
   }
 
+  /** Drop up to `limit` cached pages with ids in [from, to) (a big tier can't go in one
+   *  statement: the storage operation would time out). Returns how many are left there. */
+  async dropPages(from: number, to: number, limit = 2000) {
+    this.sql.exec("DELETE FROM pages WHERE id IN (SELECT id FROM pages WHERE id >= ? AND id < ? LIMIT ?)", from, to, limit);
+    return { left: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages WHERE id >= ? AND id < ?", from, to).one().n };
+  }
+
   /** Drop the SQLite page tier and the engine (cold benchmarks). */
-  async reset() {
+  async reset(db?: string) {
     this.sql.exec("DELETE FROM pages");
-    this.ctx.storage.kv.delete(`manifest:${this.db}`);
+    this.ctx.storage.kv.delete(`manifest:${db ?? this.db}`);
     this.ctx.storage.kv.delete("prewarm");
     this.engine = undefined;
     this.freshManifest = true;

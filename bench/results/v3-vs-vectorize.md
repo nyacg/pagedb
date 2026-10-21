@@ -37,6 +37,9 @@ Scripts: `bench/vectorize.mjs` (+ `spikes/vectorize-bench`), `bench/vec-query.mj
 
 ## Head to head, all 4.85M stories, Vectorize idle (fully indexed)
 
+(Single-stage index. With the two-stage index pagevec measures 0.971 recall and 140 ms / 0.885
+filtered: see `v4-vs-turbopuffer.md`, which also notes Vectorize caching repeated queries.)
+
 The 100 hand-written queries, recall@10 against exact search over all 4.85M vectors.
 
 | | recall@10 vs exact | client ms p50 / p90 | in the server |

@@ -72,7 +72,11 @@ export default {
       if ((url.pathname === "/api/query" || url.pathname === "/api/write") && !admin(req, env)) return new Response("unauthorized", { status: 401 });
       if (url.pathname === "/api/query" && req.method === "POST") {
         const { db, ast, obj, salt } = (await req.json()) as { db: string; ast: unknown; obj?: string; salt?: string };
-        return Response.json(await env.DB.getByName(obj ?? db).query(db, ast, { salt }));
+        // workerMs: the Worker's round trip to the object, its CPU included (Workers clocks only
+        // advance across I/O, so the object can't time its own synchronous engine run).
+        const t0 = Date.now();
+        const r = await env.DB.getByName(obj ?? db).query(db, ast, { salt });
+        return Response.json({ ...r, workerMs: Date.now() - t0 });
       }
       if (url.pathname === "/api/mutate" && req.method === "POST") {
         const { name, args, user } = (await req.json()) as { name: string; args: Record<string, unknown>; user?: string };
@@ -133,9 +137,11 @@ export default {
         }
         const db = url.searchParams.get("db") ?? "db1g";
         const stub = env.DB.getByName(url.searchParams.get("obj") ?? db);
-        if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
+        if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset(db));
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
-        if (url.pathname === "/api/admin/remanifest") return Response.json(await stub.remanifest());
+        if (url.pathname === "/api/admin/remanifest") return Response.json(await stub.remanifest(db));
+        if (url.pathname === "/api/admin/drop-pages")
+          return Response.json(await stub.dropPages(Number(url.searchParams.get("from") ?? 0), Number(url.searchParams.get("to") ?? 2 ** 53), Number(url.searchParams.get("limit") ?? 2000)));
         if (url.pathname === "/api/admin/prewarm") {
           const n = (k: string) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : undefined);
           return Response.json(await stub.prewarm(db, n("from"), n("to")));

@@ -656,6 +656,8 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
         v.visit(vi.tree, &staged, &mut |k, e| ov.push((k, e)));
     }
     let shadow: HashSet<&[u8]> = ov.iter().map(|(k, _)| *k).collect();
+    // The clusters those keys are in: base entries elsewhere skip the per-key check.
+    let shadowed: HashSet<u32> = ov.iter().map(|(k, _)| cluster_of(k)).collect();
 
     // Top candidates (2k: room for rows the overlay has since deleted).
     let mut best = Best::new(aq.k * 2 + 8);
@@ -667,17 +669,17 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
             stats.pages = pages.len();
             for p in &pages {
                 let page = Page(p);
-                let mut cur = (u32::MAX, None::<f32>);
+                let mut cur = (u32::MAX, None::<f32>, false);
                 for i in 0..page.count() {
                     let (k, v) = page.entry(i);
                     let cid = cluster_of(k);
                     if cid != cur.0 {
-                        cur = (cid, qc.get(&cid).copied());
+                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid));
                     }
                     let Some(c) = cur.1 else { continue };
                     stats.scanned += 1;
                     let (code, row) = vi.split(v);
-                    if !aq.filters.iter().all(|f| f.matches(row)) || (!shadow.is_empty() && shadow.contains(k)) {
+                    if !aq.filters.iter().all(|f| f.matches(row)) || (cur.2 && shadow.contains(k)) {
                         continue;
                     }
                     best.offer(scorer.score(c, code), k, v);
@@ -705,17 +707,17 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
             let mut cands = Best::new(aq.rerank.max(aq.k));
             for p in &pages {
                 let page = Page(p);
-                let mut cur = (u32::MAX, None::<f32>);
+                let mut cur = (u32::MAX, None::<f32>, false);
                 for i in 0..page.count() {
                     let (k, v) = page.entry(i);
                     let cid = cluster_of(k);
                     if cid != cur.0 {
-                        cur = (cid, qc.get(&cid).copied());
+                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid));
                     }
                     let Some(c) = cur.1 else { continue };
                     stats.scanned += 1;
                     let (w, bits, row) = probe::split(vi.dims, v);
-                    if !early.iter().all(|f| f.matches(row)) || (!shadow.is_empty() && shadow.contains(k)) {
+                    if !early.iter().all(|f| f.matches(row)) || (cur.2 && shadow.contains(k)) {
                         continue;
                     }
                     cands.offer(c + ps.estimate(w, bits), k, &[]);

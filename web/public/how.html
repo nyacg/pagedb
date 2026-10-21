@@ -59,9 +59,9 @@
 </ul>
 
 <h2>6 · Search by meaning, in the same pages</h2>
-<p><a href="/hn?p=semantic">Semantic search on Hacker News</a> runs in the same object as everything else. Every story since 2006 is an embedding (Workers AI, Qwen3-Embedding-0.6B, 1024 dimensions) in a <b>vector index made of ordinary B+trees</b>: one keyed by <i>cluster, story id</i>, whose entries hold a 4-bit code of the story's vector and the columns a result shows, and a small tree of cluster centroids that sits in the pinned region.</p>
+<p><a href="/hn?p=semantic">Semantic search on Hacker News</a> runs in the same object as everything else. Every story since 2006 is an embedding (Workers AI, Qwen3-Embedding-0.6B, 1024 dimensions) in a <b>vector index made of ordinary B+trees</b>: one keyed by <i>cluster, story id</i>, whose entries hold 1 bit per dimension of the story's vector (for a fast first pass) or an 8-bit code and the columns a result shows (to rerank the best candidates), and a small tree of cluster centroids that sits in the pinned region.</p>
 <ul>
-  <li><b>One round, like every other query.</b> The engine scores the centroids, picks the nearest clusters, finds their leaves through the pinned branch pages and asks for all of them at once. Scoring tens of thousands of vectors is one SIMD dot product each, a few milliseconds.</li>
+  <li><b>Two rounds, each fetching everything it needs at once.</b> The engine scores the centroids, picks the nearest clusters and asks for all their 1-bit pages together; it scores ~70,000 vectors with popcounts, then fetches the 8-bit entries of the best 100 and reranks them.</li>
   <li><b>Writes are searchable immediately.</b> A new story and its vector go into the overlay in the same write; searches scan overlay vectors too. A managed vector index (Vectorize) makes writes visible after its next indexing job: seconds to a minute in our measurements.</li>
   <li><b>Semantic results are live.</b> A new story that scores into an open search's top results is pushed to every tab showing it, and points and comment counts update in place.</li>
   <li><b>It's turbopuffer's shape</b> (object storage as the source of truth, centroids cached, one round trip to object storage per cold query, unindexed writes searched directly) built from Durable Objects, SQLite and R2.</li>
@@ -81,13 +81,13 @@
 <p style="font-size:13px;margin-top:14px"><b>Semantic search</b> (all 4.85 million HN stories, compared with Cloudflare Vectorize on the same vectors):</p>
 <table>
   <tr><th>Measured</th><th>pagevec</th><th>Vectorize</th></tr>
-  <tr><td>Recall@10 against exact search (100 queries, same vectors)</td><td class="n win">0.895</td><td class="n">0.786</td></tr>
-  <tr><td>Search, warm (laptop → Cloudflare, p50)</td><td class="n win">59 ms (RAM), 91–193 ms (SQLite)</td><td class="n">506 ms</td></tr>
-  <tr><td>Search with a date filter (~8% of stories)</td><td class="n win">149 ms, recall 0.79</td><td class="n">10.8 s, recall 0.72</td></tr>
-  <tr><td>Search, cold</td><td class="n">1.04 s from R2, 0.37 s from the city cache</td><td class="n">—</td></tr>
+  <tr><td>Recall@10 against exact search (100 queries, same vectors)</td><td class="n win">0.971</td><td class="n">0.786</td></tr>
+  <tr><td>Search, new query (p50 in the Worker)</td><td class="n win">138 ms (SQLite), 44 ms (RAM)</td><td class="n">465 ms</td></tr>
+  <tr><td>Search with a date filter (~8% of stories)</td><td class="n win">140 ms, recall 0.89</td><td class="n">10.2 s, recall 0.72</td></tr>
+  <tr><td>Search, cold</td><td class="n">1.86 s from R2, 0.58 s from the city cache</td><td class="n">—</td></tr>
   <tr><td>A write is searchable</td><td class="n win">on the next search</td><td class="n">after 1–66 s (p50 14 s)</td></tr>
   <tr><td>Results update live</td><td class="n win">yes</td><td class="n">no</td></tr>
-  <tr><td>Monthly cost at this size, before queries</td><td class="n win">~$0.75</td><td class="n">~$52</td></tr>
+  <tr><td>Monthly cost at this size, before queries</td><td class="n win">~$1.50</td><td class="n">~$52</td></tr>
 </table>
 <p style="font-size:13px">Comparisons are against r2db's public demo, measured the same way from the same laptop, both on 100 GB bases (r2db as a returning visitor with its intro panel closed). The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
 

@@ -60,3 +60,12 @@ A randomized Hadamard rotation of the residuals before quantization (`"rotate": 
 idea behind RaBitQ; queries are rotated once, dot products are unchanged) adds only +0.006
 (0.865 at 256 pages, 0.886 at 384): per-dimension steps already capture most of it at 4 bits.
 It's available, off by default.
+
+## Two-stage index (deployed since 2026-10-20)
+
+The rerank above, built: a 1-bit probe tier (RaBitQ-style sign bits of the rotated residual,
+~150 B per entry with the filter columns) scored with popcounts, then the best 100 rescored
+with SQ8 codes from the main tree. 7.0 GB, 162 s to build. At the same 256-page budget,
+recall@10 rises from 0.859 to **0.943** over 300 queries (0.895 → 0.971 on the 100 hand-written
+ones), and filtered (time < 2011) from 0.790 to 0.885. Details and latency:
+`v4-vs-turbopuffer.md`.

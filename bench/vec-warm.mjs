@@ -20,11 +20,13 @@ const query = async (ast) => {
 };
 const pct = (xs, p) => [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(p * xs.length))];
 let hit = 0;
-const first = [], again = [], pages = [], scanned = [], net = [];
+const first = [], again = [], pages = [], scanned = [], net = [], wFirst = [], wAgain = [];
 for (const g of gt) {
   const a = await query(ann(g.q));
   const b = await query(ann(g.q));
   first.push(a.ms);
+  wFirst.push(a.workerMs);
+  wAgain.push(b.workerMs);
   again.push(b.ms);
   pages.push(a.result.ann.pages);
   scanned.push(a.result.ann.scanned);
@@ -35,3 +37,4 @@ for (const g of gt) {
 const avg = (xs) => xs.reduce((s, x) => s + x, 0) / xs.length;
 console.log(`${db}: ${gt.length} queries; recall@10 ${(hit / (10 * gt.length)).toFixed(3)}; ${avg(pages).toFixed(0)} pages, ${avg(scanned).toFixed(0)} vectors scored per query; network fetches ${avg(net).toFixed(2)}/query`);
 console.log(`first run (SQLite tier) client ms p50 ${pct(first, 0.5).toFixed(0)} p90 ${pct(first, 0.9).toFixed(0)}; repeat (RAM) p50 ${pct(again, 0.5).toFixed(0)} p90 ${pct(again, 0.9).toFixed(0)}`);
+if (wAgain[0] != null) console.log(`in the Worker (object round trip, CPU included): first p50 ${pct(wFirst, 0.5)} p90 ${pct(wFirst, 0.9)}; repeat p50 ${pct(wAgain, 0.5)} p90 ${pct(wAgain, 0.9)} ms`);

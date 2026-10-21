@@ -1,6 +1,6 @@
 // pagevec vs Vectorize on the same queries and the same filter (time < cutoff): recall@10 against
 // exact search over the stories that pass the filter (gt from `pagedb-builder vec-gt --reuse`).
-//   node bench/vec-compare.mjs <gt.json> <cutoff ms> [--n 100] [--pages 256,512]
+//   node bench/vec-compare.mjs <gt.json> <cutoff ms> [--n 100] [--pages 256,512] [--no-vectorize]
 import { readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
@@ -28,17 +28,18 @@ const where = { type: "simple", op: "<", left: { type: "column", name: "time" },
 const rows = [];
 for (const pages of opt("--pages", "256,512").split(",").map(Number)) {
   let hit = 0;
-  const ms = [];
+  const ms = [], worker = [];
   for (const g of gt) {
     const vec = Buffer.from(new Float32Array(g.q).buffer).toString("base64");
     const r = await post("https://pagedb-vec.do-pool-lab.workers.dev/api/query", { db: "hnv", obj: "hnv", ast: { table: "story", ann: { index: "story_vec", vec, k: 10, nprobe: 512, maxPages: pages }, where } });
     const want = new Set(g.ids.slice(0, 10));
     hit += r.result.rows.filter((x) => want.has(x.id)).length;
     ms.push(r.clientMs);
+    worker.push(r.workerMs);
   }
-  rows.push(`| pagevec (prewarmed), ≤ ${pages} pages | ${(hit / (10 * gt.length)).toFixed(3)} | ${pct(ms, 0.5).toFixed(0)} / ${pct(ms, 0.9).toFixed(0)} |`);
+  rows.push(`| pagevec (prewarmed), ≤ ${pages} pages (in-Worker ${pct(worker, 0.5)} / ${pct(worker, 0.9)} ms) | ${(hit / (10 * gt.length)).toFixed(3)} | ${pct(ms, 0.5).toFixed(0)} / ${pct(ms, 0.9).toFixed(0)} |`);
 }
-{
+if (!args.includes("--no-vectorize")) {
   let hit = 0;
   const ms = [], server = [];
   for (const g of gt) {

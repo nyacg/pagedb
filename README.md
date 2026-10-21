@@ -88,13 +88,15 @@ in an IVF index stored as ordinary B+trees**, next to the relational data. It's 
 design (object storage first, centroids pinned, one round trip per query, unindexed writes
 searched directly) on Durable Objects + R2. Try it: `/hn?p=semantic&q=…` on the vec Worker.
 
-- **Index format** (`engine/core/src/vector`): a tree keyed `cluster ‖ pk` whose entries hold a
-  4-bit residual code of the vector (all 1024 dims: 512 B) and the columns a result shows; a
-  pinned centroid tree; a `byId` tree for replacing and deleting. Scores are one i8 dot product
-  per entry (SIMD128 in the object).
-- **One fault round:** score the centroids, take the `nprobe` best, find their leaves through
-  the pinned branch pages, ask for all of them at once (≤ `maxPages`). Vector segments use
-  256 KiB chunks; a prewarmed object reads them from its SQLite in batches.
+- **Index format** (`engine/core/src/vector`): two trees keyed `cluster ‖ pk`. The probe tree's
+  entries hold 1 bit per dimension of the rotated residual (RaBitQ-style, 128 B at 1024 dims)
+  and the filter columns; the rerank tree's hold an 8-bit residual code and the columns a result
+  shows. Plus a pinned centroid tree and a `byId` tree for replacing and deleting.
+- **Two stages, one fault round each:** score the centroids, take the best clusters within
+  `maxPages` probe pages, ask for all of them at once, score every entry with popcounts against
+  a 4-bit query, then fetch the best `rerank` (100) candidates' 8-bit entries and rescore them
+  (SIMD128 i8 dot products). Vector segments use 256 KiB chunks; a prewarmed object reads them
+  from its SQLite in batches. (Without `probe` in `vectors.json`, an index is single-stage.)
 - **Writes are searchable at once:** `vec_put` / `vec_del` go into the overlay with the row ops
   of the same batch; a search scans overlay vectors too and tombstones hide base entries. New HN
   stories (the live tail) and visitors' submissions are embedded on write.
@@ -116,20 +118,24 @@ node scripts/attach-vec.mjs data/seg hn hnv                      # base + segmen
 npm run deploy:vec                                               # pagedb-vec Worker (HN_DB=hnv)
 ```
 
-Measured on all 4,848,803 HN stories (1024-d Qwen3 embeddings, 14,276 clusters, 3.6 GB):
+Measured on all 4,848,803 HN stories (1024-d Qwen3 embeddings, 14,276 clusters, 7.0 GB).
+Latency is p50 in the Worker (its round trip to the object, CPU included; a laptop adds its own
+network on top):
 
 | | pagevec |
 |---|---|
-| recall@10 vs exact search over all 4.85M (300 queries) | 0.859 (99.9% of results in the true top 100) |
-| search, prewarmed object (laptop → Cloudflare) | 91 ms p50 (SQLite tier), 49 ms (RAM) |
-| search, cold (nothing resident) | 1.04 s from R2, 366 ms from the city cache (server, 1 fault round) |
-| per search | ~253 pages, ~20k vectors scored (~7 ms of SIMD in the object) |
+| recall@10 vs exact search over all 4.85M | 0.971 (100 hand-written queries), 0.943 (300 incl. titles) |
+| search, prewarmed object | 138 ms (SQLite tier), 44 ms (RAM) |
+| search, cold (nothing resident) | 1.86 s from R2, 578 ms from the city cache (2 fault rounds) |
+| per search | ~255 probe pages + ~45 rerank pages, ~70k vectors scored |
 | a write searchable | on the next search (Vectorize: 1–66 s, p50 14 s) |
-| vs Vectorize, same vectors, 100 queries | recall@10 **0.895 vs 0.786**; warm 59 ms vs 506 ms (p50, laptop); with a date filter 149 ms vs 10.8 s |
-| embedding all stories / building the index | ~50 min on Workers AI (9 jobs), ~$1.60 / 100 s on a laptop |
-| storage | 3.6 GB in R2 ($0.05/mo) + the object's SQLite once prewarmed ($0.70/mo) |
+| vs turbopuffer, same vectors, 100 queries | recall@10 0.971 vs **0.990**; 138 ms vs **13 ms** in the service; ~$0.41 vs $10.03 per 1M searches |
+| vs Vectorize, same vectors, 100 queries | recall@10 **0.971 vs 0.786**; 138 ms vs 465 ms; with a date filter 140 ms vs 10.2 s |
+| embedding all stories / building the index | ~50 min on Workers AI (9 jobs), ~$1.60 / 162 s on a laptop |
+| storage | 7.0 GB in R2 ($0.10/mo) + the object's SQLite once prewarmed ($1.40/mo) |
 
-Results: `bench/results/v0-vec-synth.md`, `v1-hn-recall.md`, `v3-vs-vectorize.md`.
+Results: `bench/results/v0-vec-synth.md`, `v1-hn-recall.md`, `v3-vs-vectorize.md`,
+`v4-vs-turbopuffer.md`.
 
 ## Schemas and datasets
 
