@@ -176,8 +176,9 @@ pagedb is a demo of an idea, built in days. Here is what it can't do, or hasn't 
 - **The data is built offline and is read-mostly.**
   - The 100 GB base is bulk-built by a container job and never changes.
   - Live writes go into an overlay in the object's SQLite.
-  - **Nothing folds the overlay back into R2 yet.** So the writable part is capped by the object's
-    SQLite (10 GB). You can't stream 100 GB of writes through it.
+  - **Nothing folds the overlay back into R2 yet** (see [Next step](#next-step-folding-writes-back-into-r2)).
+    So the writable part is capped by the object's SQLite (10 GB). You can't stream 100 GB of
+    writes through it.
 - **The demos reset nightly.** The Hacker News copy doesn't; its overlay grows with new HN items.
 
 **Scale**
@@ -220,3 +221,36 @@ pagedb is a demo of an idea, built in days. Here is what it can't do, or hasn't 
   - at most 4,096 inbound connections per container;
   - cold starts of several seconds;
   - R2 through a bridge limited to ~4 concurrent connections.
+
+## Next step: folding writes back into R2
+
+Today the base is immutable and every write lives in the object's SQLite overlay. Folding turns
+the overlay into **layers** in R2, LSM-style, so writes are no longer capped by SQLite. The design:
+
+1. **Freeze the overlay and build a layer.**
+   - When the overlay passes a threshold (say 64 MB), freeze it. New writes go into a fresh
+     overlay on top. Reads merge base ⊕ layers ⊕ frozen ⊕ new, so nothing visible changes.
+   - The object builds the frozen overlay into a small B+tree in the same page format and uploads
+     its parts.
+   - Only changed entries are written. Rewriting the 64 KiB base leaves that writes touch instead
+     would write thousands of times more bytes than changed, because writes land all over 100 GB.
+2. **Publish atomically.**
+   - The manifest becomes a list of layers, each owning a range of page ids. A page's R2 location
+     stays arithmetic, and no cached page goes stale.
+   - Write the new manifest, then drop the frozen overlay. The manifest records which overlay
+     version it folded, so a crash in between finishes on restart.
+3. **Merge across layers.**
+   - Layer cells carry tombstones and count deltas.
+   - Layer branch pages sum those deltas, so counts stay O(height).
+   - `nth` (jump to row N) needs a few correction rounds across layers instead of one overlay pass.
+     It's the riskiest piece.
+4. **Compact.**
+   - Merge small layers in the object, in chunks driven by alarms.
+   - Now and then, rewrite the base in the builder container by streaming the merged view through
+     `build_tables`. That's a few dollars for 100 GB.
+   - Delete superseded parts.
+
+Tests: fuzz that the merged view is identical before and after a fold (rows, counts, `nth`,
+live-query output), with crash injection at every step and faults on layer reads.
+
+Folding doesn't lift the one-thread limit on writes; that needs sharding or replicas.
