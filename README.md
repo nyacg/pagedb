@@ -156,12 +156,101 @@ node bench/query.mjs db1g && node bench/load.mjs --sockets 200
 node --import tsx --test test/live.test.ts test/hibernate.test.ts test/lease.test.ts   # need ADMIN_TOKEN in .env
 ```
 
-## Limits
+## Limitations
 
-- **Indexed queries only.** Anything not answerable from an index is refused rather than scanned.
-- **One object's thread** serves a database. Read replicas sharing the base are the next step.
-- **Cold reads pay R2 latency** for parts no one has read recently.
-- **Demo data:** users and projects are read-only. The feed index holds the base's newest 500k
-  comments, plus everything written since.
-- **Container variant:** at most 4,096 inbound connections per container, seconds-long cold starts,
-  and R2 through a bridge limited to ~4 concurrent connections.
+pagedb is a demo of an idea, built in days. Here is what it can't do, or hasn't proven yet.
+
+**Queries**
+- **Only the queries an app defines.** A page can't send its own query. It subscribes to the app's
+  named queries, which the Worker signs (leases).
+- **Only indexed queries.** Every filter and sort needs an index declared in the schema. Anything
+  else is refused, never scanned. Postgres, Zero or Convex would run it.
+- **A new index means rebuilding the base** from the source data. For the 137 GB taxi set that was
+  hours of container time.
+- **Text search is thin.**
+  - HN search matches title words.
+  - Comment search is a substring scan in growing batches, with no word index. A rare word reads
+    20–35 MB of a project's comments from R2: seconds.
+
+**Writes**
+- **The data is built offline and is read-mostly.**
+  - The 100 GB base is bulk-built by a container job and never changes.
+  - Live writes go into an overlay in the object's SQLite.
+  - **Nothing folds the overlay back into R2 yet** (see [Next step](#next-step-folding-writes-back-into-r2)).
+    So the writable part is capped by the object's SQLite (10 GB). You can't stream 100 GB of
+    writes through it.
+- **The demos reset nightly.** The Hacker News copy doesn't; its overlay grows with new HN items.
+
+**Scale**
+- **One object is one thread in one place.**
+  - Every write, live-query update and socket message for a database goes through one Durable
+    Object, in one Cloudflare location.
+  - Users far from it pay the network distance.
+  - There are no read replicas yet.
+- **Cold reads pay R2 latency.**
+  - A page nobody has read recently comes from R2: 100–370 ms per round.
+  - Before the taxi sheet had covering indexes, a cold "sort by tip" took 10.7 s.
+- **The load tests are the easy case.**
+  - Each fan-out test ran for 30 s, with 1,000–2,000 Node WebSocket clients on one laptop, not
+    real browsers.
+  - Every client watched the same list and count, with one writer. Real users watch different
+    views, and each distinct live query costs the object CPU.
+  - Higher write rates are untested.
+
+**Cost claims**
+- **The ~$9/month figure is projected, not a bill.**
+  - It's a 30 s load test (100 GB, 1,000 sockets, 5 writes/s) scaled to a month at Cloudflare's
+    list prices.
+  - That's $5 for the Workers plan, $1.35 for R2 and ~$2.75 for requests. Row writes and duration
+    fit in the included free amounts.
+- **Competitors' prices are our list-price estimates for the same workload.** We sent every write
+  to all 1,000 clients:
+  - That's the worst case for anything that bills per message (Supabase Realtime, Convex,
+    PowerSync, Firestore).
+  - With ~50 recipients per write, our estimates fall to $190–2,100.
+  - Electric + Neon (~$190) is the fairest comparison.
+
+**Everything else**
+- **No auth or permissions.** Visitors are anonymous guests. Leases stop clients from inventing
+  queries, but there are no per-user rules.
+- **No production use.** It was built quickly by Claude Code, tested hard (oracles, fuzzing,
+  browser tests), but it has no operational history.
+- **Demo data quirks.** In the tracker, users and projects are read-only. The feed index holds the
+  base's newest 500k comments, plus everything written since.
+- **The container variant:**
+  - at most 4,096 inbound connections per container;
+  - cold starts of several seconds;
+  - R2 through a bridge limited to ~4 concurrent connections.
+
+## Next step: folding writes back into R2
+
+Today the base is immutable and every write lives in the object's SQLite overlay. Folding turns
+the overlay into **layers** in R2, LSM-style, so writes are no longer capped by SQLite. The design:
+
+1. **Freeze the overlay and build a layer.**
+   - When the overlay passes a threshold (say 64 MB), freeze it. New writes go into a fresh
+     overlay on top. Reads merge base ⊕ layers ⊕ frozen ⊕ new, so nothing visible changes.
+   - The object builds the frozen overlay into a small B+tree in the same page format and uploads
+     its parts.
+   - Only changed entries are written. Rewriting the 64 KiB base leaves that writes touch instead
+     would write thousands of times more bytes than changed, because writes land all over 100 GB.
+2. **Publish atomically.**
+   - The manifest becomes a list of layers, each owning a range of page ids. A page's R2 location
+     stays arithmetic, and no cached page goes stale.
+   - Write the new manifest, then drop the frozen overlay. The manifest records which overlay
+     version it folded, so a crash in between finishes on restart.
+3. **Merge across layers.**
+   - Layer cells carry tombstones and count deltas.
+   - Layer branch pages sum those deltas, so counts stay O(height).
+   - `nth` (jump to row N) needs a few correction rounds across layers instead of one overlay pass.
+     It's the riskiest piece.
+4. **Compact.**
+   - Merge small layers in the object, in chunks driven by alarms.
+   - Now and then, rewrite the base in the builder container by streaming the merged view through
+     `build_tables`. That's a few dollars for 100 GB.
+   - Delete superseded parts.
+
+Tests: fuzz that the merged view is identical before and after a fold (rows, counts, `nth`,
+live-query output), with crash injection at every step and faults on layer reads.
+
+Folding doesn't lift the one-thread limit on writes; that needs sharding or replicas.
