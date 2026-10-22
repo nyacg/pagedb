@@ -254,3 +254,8 @@ Tests: fuzz that the merged view is identical before and after a fold (rows, cou
 live-query output), with crash injection at every step and faults on layer reads.
 
 Folding doesn't lift the one-thread limit on writes; that needs sharding or replicas.
+
+## License
+
+MIT, see [LICENSE](LICENSE). That covers the code in this repo. The datasets the apps are built from
+(Hacker News, Reddit's r/place 2022 canvas history, NYC TLC trip records) keep their own terms.
