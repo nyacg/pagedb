@@ -54,9 +54,11 @@ Details: `bench/results/*.md`.
    - A detail query prefetches its comment thread with the issue.
    - A view's subscriptions share a round.
 4. **Writes.**
-   - Index entries go into an overlay in the object's SQLite, durable when acknowledged.
-   - Reads merge base ⊕ overlay. Counts add each entry's rank delta.
-   - The base is never written. A nightly reset of the demo drops the overlay.
+   - Index entries go into an overlay, logged in the object's SQLite, durable when acknowledged.
+   - Reads merge base ⊕ layer ⊕ overlay. Counts add each entry's rank delta.
+   - The base is never written. Once the overlay holds 4 MB, it's **folded** into a layer in R2
+     (below), so the object's memory stays small however much is written. A nightly reset of the
+     demo drops the overlay and the layer.
 5. **Live queries (IVM).**
    - Each subscription is a window of keys.
    - A write's row changes produce add, remove and edit ops (and refills) per window. These are
@@ -154,6 +156,7 @@ npm run deploy:preview                                  # same, to pagedb-previe
 node scripts/upload.mjs data/db1g db1g                  # base → R2 (or the builder container for 100 GB)
 node bench/query.mjs db1g && node bench/load.mjs --sockets 200
 node --import tsx --test test/live.test.ts test/hibernate.test.ts test/lease.test.ts   # need ADMIN_TOKEN in .env
+node --import tsx scripts/fold-check.ts taxi --edits 20   # fold a preview object; compare queries before/after
 ```
 
 ## Limitations
@@ -175,10 +178,11 @@ pagedb is a demo of an idea, built in days. Here is what it can't do, or hasn't 
 **Writes**
 - **The data is built offline and is read-mostly.**
   - The 100 GB base is bulk-built by a container job and never changes.
-  - Live writes go into an overlay in the object's SQLite.
-  - **Nothing folds the overlay back into R2 yet** (see [Next step](#next-step-folding-writes-back-into-r2)).
-    So the writable part is capped by the object's SQLite (10 GB). You can't stream 100 GB of
-    writes through it.
+  - Live writes go into an overlay, then [fold](#folding-writes-into-r2) into a layer in R2.
+  - **Each fold rewrites the whole layer.** That's fine at the demos' write rates (HN's live
+    copy adds ~2 MB a day). Under heavy writes the layer should be merged into the base now and
+    then (a rebuild in the builder container), which isn't automated yet.
+  - The container variant can't fold: its R2 bridge only reads.
 - **The demos reset nightly.** The Hacker News copy doesn't; its overlay grows with new HN items.
 
 **Scale**
@@ -222,38 +226,36 @@ pagedb is a demo of an idea, built in days. Here is what it can't do, or hasn't 
   - cold starts of several seconds;
   - R2 through a bridge limited to ~4 concurrent connections.
 
-## Next step: folding writes back into R2
+## Folding writes into R2
 
-Today the base is immutable and every write lives in the object's SQLite overlay. Folding turns
-the overlay into **layers** in R2, LSM-style, so writes are no longer capped by SQLite. The design:
+The base is immutable; writes land in an overlay held in the engine's memory (and logged in
+SQLite). Once it holds 4 MB the object folds it into a **layer**: B+trees in R2 between the base
+and the overlay. Reads merge base ⊕ layer ⊕ overlay (`engine/core/src/merged.rs`); the fold is
+`engine/core/src/fold.rs` and `runFold` in `src/do.ts`.
 
-1. **Freeze the overlay and build a layer.**
-   - When the overlay passes a threshold (say 64 MB), freeze it. New writes go into a fresh
-     overlay on top. Reads merge base ⊕ layers ⊕ frozen ⊕ new, so nothing visible changes.
-   - The object builds the frozen overlay into a small B+tree in the same page format and uploads
-     its parts.
-   - Only changed entries are written. Rewriting the 64 KiB base leaves that writes touch instead
-     would write thousands of times more bytes than changed, because writes land all over 100 GB.
-2. **Publish atomically.**
-   - The manifest becomes a list of layers, each owning a range of page ids. A page's R2 location
-     stays arithmetic, and no cached page goes stale.
-   - Write the new manifest, then drop the frozen overlay. The manifest records which overlay
-     version it folded, so a crash in between finishes on restart.
-3. **Merge across layers.**
-   - Layer cells carry tombstones and count deltas.
-   - Layer branch pages sum those deltas, so counts stay O(height).
-   - `nth` (jump to row N) needs a few correction rounds across layers instead of one overlay pass.
-     It's the riskiest piece.
-4. **Compact.**
-   - Merge small layers in the object, in chunks driven by alarms.
-   - Now and then, rewrite the base in the builder container by streaming the merged view through
-     `build_tables`. That's a few dollars for 100 GB.
-   - Delete superseded parts.
-
-Tests: fuzz that the merged view is identical before and after a fold (rows, counts, `nth`,
-live-query output), with crash injection at every step and faults on layer reads.
-
-Folding doesn't lift the one-thread limit on writes; that needs sharding or replicas.
+- **The layer.** Per index, a tree `d` holds every key changed since the base (its value, or a
+  tombstone, with its count delta against the base). Two key-only trees, `plus` and `minus`,
+  hold the keys whose delta is +1 or −1, so their counted branch pages give the layer's count
+  change over any range in O(height).
+- **A fold** streams the old layer and the overlay into new trees. It never reads the base: each
+  entry's delta against the base follows from the old layer's entry and the overlay's.
+  1. Fault in every page of the old layer (one round per level).
+  2. Build the new trees. Pages go to SQLite as they fill, numbered after every page before them.
+  3. Upload them to R2 as 4 MiB parts, under `db/<db>/layer/<object id>/<layer id>/`.
+  4. Swap. Entries already in the new layer leave the overlay; keys written during the upload are
+     rebased onto it. The merged view is identical before and after, so live queries carry on.
+  5. Write the layer pointer and the new overlay log in one SQLite transaction. A crash anywhere
+     leaves either the old state or the new one.
+- **Reads** treat base ⊕ layer as the base. Scans merge the layer in chunks; `nth` (jump to
+  row N) finds a nearby base key from counted pages, then steps through the merged view.
+- **Clean-up.** The replaced layer stays readable until the next fold, then its parts are
+  deleted. A reset deletes them all.
+- **Tests.**
+  - Write fuzz with folds mid-stream: every query identical across each commit, and every
+    window, client and oracle check after every step.
+  - Large multi-level layers against a plain map: scans both ways, counts, `nth`, lookups.
+  - `scripts/fold-check.ts` on a deployed object: the same queries before a fold, after it,
+    after a restart, and with the page cache dropped.
 
 ## License
 

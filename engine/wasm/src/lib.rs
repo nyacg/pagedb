@@ -22,6 +22,8 @@ use std::rc::Rc;
 extern "C" {
     /// Copy page `id` into `dst` (PAGE_SIZE bytes) if the host's synchronous tier has it.
     fn host_page_get(id_lo: u32, id_hi: u32, dst: *mut u8) -> u32;
+    /// A fold wrote page `id` (PAGE_SIZE bytes at `src`): the host stores it synchronously.
+    fn host_page_out(id_lo: u32, id_hi: u32, src: *const u8);
 }
 
 // ------------------------------------------------------------------ RAM tier
@@ -56,6 +58,8 @@ struct Db {
     parts: HashMap<u32, Live>,
     by_ast: HashMap<String, u32>,
     next_pid: u32,
+    /// A fold's new layer, built and uploading, not yet swapped in.
+    pending: Option<Rc<pagedb_core::overlay::Layer>>,
 }
 
 /// A live partition and how many subscriptions share it.
@@ -270,6 +274,7 @@ pub unsafe extern "C" fn init(ptr: *const u8, len: u32) -> u32 {
                     parts: HashMap::new(),
                     by_ast: HashMap::new(),
                     next_pid: 1,
+                    pending: None,
                 })
             });
             set_out(Vec::new());
@@ -624,5 +629,156 @@ pub extern "C" fn ovl_export() -> u32 {
 pub extern "C" fn overlay_stats() -> u32 {
     let s = DB.with(|d| d.borrow().as_ref().map(|db| [db.overlay.map.len() as u64, db.overlay.bytes as u64, db.overlay.version, db.parts.len() as u64]).unwrap_or_default());
     set_out(s.iter().flat_map(|v| v.to_le_bytes()).collect());
+    0
+}
+
+// ------------------------------------------------------------------ folding (see core::fold)
+
+fn root_json(r: &TreeRoot) -> serde_json::Value {
+    // An empty tree has no root page: null (JSON readers mangle u64::MAX).
+    if r.height == 0 {
+        serde_json::json!([null, 0, 0])
+    } else {
+        serde_json::json!([r.root, r.height, r.rows])
+    }
+}
+
+fn root_from(tree: u16, j: &serde_json::Value) -> Result<TreeRoot, String> {
+    let a = j.as_array().ok_or("layer root")?;
+    let height = a.get(1).and_then(|v| v.as_u64()).ok_or("layer height")? as u8;
+    if height == 0 {
+        return Ok(TreeRoot::empty(tree));
+    }
+    Ok(TreeRoot { tree, leaves: 0, root: a[0].as_u64().ok_or("layer root id")?, height, rows: a.get(2).and_then(|v| v.as_u64()).unwrap_or(0) })
+}
+
+fn layer_json(l: &pagedb_core::overlay::Layer) -> String {
+    let mut trees: Vec<_> = l.trees.iter().collect();
+    trees.sort_by_key(|(t, _)| **t);
+    let trees: Vec<serde_json::Value> =
+        trees.into_iter().map(|(t, x)| serde_json::json!({"tree": t, "d": root_json(&x.d), "plus": root_json(&x.plus), "minus": root_json(&x.minus)})).collect();
+    serde_json::json!({ "trees": trees }).to_string()
+}
+
+/// Set the folded layer under the overlay (JSON as `fold_build` returns it). Call before
+/// `ovl_load`: the persisted overlay is relative to base ⊕ this layer.
+#[no_mangle]
+pub unsafe extern "C" fn layer_set(ptr: *const u8, len: u32) -> u32 {
+    let j: serde_json::Value = match serde_json::from_slice(slice(ptr, len)) {
+        Ok(v) => v,
+        Err(e) => return error(format!("bad layer: {e}")),
+    };
+    let mut layer = pagedb_core::overlay::Layer::default();
+    for t in j.get("trees").and_then(|v| v.as_array()).into_iter().flatten() {
+        let tree = match t.get("tree").and_then(|v| v.as_u64()) {
+            Some(x) => x as u16,
+            None => return error("layer tree id"),
+        };
+        let x = (|| -> Result<_, String> {
+            Ok(pagedb_core::overlay::LayerTrees { d: root_from(tree, &t["d"])?, plus: root_from(tree, &t["plus"])?, minus: root_from(tree, &t["minus"])? })
+        })();
+        match x {
+            Ok(x) => layer.trees.insert(tree, x),
+            Err(e) => return error(e),
+        };
+    }
+    DB.with(|d| {
+        if let Some(db) = d.borrow_mut().as_mut() {
+            db.overlay.layer = Some(Rc::new(layer));
+        }
+    });
+    set_out(Vec::new());
+    0
+}
+
+/// Fold step 1: fault in every page of the current layer.
+#[no_mangle]
+pub extern "C" fn fold_touch() -> u32 {
+    let guard = DB.with(|d| d.as_ptr());
+    let Some(db) = (unsafe { (*guard).as_ref() }) else { return error("engine not initialized") };
+    let store = Tiers;
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    let r = pagedb_core::fold::touch(&ctx, &db.overlay);
+    finish(&ctx, r, |_| Vec::new())
+}
+
+/// Pages a fold writes, numbered from `next`; each goes straight to the host.
+struct HostSink {
+    next: PageId,
+}
+
+impl tree::PageSink for HostSink {
+    fn write(&mut self, page: Vec<u8>) -> PageId {
+        let id = self.next;
+        self.next += 1;
+        unsafe { host_page_out(id as u32, (id >> 32) as u32, page.as_ptr()) };
+        id
+    }
+}
+
+/// Fold step 2: build the new layer (old layer ⊕ overlay) into pages numbered from `first`.
+/// OK payload: {"pages": n, "layer": {...}}. From here until `fold_commit` or `fold_abort`,
+/// written keys are tracked so the commit can rebase them.
+#[no_mangle]
+pub extern "C" fn fold_build(first: f64) -> u32 {
+    let guard = DB.with(|d| d.as_ptr());
+    let Some(db) = (unsafe { (*guard).as_mut() }) else { return error("engine not initialized") };
+    let store = Tiers;
+    let first = first as PageId;
+    let mut sink = HostSink { next: first };
+    let built = {
+        let view = pagedb_core::overlay::View::new(&db.overlay);
+        let ctx = Ctx::with_view(&store, &view);
+        match pagedb_core::fold::build(&ctx, &db.roots, &db.overlay, &mut sink) {
+            Ok(l) => l,
+            Err(Miss) => {
+                set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+                return 1;
+            }
+        }
+    };
+    let json = format!("{{\"pages\":{},\"layer\":{}}}", sink.next - first, layer_json(&built));
+    db.pending = Some(Rc::new(built));
+    db.overlay.dirty = Some(Default::default());
+    set_out(json.into_bytes());
+    0
+}
+
+/// Fold step 3 (after the upload): swap the new layer in under a rebased overlay. FAULT: fetch
+/// (the new layer's pages) and call again; nothing changed.
+#[no_mangle]
+pub extern "C" fn fold_commit() -> u32 {
+    let guard = DB.with(|d| d.as_ptr());
+    let Some(db) = (unsafe { (*guard).as_mut() }) else { return error("engine not initialized") };
+    let Some(layer) = db.pending.clone() else { return error("no fold in progress") };
+    let store = Tiers;
+    let map = {
+        let view = pagedb_core::overlay::View::new(&db.overlay);
+        let ctx = Ctx::with_view(&store, &view);
+        match pagedb_core::fold::rebase(&ctx, &db.overlay, &layer) {
+            Ok(m) => m,
+            Err(Miss) => {
+                set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+                return 1;
+            }
+        }
+    };
+    pagedb_core::fold::commit(&mut db.overlay, map, layer);
+    db.pending = None;
+    set_out(Vec::new());
+    0
+}
+
+/// Give up on a fold (the upload failed): the overlay carries on over the old layer.
+#[no_mangle]
+pub extern "C" fn fold_abort() -> u32 {
+    DB.with(|d| {
+        if let Some(db) = d.borrow_mut().as_mut() {
+            db.pending = None;
+            db.overlay.dirty = None;
+        }
+    });
+    set_out(Vec::new());
     0
 }

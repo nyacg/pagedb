@@ -8,5 +8,6 @@ pub mod query;
 pub mod build;
 pub mod overlay;
 pub mod merged;
+pub mod fold;
 pub mod write;
 pub mod ivm;

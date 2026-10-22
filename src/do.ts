@@ -8,7 +8,7 @@
  * it needs; we fetch them as coalesced 1 MiB chunks and call again.
  */
 import { DurableObject } from "cloudflare:workers";
-import { Engine, FAULT, OK, PAGE } from "./engine";
+import { Engine, FAULT, OK, PAGE, type LayerTrees } from "./engine";
 import { encodeRecords, splitRecords, type OvRecord } from "./overlay-codec";
 import { verifyLease } from "./lease";
 
@@ -37,6 +37,7 @@ export interface Env {
 
 /** The slice of R2 we use, over a real binding or (in a container) the R2 bridge. */
 interface Blob {
+  put?(key: string, body: Uint8Array): Promise<unknown>;
   get(key: string, opts?: { range?: { offset: number; length: number } }): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; text(): Promise<string> } | null>;
 }
 function blobStore(b: R2Bucket | Fetcher, bridge?: string, viaUrl?: string, token?: string): Blob {
@@ -83,6 +84,23 @@ const COMPACT_AT = 5_000;
 /** Also compact once the log holds this many bytes beyond twice the overlay itself: replaying
  *  a big log on wake is what costs memory (HN's live tail writes ~1 MB rows). */
 const COMPACT_BYTES = 16_000_000;
+/** Fold the overlay into an R2 layer once it holds this many bytes of keys and values: it lives
+ *  in the engine's memory, and an object that never resets (HN) would otherwise outgrow 128 MB. */
+const FOLD_BYTES = Number((globalThis as { PAGEDB_FOLD_BYTES?: number }).PAGEDB_FOLD_BYTES ?? 4_000_000);
+
+/** A folded layer in R2: its pages are ids [first, first + pages), stored as 4 MiB parts under
+ *  db/<db>/layer/<object id>/<layer id>/ (objects that share a database, like prod and preview,
+ *  never see each other's layers). `prev` is the layer it replaced, kept until the next fold so a read that
+ *  started before the swap can still finish. */
+interface LayerMeta {
+  id: string;
+  base: string;
+  first: number;
+  pages: number;
+  trees: LayerTrees["trees"];
+  at: number;
+  prev?: { id: string; first: number; pages: number };
+}
 
 export interface QueryStats {
   rounds: number;
@@ -130,6 +148,11 @@ export class DbObject extends DurableObject<Env> {
   private engine?: Engine;
   private db?: string;
   private base?: string;
+  private basePages = 0;
+  private layer?: LayerMeta;
+  /** A fold's layer while it uploads and commits (its pages may be read before it's current). */
+  private pendingLayer?: LayerMeta;
+  private foldRun?: Promise<Record<string, unknown>>;
   private sqliteHits = 0;
   private salt = "";
 
@@ -193,14 +216,20 @@ export class DbObject extends DurableObject<Env> {
       dst.set(new Uint8Array(row.data));
       this.sqliteHits++;
       return true;
-    });
+    }, (id, page) => this.sql.exec("INSERT OR REPLACE INTO pages (id, data) VALUES (?, ?)", id, page.slice()));
     engine.init(manifest);
+    // Folded writes (a layer in R2) sit between the base and the overlay log.
+    const layer = this.ctx.storage.kv.get<LayerMeta>(`layer:${db}`);
+    this.layer = layer && layer.base === m.base ? layer : undefined;
+    if (this.layer) engine.setLayer({ trees: this.layer.trees });
     engine.setRamBudget(Number(this.env.RAM_PAGES ?? 512)); // 512 = 32 MiB (a DO); GBs in a container
     this.loadLog(engine, db);
     this.engine = engine;
     if (this.needsCompaction()) this.compactNow();
     this.db = db;
     this.base = m.base;
+    this.basePages = m.pages;
+    if (engine.overlayStats().bytes > FOLD_BYTES) this.scheduleFold();
     // Pinned region: small tables + every tree's interior pages, contiguous at the end of the
     // base. With it resident, a query only ever faults leaves (one round for a list).
     if (m.pinnedFrom !== undefined) {
@@ -320,8 +349,7 @@ export class DbObject extends DurableObject<Env> {
   /** Neighbouring chunks of one part: each from the city cache if it's there, the rest from R2
    *  in as few ranged GETs as possible (then cached as 1 MiB chunks). */
   private async fetchRun(run: number[], stats: QueryStats): Promise<Map<number, ArrayBuffer>> {
-    const part = Math.floor((run[0] * PAGES_PER_CHUNK) / PAGES_PER_PART);
-    const key = `db/${this.db}/base/${this.base}/part-${String(part).padStart(6, "0")}`;
+    const key = this.partKey(Math.floor((run[0] * PAGES_PER_CHUNK) / PAGES_PER_PART));
     const offsetOf = (c: number) => ((c * PAGES_PER_CHUNK) % PAGES_PER_PART) * PAGE;
     const cacheUrl = (c: number) => `https://pagedb.cache/${key}/${offsetOf(c)}${this.salt ? `?s=${this.salt}` : ""}`;
     const out = new Map<number, ArrayBuffer>();
@@ -365,15 +393,33 @@ export class DbObject extends DurableObject<Env> {
     return out;
   }
 
-  /** Run an engine call to completion, resolving page faults. */
-  private async drive(call: () => { status: number; out: Uint8Array }, stats?: QueryStats) {
+  /** R2 key of part `part` (page ids part × 64 …): the base's, or a folded layer's. */
+  private partKey(part: number): string {
+    const id = part * PAGES_PER_PART;
+    const pad = (n: number) => String(n).padStart(6, "0");
+    for (const l of [this.layer, this.pendingLayer, this.layer?.prev]) {
+      if (l && id >= l.first && id < l.first + l.pages) return `${this.layerPrefix(this.db!)}${l.id}/part-${pad((id - l.first) / PAGES_PER_PART)}`;
+    }
+    return `db/${this.db}/base/${this.base}/part-${pad(part)}`;
+  }
+
+  private layerPrefix(db: string) {
+    return `db/${db}/layer/${this.ctx.id.toString()}/`;
+  }
+
+  /** Run an engine call to completion, resolving page faults. `onOk` runs in the same turn as
+   *  the successful call (nothing else can run in between). */
+  private async drive(call: () => { status: number; out: Uint8Array }, stats?: QueryStats, onOk?: (out: Uint8Array) => void, persistNow = false) {
     const st = stats ?? newStats();
     for (;;) {
       const r = call();
-      if (r.status === OK) return r.out;
+      if (r.status === OK) {
+        onOk?.(r.out);
+        return r.out;
+      }
       if (++st.rounds > MAX_ROUNDS) throw new Error(`gave up after ${st.rounds} fault rounds`);
       const f0 = performance.now();
-      await this.resolve(Engine.faults(r.out), st);
+      await this.resolve(Engine.faults(r.out), st, false, persistNow);
       st.roundMs.push(+(performance.now() - f0).toFixed(1));
     }
   }
@@ -594,21 +640,173 @@ export class DbObject extends DurableObject<Env> {
     return { compacted: true, before, after: { rows: this.logRows, bytes: this.logBytes } };
   }
 
+  // ---------------------------------------------------------------- folding (core/src/fold.rs)
+
+  /** Fold soon, from an alarm (which keeps the object alive until it's done). */
+  private scheduleFold() {
+    if (this.foldRun || this.env.R2_BRIDGE) return;
+    void this.ctx.storage.getAlarm().then((at) => (at === null ? this.ctx.storage.setAlarm(Date.now() + 1000) : undefined));
+  }
+
+  async alarm() {
+    const db = this.ctx.storage.kv.get<string>("boundDb");
+    if (!db) return;
+    await this.ensure(db);
+    if (this.engine!.overlayStats().bytes > FOLD_BYTES) {
+      try {
+        console.log("fold", JSON.stringify(await this.fold()));
+      } catch (e) {
+        console.error("fold failed", String((e as Error).stack ?? e));
+      }
+    }
+  }
+
+  /** Admin: fold now (whatever the overlay's size). */
+  async foldNow(db?: string) {
+    db ??= this.db ?? this.ctx.storage.kv.get<string>("boundDb");
+    if (!db) return { folded: false, reason: "no database" };
+    await this.ensure(db);
+    return this.fold();
+  }
+
+  private fold(): Promise<Record<string, unknown>> {
+    if (this.env.R2_BRIDGE) return Promise.resolve({ folded: false, reason: "no R2 writes from a container" });
+    this.foldRun ??= this.runFold().finally(() => (this.foldRun = undefined));
+    return this.foldRun;
+  }
+
+  /**
+   * Overlay → a new layer in R2. Reads and writes carry on throughout; writes made while it
+   * uploads are rebased at the commit. The swap (layer pointer + overlay log) is one SQLite
+   * transaction, so a crash at any point leaves either the old state or the new one.
+   */
+  private async runFold(): Promise<Record<string, unknown>> {
+    const engine = this.engine!;
+    const db = this.db!;
+    const t0 = Date.now();
+    const before = engine.overlayStats();
+    const stats = newStats();
+    const gone = () => this.engine !== engine;
+    const bucket = blobStore(this.env.BUCKET, this.env.R2_BRIDGE, this.env.R2_URL, this.env.R2_TOKEN);
+    if (!bucket.put) return { folded: false, reason: "no R2 writes" };
+    try {
+      // 1. Every page of the current layer, straight into SQLite (more than RAM holds).
+      await this.drive(() => engine.foldTouch(), stats, undefined, true);
+      if (gone()) return { folded: false, reason: "reset" };
+      // 2. The new layer: pages numbered after everything before it, written to SQLite as built.
+      const old = this.layer;
+      const first = Math.ceil(Math.max(this.basePages, old ? old.first + old.pages : 0) / PAGES_PER_PART) * PAGES_PER_PART;
+      let built!: { pages: number; layer: LayerTrees };
+      await this.drive(() => engine.foldBuild(first), stats, (out) => (built = JSON.parse(Engine.text(out))), true);
+      const meta: LayerMeta = {
+        id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+        base: this.base!,
+        first,
+        pages: built.pages,
+        trees: built.layer.trees,
+        at: Date.now(),
+        prev: old && { id: old.id, first: old.first, pages: old.pages },
+      };
+      this.pendingLayer = meta;
+      // 3. Upload, as 4 MiB parts.
+      const t1 = Date.now();
+      const parts = Math.ceil(meta.pages / PAGES_PER_PART);
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(4, parts) }, async () => {
+          while (next < parts) {
+            const p = next++;
+            const lo = first + p * PAGES_PER_PART;
+            const hi = Math.min(first + meta.pages, lo + PAGES_PER_PART);
+            const rows = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM pages WHERE id >= ? AND id < ? ORDER BY id", lo, hi).toArray();
+            if (rows.length !== hi - lo) throw new Error(`fold: part ${p} has ${rows.length} of ${hi - lo} pages`);
+            const body = new Uint8Array((hi - lo) * PAGE);
+            rows.forEach((r, i) => body.set(new Uint8Array(r.data), i * PAGE));
+            await this.gate.run(() => bucket.put!(`${this.layerPrefix(db)}${meta.id}/part-${String(p).padStart(6, "0")}`, body));
+          }
+        }),
+      );
+      const uploadMs = Date.now() - t1;
+      if (gone()) return { folded: false, reason: "reset" };
+      // 4. Swap it in, and 5. persist the swap, in the same turn.
+      let committed = false;
+      await this.drive(() => (gone() ? { status: OK, out: new Uint8Array() } : engine.foldCommit()), stats, () => {
+        if (gone()) return; // reset while the commit waited on pages: this engine is discarded
+        committed = true;
+        this.ctx.storage.transactionSync(() => {
+          this.ctx.storage.kv.put(`layer:${db}`, meta);
+          this.sql.exec("DELETE FROM ovlog");
+          this.sql.exec("DELETE FROM ovl");
+          this.logRows = 0;
+          this.logBytes = 0;
+          this.appendLog(engine.exportOverlay(), engine.overlayStats().version);
+        });
+        this.layer = meta;
+        this.pendingLayer = undefined;
+      }, true);
+      if (!committed) return { folded: false, reason: "reset" };
+      // 6. The layer before the old one: nothing can reach it now.
+      if (old?.prev) {
+        const pp = old.prev;
+        this.sql.exec("DELETE FROM pages WHERE id >= ? AND id < ?", pp.first, pp.first + pp.pages);
+        void this.deleteLayers(db, (id) => id === pp.id);
+      }
+      const after = engine.overlayStats();
+      return {
+        folded: true,
+        layer: meta.id,
+        pages: meta.pages,
+        mb: +((meta.pages * PAGE) / 1e6).toFixed(1),
+        overlay: { before: { entries: before.entries, bytes: before.bytes }, after: { entries: after.entries, bytes: after.bytes } },
+        rounds: stats.rounds,
+        uploadMs,
+        ms: Date.now() - t0,
+      };
+    } catch (e) {
+      if (!gone()) engine.foldAbort();
+      this.pendingLayer = undefined;
+      throw e;
+    }
+  }
+
+  /** Delete layers' parts from R2 (best effort; R2 binding only). */
+  private async deleteLayers(db: string, which: (id: string) => boolean) {
+    const b = this.env.BUCKET as R2Bucket;
+    if (this.env.R2_BRIDGE || typeof b.list !== "function") return;
+    try {
+      let cursor: string | undefined;
+      do {
+        const prefix = this.layerPrefix(db);
+        const page = await b.list({ prefix, cursor });
+        const idOf = (k: string) => k.slice(prefix.length).split("/")[0];
+        const keys = page.objects.map((o) => o.key).filter((k) => which(idOf(k)) && idOf(k) !== this.layer?.id && idOf(k) !== this.pendingLayer?.id);
+        if (keys.length) await b.delete(keys);
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+    } catch (e) {
+      console.error("layer cleanup", String(e));
+    }
+  }
+
   async write(db: string, ops: unknown): Promise<{ version: number; changes: number; ms: number; rounds: number } | { error: string }> {
     const t0 = performance.now();
     await this.ensure(db);
     const stats = newStats();
-    let out: Uint8Array;
+    let result!: { version: number; changes: number; pokes: Record<string, unknown[]> };
     try {
-      out = await this.drive(() => this.engine!.write(typeof ops === "string" ? ops : JSON.stringify(ops)), stats);
+      await this.drive(() => this.engine!.write(typeof ops === "string" ? ops : JSON.stringify(ops)), stats, (out) => {
+        // Logged in the same turn the engine applied it: a fold can't commit in between (the
+        // record is relative to the layer the engine had when it applied the write).
+        const jsonLen = new DataView(out.buffer, out.byteOffset).getUint32(0, true);
+        result = JSON.parse(new TextDecoder().decode(out.subarray(4, 4 + jsonLen)));
+        // One log row for the whole write (its version rides along: no separate version write).
+        this.ctx.storage.transactionSync(() => this.appendLog(out.subarray(4 + jsonLen), result.version));
+      });
     } catch (e) {
       return { error: String((e as Error).message ?? e) };
     }
-    const jsonLen = new DataView(out.buffer, out.byteOffset).getUint32(0, true);
-    const result = JSON.parse(new TextDecoder().decode(out.subarray(4, 4 + jsonLen))) as { version: number; changes: number; pokes: Record<string, unknown[]> };
-    // One log row for the whole write (its version rides along: no separate version write).
-    this.ctx.storage.transactionSync(() => this.appendLog(out.subarray(4 + jsonLen), result.version));
     if (this.needsCompaction()) this.compactNow();
+    if (this.engine!.overlayStats().bytes > FOLD_BYTES) this.scheduleFold();
     // One message per socket with every op for its subscriptions (output gate holds these
     // until the overlay write above is durable).
     const perSocket = new Map<string, Record<string, unknown[]>>();
@@ -652,6 +850,14 @@ export class DbObject extends DurableObject<Env> {
     this.sql.exec("DELETE FROM ovlog");
     this.logRows = 0;
     this.logBytes = 0;
+    // Folded layers go too: back to the published base.
+    const layer = this.ctx.storage.kv.get<LayerMeta>(`layer:${db}`);
+    this.ctx.storage.kv.delete(`layer:${db}`);
+    this.layer = this.pendingLayer = undefined;
+    if (layer) {
+      this.sql.exec("DELETE FROM pages WHERE id >= ?", Math.min(layer.first, layer.prev?.first ?? Infinity));
+      void this.deleteLayers(db, () => true);
+    }
     const version = last + 1;
     this.ctx.storage.kv.put(`version:${db}`, version);
     this.engine = undefined; // next use reloads the (now empty) overlay
@@ -716,7 +922,8 @@ export class DbObject extends DurableObject<Env> {
     const ov = this.engine?.overlayStats();
     const pages = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pages").one().n;
     const log = { rows: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n, legacyEntries: this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n };
-    return { db: this.db, base: this.base, overlayLog: log, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
+    const layer = this.layer && { id: this.layer.id, pages: this.layer.pages, mb: +((this.layer.pages * PAGE) / 1e6).toFixed(1), at: new Date(this.layer.at).toISOString(), folding: !!this.foldRun };
+    return { db: this.db, base: this.base, layer, overlayLog: log, sqlitePages: pages, sqliteMB: +((pages * PAGE) / 1e6).toFixed(1), engine: this.engine?.stats(), overlay: ov, sockets: this.ctx.getWebSockets().length, build: this.env.CF_VERSION_METADATA?.id };
   }
 }
 
