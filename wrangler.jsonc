@@ -37,7 +37,7 @@
       "ai": { "binding": "AI" },
       "triggers": { "crons": ["* * * * *"] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
-      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g-vec", "HN_DB": "hnv", "HN_OBJ": "hnv", "HN_VEC": "story_vec", "RAM_PAGES": "768", "PLACE_DB": "place", "PLACE_OBJ": "place-vec", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi-vec" }
+      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g-vec", "HN_DB": "hnv", "HN_OBJ": "hnv", "HN_VEC": "story_vec", "RAM_PAGES": "640", "PLACE_DB": "place", "PLACE_OBJ": "place-vec", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi-vec" }
     }
   }
 }

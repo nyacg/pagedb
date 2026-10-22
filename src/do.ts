@@ -220,9 +220,11 @@ export class DbObject extends DurableObject<Env> {
     );
     engine.init(manifest);
     engine.setRamBudget(Number(this.env.RAM_PAGES ?? 512)); // 512 = 32 MiB (a DO); GBs in a container
-    const { records, version, logRows } = this.readOverlay(db);
-    engine.loadOverlay(records, version);
-    this.logRows = logRows;
+    // In pieces: one buffer of the whole overlay, its decoded copy and the overlay being built
+    // at once would take ~3× its size out of the object's 128 MB.
+    for (const part of this.overlayParts(db)) engine.loadOverlay(part.records, part.version);
+    engine.loadOverlay(new Uint8Array(0), this.overlayVersion(db));
+    this.logRows = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n;
     this.engine = engine;
     this.db = db;
     this.base = m.base;
@@ -630,24 +632,31 @@ export class DbObject extends DurableObject<Env> {
   }
 
   /** Apply a batch of row ops. Durable before the version is returned and the pokes go out. */
-  /** The persisted overlay: old per-entry rows, then the log in order (later records win). */
-  private readOverlay(db: string): { records: Uint8Array; version: number; logRows: number } {
-    const legacy: OvRecord[] = this.sql
-      .exec<{ tree: number; key: ArrayBuffer; val: ArrayBuffer | null; delta: number }>("SELECT tree, key, val, delta FROM ovl")
-      .toArray()
-      .map((r) => ({ tree: r.tree, key: new Uint8Array(r.key), kind: 1, delta: r.delta, val: r.val ? new Uint8Array(r.val) : null }));
-    const parts: Uint8Array[] = [encodeRecords(legacy)];
+  /** The persisted overlay in order (later records win): old per-entry rows in ~1.5 MB batches,
+   *  then the log's rows. `version` is the latest so far. */
+  private *overlayParts(db: string): Generator<{ records: Uint8Array; version: number }> {
     let version = this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0;
-    let logRows = 0;
-    for (const r of this.sql.exec<{ recs: ArrayBuffer; version: number }>("SELECT recs, version FROM ovlog ORDER BY seq").toArray()) {
-      parts.push(new Uint8Array(r.recs));
-      version = Math.max(version, r.version);
-      logRows++;
+    let batch: OvRecord[] = [];
+    let size = 0;
+    for (const r of this.sql.exec<{ tree: number; key: ArrayBuffer; val: ArrayBuffer | null; delta: number }>("SELECT tree, key, val, delta FROM ovl")) {
+      batch.push({ tree: r.tree, key: new Uint8Array(r.key), kind: 1, delta: r.delta, val: r.val ? new Uint8Array(r.val) : null });
+      size += 13 + r.key.byteLength + (r.val?.byteLength ?? 0);
+      if (size >= LOG_ROW_BYTES) {
+        yield { records: encodeRecords(batch), version };
+        (batch = []), (size = 0);
+      }
     }
-    const records = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-    let at = 0;
-    for (const p of parts) (records.set(p, at), (at += p.length));
-    return { records, version, logRows };
+    if (batch.length) yield { records: encodeRecords(batch), version };
+    for (const r of this.sql.exec<{ recs: ArrayBuffer; version: number }>("SELECT recs, version FROM ovlog ORDER BY seq")) {
+      version = Math.max(version, r.version);
+      yield { records: new Uint8Array(r.recs), version };
+    }
+  }
+
+  /** The overlay's latest version, without reading its records. */
+  private overlayVersion(db: string): number {
+    const logged = this.sql.exec<{ v: number | null }>("SELECT MAX(version) AS v FROM ovlog").one().v ?? 0;
+    return Math.max(this.ctx.storage.kv.get<number>(`version:${db}`) ?? 0, logged);
   }
 
   /** Append encoded overlay records as log rows (split under SQLite's 2 MB row limit). */
@@ -679,12 +688,16 @@ export class DbObject extends DurableObject<Env> {
   compactOverlay() {
     const db = this.db ?? this.ctx.storage.kv.get<string>("boundDb");
     if (!db) return { compacted: false };
-    const { records, version, logRows } = this.readOverlay(db);
+    const logRows = this.logRows;
+    let version = 0;
     const state = new Map<string, OvRecord>();
-    for (const r of decodeRecords(records)) {
-      const k = `${r.tree}:${Array.from(r.key, (b) => b.toString(16).padStart(2, "0")).join("")}`;
-      if (r.kind === 0) state.delete(k);
-      else state.set(k, r);
+    for (const part of this.overlayParts(db)) {
+      version = part.version;
+      for (const r of decodeRecords(part.records)) {
+        const k = `${r.tree}:${Array.from(r.key, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+        if (r.kind === 0) state.delete(k);
+        else state.set(k, r);
+      }
     }
     this.ctx.storage.transactionSync(() => {
       this.sql.exec("DELETE FROM ovlog");
@@ -748,7 +761,7 @@ export class DbObject extends DurableObject<Env> {
    */
   async resetOverlay(db: string) {
     const before = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovl").one().n + this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM ovlog").one().n;
-    const last = this.readOverlay(db).version;
+    const last = this.overlayVersion(db);
     this.sql.exec("DELETE FROM ovl");
     this.sql.exec("DELETE FROM ovlog");
     this.logRows = 0;
