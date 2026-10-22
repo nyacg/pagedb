@@ -592,6 +592,34 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
     0
 }
 
+/// The whole committed overlay as records (every entry kind 1), for compacting the log into
+/// one snapshot without replaying it.
+#[no_mangle]
+pub extern "C" fn ovl_export() -> u32 {
+    let mut out = Vec::new();
+    DB.with(|d| {
+        if let Some(db) = d.borrow().as_ref() {
+            for ((tree, key), e) in &db.overlay.map {
+                out.extend_from_slice(&tree.to_le_bytes());
+                put_u32(&mut out, key.len() as u32);
+                out.extend_from_slice(key);
+                out.push(1);
+                out.push(e.delta as u8);
+                match &e.val {
+                    None => out.extend_from_slice(&[0, 0, 0, 0, 0]),
+                    Some(v) => {
+                        out.push(1);
+                        put_u32(&mut out, v.len() as u32);
+                        out.extend_from_slice(v);
+                    }
+                }
+            }
+        }
+    });
+    set_out(out);
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn overlay_stats() -> u32 {
     let s = DB.with(|d| d.borrow().as_ref().map(|db| [db.overlay.map.len() as u64, db.overlay.bytes as u64, db.overlay.version, db.parts.len() as u64]).unwrap_or_default());

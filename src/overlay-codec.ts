@@ -50,3 +50,22 @@ export function encodeRecords(recs: OvRecord[]): Uint8Array {
   }
   return b;
 }
+
+/** Split encoded records into pieces of at most `max` bytes, at record boundaries (a single
+ *  record bigger than `max` gets a piece of its own). */
+export function splitRecords(b: Uint8Array, max: number): Uint8Array[] {
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const out: Uint8Array[] = [];
+  let start = 0;
+  let p = 0;
+  while (p < b.length) {
+    const end = p + 13 + dv.getUint32(p + 2, true) + dv.getUint32(p + 9 + dv.getUint32(p + 2, true), true);
+    if (end - start > max && p > start) {
+      out.push(b.subarray(start, p));
+      start = p;
+    }
+    p = end;
+  }
+  if (p > start) out.push(b.subarray(start, p));
+  return out;
+}
