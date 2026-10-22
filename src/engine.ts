@@ -24,6 +24,7 @@ interface Exports {
   write(ptr: number, len: number): number;
   ovl_load(ptr: number, len: number, version: number): number;
   overlay_stats(): number;
+  ovl_export(): number;
 }
 
 const enc = new TextEncoder();
@@ -87,6 +88,14 @@ export class Engine {
 
   loadOverlay(records: Uint8Array, version: number) {
     this.result(this.withBytes(records, (p, l) => this.x.ovl_load(p, l, version)));
+  }
+
+  /** The committed overlay as records (one per entry): a compaction snapshot. */
+  exportOverlay(): Uint8Array {
+    this.x.ovl_export();
+    const out = this.out();
+    this.x.overlay_stats(); // release the export buffer inside the engine
+    return out;
   }
 
   overlayStats() {
