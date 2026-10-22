@@ -5,7 +5,7 @@
  *   GET  /api/socket?app=                        → the app's object (subscriptions need leases)
  *   POST /api/mutate?app= {name,args,user}       → a named mutator → the object's write
  *   POST /api/query {db, ast, obj?}  POST /api/write {db, ops, obj?}   (admin: raw ASTs / ops)
- *   PUT  /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict}
+ *   PUT  /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict,compact,fold}
  */
 import { DbObject, type Env } from "./do";
 import { HnTail } from "./hn-tail";
@@ -128,6 +128,7 @@ export default {
         if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
         if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
+        if (url.pathname === "/api/admin/fold") return Response.json(await (stub as unknown as { foldNow(db: string): Promise<unknown> }).foldNow(db));
         if (url.pathname === "/api/admin/compact") return Response.json(await (stub as unknown as { compactOverlay(): Promise<unknown> }).compactOverlay());
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));
       }
