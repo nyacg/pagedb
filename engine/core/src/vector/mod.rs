@@ -35,7 +35,7 @@ use crate::catalog::{ColType, IndexValue, Schema, TableId, TreeId};
 use kernels::{dot_f32_i8, dot_i8, dot_i8_u4, pack_u4};
 use serde_json::Value as J;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 pub const MAX_K: usize = 200;
@@ -638,6 +638,33 @@ fn qc_of(qc: &HashMap<u32, f32>, cents: &Centroids, q: &[f32], cid: u32) -> Opti
     qc.get(&cid).copied().or_else(|| cents.ids.binary_search(&cid).ok().map(|i| q_dot_centroid(cents, i, q)))
 }
 
+/// Folded writes (a layer, see `fold`) of `tree` in the probed clusters: key → value, `None` for a
+/// tombstone. They hide base entries with the same key and are scored like base entries. Scanned
+/// before the base's leaves are fetched; `missed` says some layer page wasn't resident (its miss
+/// is recorded, so it shares the base's fault round).
+struct Folded {
+    entries: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    clusters: HashSet<u32>,
+    missed: bool,
+}
+
+fn folded(ctx: &Ctx, tree: u16, qc: &HashMap<u32, f32>) -> Folded {
+    let mut f = Folded { entries: BTreeMap::new(), clusters: HashSet::new(), missed: false };
+    let Some(l) = ctx.view.and_then(|v| v.layer(tree)).filter(|l| l.d.height > 0) else { return f };
+    let mut cids: Vec<u32> = qc.keys().copied().collect();
+    cids.sort_unstable();
+    for cid in cids {
+        let (lo, hi) = (cid.to_be_bytes(), (cid + 1).to_be_bytes());
+        let r = tree::scan(ctx, &l.d, &Range { lo: &lo, hi: &hi }, false, usize::MAX, &mut |k, v| {
+            f.entries.insert(k.to_vec(), crate::merged::decode_entry(v).0.map(<[u8]>::to_vec));
+            f.clusters.insert(cid);
+            true
+        });
+        f.missed |= r.is_err();
+    }
+    f
+}
+
 /// Run a vector query. One fault round when the centroid and branch pages are resident (they
 /// are pinned), with at most `max_pages` leaf pages requested; two for a two-stage index (the
 /// probe pages, then the rerank entries of the best candidates).
@@ -664,33 +691,53 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
     let qc = match &vi.probe {
         None => {
             let (qc, leaves) = select_clusters(ctx, &roots.get(vi.tree), &cents, aq)?;
-            let pages = ctx.get_all(&leaves)?;
+            let fold = folded(ctx, vi.tree, &qc);
+            let pages = ctx.get_all(&leaves);
+            if fold.missed {
+                return Err(Miss);
+            }
+            let pages = pages?;
             stats.clusters = qc.len();
             stats.pages = pages.len();
+            let mut consider = |k: &[u8], v: &[u8], c: f32, shadowed: bool| {
+                stats.scanned += 1;
+                let (code, row) = vi.split(v);
+                if aq.filters.iter().all(|f| f.matches(row)) && !(shadowed && shadow.contains(k)) {
+                    best.offer(scorer.score(c, code), k, v);
+                }
+            };
             for p in &pages {
                 let page = Page(p);
-                let mut cur = (u32::MAX, None::<f32>, false);
+                let mut cur = (u32::MAX, None::<f32>, false, false);
                 for i in 0..page.count() {
                     let (k, v) = page.entry(i);
                     let cid = cluster_of(k);
                     if cid != cur.0 {
-                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid));
+                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid), fold.clusters.contains(&cid));
                     }
                     let Some(c) = cur.1 else { continue };
-                    stats.scanned += 1;
-                    let (code, row) = vi.split(v);
-                    if !aq.filters.iter().all(|f| f.matches(row)) || (cur.2 && shadow.contains(k)) {
+                    // Rewritten or deleted since the base: the layer's version (if any) is scored below.
+                    if cur.3 && fold.entries.contains_key(k) {
                         continue;
                     }
-                    best.offer(scorer.score(c, code), k, v);
+                    consider(k, v, c, cur.2);
                 }
+            }
+            for (k, v) in &fold.entries {
+                let (Some(v), Some(&c)) = (v, qc.get(&cluster_of(k))) else { continue };
+                consider(k, v, c, shadowed.contains(&cluster_of(k)));
             }
             qc
         }
         Some(probe) => {
             // Stage 1: 1-bit estimates over the probe tier; filters on the columns it carries.
             let (qc, leaves) = select_clusters(ctx, &roots.get(probe.tree), &cents, aq)?;
-            let pages = ctx.get_all(&leaves)?;
+            let fold = folded(ctx, probe.tree, &qc);
+            let pages = ctx.get_all(&leaves);
+            if fold.missed {
+                return Err(Miss);
+            }
+            let pages = pages?;
             stats.clusters = qc.len();
             stats.pages = pages.len();
             let (early, late): (Vec<VFilter>, Vec<VFilter>) = {
@@ -705,66 +752,92 @@ pub fn search(ctx: &Ctx, roots: &Roots, aq: &AnnQuery) -> Result<(Vec<AnnHit>, A
             };
             let ps = probe::ProbeScorer::new(&aq.q);
             let mut cands = Best::new(aq.rerank.max(aq.k));
+            let mut consider = |k: &[u8], v: &[u8], c: f32, shadowed: bool| {
+                stats.scanned += 1;
+                let (w, bits, row) = probe::split(vi.dims, v);
+                if early.iter().all(|f| f.matches(row)) && !(shadowed && shadow.contains(k)) {
+                    cands.offer(c + ps.estimate(w, bits), k, &[]);
+                }
+            };
             for p in &pages {
                 let page = Page(p);
-                let mut cur = (u32::MAX, None::<f32>, false);
+                let mut cur = (u32::MAX, None::<f32>, false, false);
                 for i in 0..page.count() {
                     let (k, v) = page.entry(i);
                     let cid = cluster_of(k);
                     if cid != cur.0 {
-                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid));
+                        cur = (cid, qc.get(&cid).copied(), shadowed.contains(&cid), fold.clusters.contains(&cid));
                     }
                     let Some(c) = cur.1 else { continue };
-                    stats.scanned += 1;
-                    let (w, bits, row) = probe::split(vi.dims, v);
-                    if !early.iter().all(|f| f.matches(row)) || (cur.2 && shadow.contains(k)) {
+                    // Rewritten or deleted since the base: the layer's version (if any) is scored below.
+                    if cur.3 && fold.entries.contains_key(k) {
                         continue;
                     }
-                    cands.offer(c + ps.estimate(w, bits), k, &[]);
+                    consider(k, v, c, cur.2);
                 }
+            }
+            for (k, v) in &fold.entries {
+                let (Some(v), Some(&c)) = (v, qc.get(&cluster_of(k))) else { continue };
+                consider(k, v, c, shadowed.contains(&cluster_of(k)));
             }
             // Stage 2: the candidates' rerank entries (one more round for any not resident).
             let droot = roots.get(vi.tree);
             let cands = cands.sorted();
-            let mut want: Vec<PageId> = Vec::new();
-            let mut leaf_of: Vec<Option<PageId>> = Vec::with_capacity(cands.len());
-            let mut missed = false;
-            for (_, k, _) in &cands {
-                let mut hi = k.clone();
-                hi.push(0);
-                let mut ls = Vec::new();
-                if tree::leaves_in(ctx, &droot, &Range { lo: k, hi: &hi }, &mut ls).is_err() {
-                    missed = true;
-                    leaf_of.push(None);
-                    continue;
-                }
-                leaf_of.push(ls.first().copied());
-                if let Some(&l) = ls.first() {
-                    if !want.contains(&l) {
-                        want.push(l);
-                    }
-                }
-            }
-            if missed {
-                return Err(Miss);
-            }
-            let got = ctx.get_all(&want)?;
-            stats.rerank_pages = got.len();
-            let page_of: HashMap<PageId, &std::rc::Rc<[u8]>> = want.iter().copied().zip(got.iter()).collect();
-            for ((_, k, _), leaf) in cands.iter().zip(leaf_of) {
-                let Some(page) = leaf.and_then(|l| page_of.get(&l)).map(|p| Page(p)) else { continue };
-                let at = page.lower_bound(k);
-                if at >= page.count() || page.key(at) != k.as_slice() {
-                    continue;
-                }
-                let (_, v) = page.entry(at);
+            let mut rerank = |k: &[u8], v: &[u8]| {
                 let (code, row) = vi.split(v);
                 if !late.iter().all(|f| f.matches(row)) {
-                    continue;
+                    return;
                 }
-                let Some(c) = qc_of(&qc, &cents, &aq.q, cluster_of(k)) else { continue };
+                let Some(c) = qc_of(&qc, &cents, &aq.q, cluster_of(k)) else { return };
                 stats.reranked += 1;
                 best.offer(scorer.score(c, code), k, v);
+            };
+            if ctx.view.and_then(|v| v.layer(vi.tree)).is_some_and(|l| l.d.height > 0) {
+                // Some entries may be in the layer: look each one up through base ⊕ layer.
+                let got: Vec<Result<Option<Vec<u8>>, Miss>> = cands.iter().map(|(_, k, _)| crate::merged::get(ctx, &droot, k)).collect();
+                if got.iter().any(|g| g.is_err()) {
+                    return Err(Miss);
+                }
+                for ((_, k, _), v) in cands.iter().zip(got) {
+                    if let Ok(Some(v)) = v {
+                        rerank(k, &v);
+                    }
+                }
+            } else {
+                let mut want: Vec<PageId> = Vec::new();
+                let mut leaf_of: Vec<Option<PageId>> = Vec::with_capacity(cands.len());
+                let mut missed = false;
+                for (_, k, _) in &cands {
+                    let mut hi = k.clone();
+                    hi.push(0);
+                    let mut ls = Vec::new();
+                    if tree::leaves_in(ctx, &droot, &Range { lo: k, hi: &hi }, &mut ls).is_err() {
+                        missed = true;
+                        leaf_of.push(None);
+                        continue;
+                    }
+                    leaf_of.push(ls.first().copied());
+                    if let Some(&l) = ls.first() {
+                        if !want.contains(&l) {
+                            want.push(l);
+                        }
+                    }
+                }
+                if missed {
+                    return Err(Miss);
+                }
+                let got = ctx.get_all(&want)?;
+                let page_of: HashMap<PageId, &std::rc::Rc<[u8]>> = want.iter().copied().zip(got.iter()).collect();
+                for ((_, k, _), leaf) in cands.iter().zip(leaf_of) {
+                    let Some(page) = leaf.and_then(|l| page_of.get(&l)).map(|p| Page(p)) else { continue };
+                    let at = page.lower_bound(k);
+                    if at >= page.count() || page.key(at) != k.as_slice() {
+                        continue;
+                    }
+                    let (_, v) = page.entry(at);
+                    rerank(k, v);
+                }
+                stats.rerank_pages = got.len();
             }
             qc
         }

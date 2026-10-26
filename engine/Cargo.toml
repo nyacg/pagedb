@@ -4,7 +4,7 @@ members = ["core", "wasm", "builder"]
 
 [workspace.package]
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 
 [profile.release]
 opt-level = 3

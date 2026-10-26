@@ -2,32 +2,53 @@
 //! fault injection (and periodic cache drops); after each commit:
 //!   1. every live partition's window equals a fresh execution over base ⊕ overlay;
 //!   2. a client model fed only the pushed ops (add/remove/edit) equals the fresh results;
-//!   3. list/count results equal an oracle that applies the same mutations to plain rows.
+//!   3. list/count/offset results equal an oracle that applies the same mutations to plain rows.
+//!
+//! The fold variant also folds the overlay into a layer every few dozen steps, keeps writing for
+//! a few steps while the fold is "uploading", then commits it, checking that every query's
+//! result is identical across the commit.
 
 use pagedb_core::build::{self, MemDb};
 use pagedb_core::catalog::{comment, issue, tags_json, tracker, STATUSES};
 use pagedb_core::codec::Value;
 use pagedb_core::gen::{Config, Rng};
 use pagedb_core::ivm::{self, DeltaOp, Partition, State};
-use pagedb_core::overlay::{Overlay, View};
+use pagedb_core::fold;
+use pagedb_core::overlay::{Layer, Overlay, View};
 use pagedb_core::page::PageId;
 use pagedb_core::query::{compile, execute, Output, Plan};
-use pagedb_core::tree::{Ctx, Miss, PageStore};
+use pagedb_core::tree::{Ctx, Miss, PageSink, PageStore};
 use pagedb_core::write::{parse_ops, plan_write, RowChange, WriteError};
 use serde_json::{json, Value as J};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-struct Cold<'a> {
-    db: &'a MemDb,
+/// Base pages, then every layer page a fold writes (ids keep growing, as in R2). Only resident
+/// pages are readable; the rest fault.
+struct Cold {
+    pages: RefCell<Vec<Rc<[u8]>>>,
     resident: RefCell<HashSet<PageId>>,
 }
-impl PageStore for Cold<'_> {
+impl PageStore for Cold {
     fn get(&self, id: PageId) -> Option<Rc<[u8]>> {
-        self.resident.borrow().contains(&id).then(|| self.db.pages[id as usize].clone())
+        if !self.resident.borrow().contains(&id) {
+            return None;
+        }
+        self.pages.borrow().get(id as usize).cloned()
     }
 }
+struct Sink<'a>(&'a Cold);
+impl PageSink for Sink<'_> {
+    fn write(&mut self, page: Vec<u8>) -> PageId {
+        let mut p = self.0.pages.borrow_mut();
+        p.push(page.into());
+        (p.len() - 1) as PageId
+    }
+}
+
+#[allow(dead_code)]
+fn _uses(_: &MemDb) {}
 
 fn eq(c: &str, v: J) -> J {
     json!({"type":"simple","op":"=","left":{"type":"column","name":c},"right":{"type":"literal","value":v}})
@@ -204,13 +225,25 @@ fn random_ops(r: &mut Rng, model: &Model, step: usize, clock: &mut f64) -> J {
 
 #[test]
 fn writes_and_live_queries_stay_consistent() {
+    run(99, 0);
+}
+
+#[test]
+fn folds_keep_every_query_identical() {
+    for (seed, every) in [(99, 40), (7, 23), (1234, 9)] {
+        run(seed, every);
+    }
+}
+
+/// `fold_every` = 0: no folds.
+fn run(seed: u64, fold_every: usize) {
     let mut cfg = Config::with_projects(3);
     cfg.issues_per_project = 400;
     cfg.users = 50;
     cfg.comments_per_issue = 3.0;
     cfg.feed_base = 100_000;
     let (db, rows) = build::build(&cfg);
-    let store = Cold { db: &db, resident: RefCell::new(HashSet::new()) };
+    let store = Cold { pages: RefCell::new(db.pages.clone()), resident: RefCell::new(HashSet::new()) };
     let mut model = Model {
         issues: rows.issues.iter().map(|r| (r[0].as_str().unwrap().to_string(), r.clone())).collect(),
         comments: rows.comments.iter().map(|r| (r[0].as_str().unwrap().to_string(), r.clone())).collect(),
@@ -255,12 +288,63 @@ fn writes_and_live_queries_stay_consistent() {
         }
         parts.push(part);
     }
-    let mut r = Rng::new(&[99]);
+    let mut r = Rng::new(&[seed]);
+    let mut fr = Rng::new(&[seed, 1]);
     let mut clock = pagedb_core::gen::NOW;
-    let (mut faults, mut rejected, mut ops_total) = (0, 0, 0);
+    let (mut faults, mut rejected, mut ops_total, mut folds) = (0, 0, 0, 0);
+    // A fold read the overlay and its layer is "uploading": (layer, commit at step).
+    let mut pending: Option<(Rc<Layer>, usize)> = None;
+    let order = json!([["createdAt","desc"],["id","asc"]]);
+    let everything = |store: &Cold, overlay: &Overlay| -> Vec<Output> {
+        store.resident.borrow_mut().extend(0..store.pages.borrow().len() as PageId);
+        let view = View::new(overlay);
+        let ctx = Ctx::with_view(store, &view);
+        let mut out: Vec<Output> = plans.iter().map(|p| execute(&ctx, &db.roots, p).unwrap()).collect();
+        for n in [0u64, 7, 33, 150, 390] {
+            let p = compile(tracker(), &json!({"table":"issue","where":eq("projectId", json!("p0000")),"orderBy":order,"limit":5,"offset":n})).unwrap();
+            out.push(execute(&ctx, &db.roots, &p).unwrap());
+        }
+        out
+    };
     for step in 0..400 {
         if step % 37 == 0 {
             store.resident.borrow_mut().clear(); // cache dropped: everything faults again
+        }
+        if fold_every > 0 {
+            if let Some((layer, at)) = pending.clone() {
+                if step >= at {
+                    let before = everything(&store, &overlay);
+                    store.resident.borrow_mut().clear();
+                    let map = loop {
+                        let view = View::new(&overlay);
+                        let ctx = Ctx::with_view(&store, &view);
+                        match fold::rebase(&ctx, &overlay, &layer) {
+                            Ok(m) => break m,
+                            Err(Miss) => store.resident.borrow_mut().extend(ctx.take_want()),
+                        }
+                    };
+                    let dirty = overlay.dirty.as_ref().unwrap().len();
+                    fold::commit(&mut overlay, map, layer);
+                    assert!(overlay.map.len() <= dirty, "step {step}: {} entries left after a fold, {dirty} written during it", overlay.map.len());
+                    store.resident.borrow_mut().clear();
+                    assert_eq!(everything(&store, &overlay), before, "step {step}: a fold changed query results");
+                    pending = None;
+                    folds += 1;
+                }
+            }
+            if pending.is_none() && step % fold_every == fold_every / 2 {
+                let layer = loop {
+                    let view = View::new(&overlay);
+                    let ctx = Ctx::with_view(&store, &view);
+                    let built = fold::touch(&ctx, &overlay).and_then(|_| fold::build(&ctx, &db.roots, &overlay, &mut Sink(&store)));
+                    match built {
+                        Ok(l) => break l,
+                        Err(Miss) => store.resident.borrow_mut().extend(ctx.take_want()),
+                    }
+                };
+                overlay.dirty = Some(BTreeSet::new());
+                pending = Some((Rc::new(layer), step + fr.below(4) as usize));
+            }
         }
         let ops_json = random_ops(&mut r, &model, step, &mut clock);
         let ops = parse_ops(tracker(), &ops_json).unwrap();
@@ -315,7 +399,7 @@ fn writes_and_live_queries_stay_consistent() {
         }
         // 1 + 2: windows and clients against fresh execution.
         let view = View::new(&overlay);
-        store.resident.borrow_mut().extend(0..db.pages.len() as PageId);
+        store.resident.borrow_mut().extend(0..store.pages.borrow().len() as PageId);
         let ctx = Ctx::with_view(&store, &view);
         for (i, part) in parts.iter().enumerate() {
             assert!(ivm::window_matches_fresh(&ctx, &db.roots, &part.plan, &part.state).unwrap(), "step {step}: partition {i} window drifted\n{}", asts[i]);
@@ -346,8 +430,22 @@ fn writes_and_live_queries_stay_consistent() {
             Output::Count(model.issues.values().filter(|r| r[issue::PROJECT].as_str() == Some("p0000")).count() as u64),
             "step {step}: count vs oracle"
         );
+        let newest = model.list("p0000", |_| true, 400);
+        for n in [0usize, 7, 33, 150, 390] {
+            let p = compile(tracker(), &json!({"table":"issue","where":eq("projectId", json!("p0000")),"orderBy":order,"limit":5,"offset":n})).unwrap();
+            let want: Vec<String> = newest.iter().skip(n).take(5).cloned().collect();
+            assert_eq!(ids(execute(&ctx, &db.roots, &p).unwrap()), want, "step {step}: offset {n} vs oracle");
+        }
         store.resident.borrow_mut().clear();
     }
-    eprintln!("{ops_total} ops, {faults} fault retries, {rejected} rejected batches, overlay {} entries / {} bytes", overlay.map.len(), overlay.bytes);
+    eprintln!(
+        "seed {seed}: {ops_total} ops, {faults} fault retries, {rejected} rejected batches, {folds} folds, overlay {} entries / {} bytes, layer pages {}",
+        overlay.map.len(),
+        overlay.bytes,
+        store.pages.borrow().len() - db.pages.len()
+    );
+    if fold_every > 0 {
+        assert!(folds >= 400 / fold_every - 1, "only {folds} folds");
+    }
     let _ = HashMap::<u8, u8>::new();
 }

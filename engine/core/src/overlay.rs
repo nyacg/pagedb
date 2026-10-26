@@ -5,10 +5,16 @@
 //!
 //! Reads go through `View`: the committed overlay, optionally with a batch's staged writes on
 //! top, so a write batch reads its own writes and nothing is committed until it all succeeds.
+//!
+//! Under the overlay there may be a **layer**: earlier writes, folded into B+trees in R2 (see
+//! `fold`). The overlay is then relative to base ⊕ layer: its deltas say how an entry changes the
+//! count of base ⊕ layer, and dropping an entry returns a key to its base ⊕ layer state.
 
+use crate::tree::TreeRoot;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -18,15 +24,39 @@ pub struct Entry {
 
 pub type Key = (u16, Vec<u8>);
 
+/// One index's folded writes. `d` maps each changed key to its entry (`fold::encode_entry`:
+/// value or tombstone, with its count delta against the base). `plus` and `minus` hold just the
+/// keys whose delta is +1 / −1, so their counted branch pages give the layer's count change over
+/// any range in O(height).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerTrees {
+    pub d: TreeRoot,
+    pub plus: TreeRoot,
+    pub minus: TreeRoot,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Layer {
+    pub trees: HashMap<u16, LayerTrees>,
+}
+
 #[derive(Default, Clone)]
 pub struct Overlay {
     pub map: BTreeMap<Key, Entry>,
     pub version: u64,
     pub bytes: usize,
+    /// Folded writes under the overlay.
+    pub layer: Option<Rc<Layer>>,
+    /// While a fold is in flight: keys written since it read the overlay (they must be rebased
+    /// onto the new layer when it commits; every other entry is in the new layer already).
+    pub dirty: Option<BTreeSet<Key>>,
 }
 
 impl Overlay {
     pub fn apply(&mut self, writes: &[(Key, Option<Entry>)]) {
+        if let Some(d) = self.dirty.as_mut() {
+            d.extend(writes.iter().map(|(k, _)| k.clone()));
+        }
         for (k, e) in writes {
             if let Some(old) = self.map.get(k) {
                 self.bytes -= k.1.len() + old.val.as_ref().map_or(0, |v| v.len());
@@ -93,6 +123,11 @@ impl<'a> View<'a> {
                 f(k, e);
             }
         }
+    }
+
+    /// The folded layer's trees for `tree`, if any.
+    pub fn layer(&self, tree: u16) -> Option<&'a LayerTrees> {
+        self.base.layer.as_deref()?.trees.get(&tree)
     }
 
     pub fn is_empty_for(&self, tree: u16) -> bool {

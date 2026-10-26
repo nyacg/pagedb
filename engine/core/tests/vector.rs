@@ -556,3 +556,69 @@ fn two_stage_writes_are_seen_at_once() {
     assert!(!hits.iter().any(|h| h.pk == "d321"));
 }
 
+
+/// A fold moves the overlay's vector entries (both tiers, and the byId entries) into a layer in
+/// R2. Search must see them there just as it saw them in the overlay: new vectors found, base
+/// vectors re-filed or deleted still hidden.
+#[test]
+fn vectors_survive_a_fold_into_a_layer() {
+    use pagedb_core::fold;
+    use pagedb_core::tree::PageSink;
+    struct Collect(u64, Vec<Rc<[u8]>>);
+    impl PageSink for Collect {
+        fn write(&mut self, page: Vec<u8>) -> PageId {
+            self.1.push(page.into());
+            self.0 + self.1.len() as u64 - 1
+        }
+    }
+    for probe in [None, Some(100)] {
+        let b = build_opts(6000, 60, "sq8", probe);
+        let store = Store { pages: &b.pages, resident: RefCell::new((0..b.pages.len() as PageId).collect()) };
+        let mut ov = Overlay::default();
+        let q = b.vecs[321].clone();
+        let mut v = q.clone();
+        v[1] += 0.002;
+        write(&b, &store, &mut ov, serde_json::json!({"ops":[
+            {"op":"insert","table":"doc","row":{"id":"p1","title":"new","time":1.0,"kind":"show"}},
+            {"op":"vec_put","index":"doc_vec","id":"p1","vec":vec_b64(&v)},
+            {"op":"vec_put","index":"doc_vec","id":"d321","vec":vec_b64(&b.vecs[9])},
+            {"op":"vec_del","index":"doc_vec","id":"d777"}]}));
+        let search = |store: &Store, ov: &Overlay, q: &[f32]| -> Vec<String> {
+            let aq = query(&b, q, 10, 60, serde_json::Value::Null);
+            let ((hits, _), _) = run(store, ov, |ctx| vector::search(ctx, &b.roots, &aq));
+            hits.into_iter().map(|h| h.pk).collect()
+        };
+        let before = (search(&store, &ov, &q), search(&store, &ov, &b.vecs[9]), search(&store, &ov, &b.vecs[777]));
+        assert!(before.0.contains(&"p1".to_string()) && !before.0.contains(&"d321".to_string()));
+        assert!(before.1.contains(&"d321".to_string()) && !before.2.contains(&"d777".to_string()));
+
+        // Fold everything into a layer (pages numbered after the base), then commit it.
+        let mut sink = Collect(b.pages.len() as u64, Vec::new());
+        let layer = {
+            let view = View::new(&ov);
+            let ctx = Ctx::with_view(&store, &view);
+            fold::touch(&ctx, &ov).and_then(|_| fold::build(&ctx, &b.roots, &ov, &mut sink)).expect("all pages resident")
+        };
+        ov.dirty = Some(Default::default());
+        let mut pages = b.pages.clone();
+        pages.extend(sink.1);
+        let store = Store { pages: &pages, resident: RefCell::new((0..pages.len() as PageId).collect()) };
+        let layer = Rc::new(layer);
+        let map = {
+            let view = View::new(&ov);
+            let ctx = Ctx::with_view(&store, &view);
+            fold::rebase(&ctx, &ov, &layer).expect("all pages resident")
+        };
+        fold::commit(&mut ov, map, layer);
+        assert!(ov.map.is_empty(), "everything is in the layer now");
+
+        let after = (search(&store, &ov, &q), search(&store, &ov, &b.vecs[9]), search(&store, &ov, &b.vecs[777]));
+        assert_eq!(after, before, "probe tier: {probe:?}");
+        // And from cold: the layer's pages fault in with the base's (still one round per stage).
+        store.resident.borrow_mut().clear();
+        let aq = query(&b, &q, 10, 60, serde_json::Value::Null);
+        let ((hits, _), rounds) = run(&store, &ov, |ctx| vector::search(ctx, &b.roots, &aq));
+        assert_eq!(hits.into_iter().map(|h| h.pk).collect::<Vec<_>>(), before.0);
+        assert!(rounds <= 4, "{rounds} rounds from cold");
+    }
+}
