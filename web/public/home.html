@@ -259,7 +259,7 @@
     <p class="sub">turbopuffer's architecture rebuilt on Durable Objects + R2: an IVF index made of ordinary B+tree pages, next to the rest of the database. Same 1,024-d Qwen3 vectors, benchmarked against turbopuffer and Cloudflare Vectorize.</p>
     <div class="media">
       <figure><video src="/media/vector-search.mp4" poster="/media/vector-search.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>One search, step by step.</b> 183 of 14,276 clusters, 255 pages in one round trip, ~80k stories scored at 1 bit per dimension, the best 100 reranked with 8 bits.</figcaption></figure>
-      <figure><video src="/media/vector-hero.mp4" poster="/media/vector-hero.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>Real windows.</b> Three searches at 43–52 ms, and a story posted in one window found by meaning in the other 0.9 s later.</figcaption></figure>
+      <figure><video src="/media/vector-hero.mp4" poster="/media/vector-hero.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>Real windows.</b> Three searches at 43–52 ms (query embeddings already cached; a brand-new query adds ~0.5–1.5 s for Workers AI to embed it), and a story posted in one window found by meaning in the other 0.9 s later.</figcaption></figure>
     </div>
     <div class="two" style="margin-top:22px">
       <div>
