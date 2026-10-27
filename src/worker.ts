@@ -11,6 +11,8 @@ import { DbObject, type Env } from "./do";
 import { HnTail } from "./hn-tail";
 import { APPS, appFor, type App, type Ref } from "./apps";
 import { canon, signLease } from "./lease";
+import { embed, packVector, storyText, type EmbedEnv } from "./embed";
+import { VEC } from "./apps/hn";
 export { DbObject, HnTail };
 
 const admin = (req: Request, env: Env) => !!env.ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
@@ -60,6 +62,9 @@ async function ssr(req: Request, env: Env, url: URL, app: App): Promise<Response
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    // A retired deployment (the old semantic-search-only Worker) sends visitors to the live site.
+    const to = (env as unknown as { REDIRECT_TO?: string }).REDIRECT_TO;
+    if (to && !url.pathname.startsWith("/api/admin/")) return Response.redirect(`${to}${url.pathname}${url.search}`, 301);
     const app = appFor(url);
     try {
       if (url.pathname === "/api/lease" && req.method === "POST") {
@@ -150,6 +155,24 @@ export default {
         if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
         if (url.pathname === "/api/admin/fold") return Response.json(await (stub as unknown as { foldNow(db: string): Promise<unknown> }).foldNow(db));
         if (url.pathname === "/api/admin/compact") return Response.json(await (stub as unknown as { compactOverlay(): Promise<unknown> }).compactOverlay());
+        // Vectors for stories written since the vector index was built (newest first, a page of
+        // up to 100 per call): ?since=<ms>&start={"time":…,"id":"…"}. Same text and model as the
+        // live tail's (apps/hn withVectors).
+        if (url.pathname === "/api/admin/vec-backfill" && req.method === "POST") {
+          const since = Number(url.searchParams.get("since") ?? Date.now());
+          const start = url.searchParams.get("start");
+          const q = { table: "story", orderBy: [["time", "desc"], ["id", "asc"]], limit: 100, ...(start ? { start: { row: JSON.parse(start) } } : {}) };
+          const page = (await (stub as unknown as { query(db: string, ast: unknown): Promise<{ result: { rows: Record<string, any>[] } }> }).query(db, q)).result.rows;
+          const rows = page.filter((r) => r.time >= since);
+          if (rows.length) {
+            const vecs = await embed(env as unknown as EmbedEnv, rows.map((r) => storyText(r) || "(untitled)"));
+            const ops = rows.map((r, i) => ({ op: "vec_put", index: VEC.index, id: r.id, vec: packVector(vecs[i], VEC.dims) }));
+            const w = await (stub as unknown as { write(db: string, ops: unknown): Promise<{ error?: string }> }).write(db, { ops });
+            if (w.error) return Response.json({ error: w.error }, { status: 500 });
+          }
+          const last = page.at(-1);
+          return Response.json({ n: rows.length, oldest: rows.at(-1)?.time, next: rows.length === page.length && last ? { time: last.time, id: last.id } : null });
+        }
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));
       }
       return env.ASSETS.fetch(req);

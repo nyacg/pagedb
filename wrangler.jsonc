@@ -14,7 +14,10 @@
   "triggers": { "crons": ["0 9 * * *", "* * * * *"] },
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
   // The public demo: the 100 GB base, one long-lived object (its city cache and SQLite stay warm).
-  "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi" },
+  // HN_VEC: Hacker News has a vector index (semantic search; the live tail embeds new stories).
+  // RAM_PAGES: the engine's page cache, 40 MiB: it also holds the vector index's pinned
+  // centroids (268 pages), so one search's ~300 pages fit beside them.
+  "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "HN_VEC": "story_vec", "RAM_PAGES": "640", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi" },
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
   "env": {
     // `npm run deploy:preview` → https://pagedb-preview.do-pool-lab.workers.dev: same base in R2,
@@ -28,16 +31,17 @@
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
       "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g", "HN_DB": "hn", "HN_OBJ": "hn", "PLACE_DB": "place", "PLACE_OBJ": "place", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi" }
     },
-    // `npx wrangler deploy --env vec` → https://pagedb-vec.do-pool-lab.workers.dev: semantic search
-    // over HN (a base with the stories' vector index attached: db "hnv"), its own objects.
+    // `npx wrangler deploy --env vec` → https://pagedb-vec.do-pool-lab.workers.dev: where semantic
+    // search over HN was built (db "hnv"). Retired: it redirects to the live site, whose HN now has
+    // the vector index; no cron, so its HN tail is idle. /api/admin still reaches its objects.
     "vec": {
       "name": "pagedb-vec",
       "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }, { "name": "HN_TAIL", "class_name": "HnTail" }] },
       "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
       "ai": { "binding": "AI" },
-      "triggers": { "crons": ["* * * * *"] },
+      "triggers": { "crons": [] },
       "version_metadata": { "binding": "CF_VERSION_METADATA" },
-      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g-vec", "HN_DB": "hnv", "HN_OBJ": "hnv", "HN_VEC": "story_vec", "RAM_PAGES": "640", "PLACE_DB": "place", "PLACE_OBJ": "place-vec", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi-vec" }
+      "vars": { "DEMO_DB": "db100g", "DEMO_OBJ": "demo100g-vec", "REDIRECT_TO": "https://pagedb.do-pool-lab.workers.dev", "HN_DB": "hnv", "HN_OBJ": "hnv", "HN_VEC": "story_vec", "RAM_PAGES": "640", "PLACE_DB": "place", "PLACE_OBJ": "place-vec", "TAXI_DB": "taxi", "TAXI_OBJ": "taxi-vec" }
     }
   }
 }

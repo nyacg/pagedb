@@ -111,7 +111,7 @@ export class HnTail extends DurableObject<Env> {
       const to = Math.min(max, last + PER_TICK);
       const ids = Array.from({ length: to - last }, (_, i) => last + 1 + i);
       const items = (await pool(ids, 6, (id) => getJson<Item>(`item/${id}.json`))).filter((x): x is Item => !!x && !x.dead && !x.deleted);
-      await this.writeAll(await this.opsFor(items));
+      await this.writeAll(await this.opsFor(items), last);
       last = to;
       kv.put("last", last);
     }
@@ -153,10 +153,16 @@ export class HnTail extends DurableObject<Env> {
     return withVectors(ops, this.env as unknown as Record<string, unknown>);
   }
 
-  /** Write in batches of 100; if a batch is refused (e.g. an item already written before a
-   *  restart), write its ops one by one and skip the refused ones. */
-  private async writeAll(ops: unknown[]) {
+  /** Write in batches of 100; if a batch is refused, write its ops one by one. An item already
+   *  written (before a restart: "story 123 exists") is skipped; any other failure (the object
+   *  out of memory, say) throws, so the tick keeps its place and retries the same items next
+   *  minute instead of losing them. After 5 failed tries on the same range, the rest are skipped
+   *  (and the error recorded) so one bad item can't stall the tail. Score updates (no `at`) just
+   *  skip failures: the next pass rewrites them anyway. */
+  private async writeAll(ops: unknown[], at?: number) {
     let written = 0;
+    const kv = this.ctx.storage.kv;
+    const tries = at !== undefined && kv.get<number>("retryAt") === at ? (kv.get<number>("retries") ?? 0) : 0;
     for (let i = 0; i < ops.length; i += 100) {
       const chunk = ops.slice(i, i + 100);
       const r = await this.db.write(this.dbName, { ops: chunk });
@@ -164,9 +170,18 @@ export class HnTail extends DurableObject<Env> {
         written += chunk.length;
         continue;
       }
-      for (const op of chunk) if (!(await this.db.write(this.dbName, { ops: [op] })).error) written++;
+      for (const op of chunk) {
+        const e = (await this.db.write(this.dbName, { ops: [op] })).error;
+        if (!e) written++;
+        else if (at !== undefined && !/ exists$/.test(e) && tries < 5) {
+          kv.put("written", (kv.get<number>("written") ?? 0) + written);
+          if (at !== undefined) (kv.put("retryAt", at), kv.put("retries", tries + 1));
+          throw new Error(`write failed (try ${tries + 1}): ${e}`);
+        }
+        else if (at !== undefined && !/ exists$/.test(e)) kv.put("error", `${new Date().toISOString()} skipped after 5 tries: ${e}`);
+      }
     }
-    this.ctx.storage.kv.put("written", (this.ctx.storage.kv.get<number>("written") ?? 0) + written);
+    kv.put("written", (kv.get<number>("written") ?? 0) + written);
   }
 
   /** Mirror HN's front page into `topRank` (and, every other minute, the ranked scores). */
