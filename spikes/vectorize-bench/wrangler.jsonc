@@ -1,0 +1,14 @@
+{
+  // Vectorize side of the pagevec benchmark (bench/results/v3-vs-vectorize.md): the same
+  // 1024-d story vectors, loaded from the PVEC shards in R2.
+  //   npx wrangler vectorize create hn-stories-1024 --dimensions=1024 --metric=cosine
+  //   npx wrangler vectorize create-metadata-index hn-stories-1024 --property-name=kind --type=string
+  //   npx wrangler vectorize create-metadata-index hn-stories-1024 --property-name=time --type=number
+  "name": "pagedb-vectorize-bench",
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "vectorize": [{ "binding": "VEC", "index_name": "hn-stories-1024" }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+  "limits": { "cpu_ms": 120000 }
+}

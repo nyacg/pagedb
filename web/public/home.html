@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pagedb · databases in R2, live from one Durable Object</title>
+<meta name="description" content="pagedb keeps a database as immutable pages in R2 and serves it, live, from one Cloudflare Durable Object. 300 GB of real data across four demos, plus vector search over every Hacker News story.">
+<style>
+  :root { --bg:#f7f6f3; --panel:#fff; --line:#e7e5e0; --line2:#f0eee9; --ink:#141413; --ink2:#55534e; --ink3:#93918a; --accent:#2a78d6; --accent-soft:#eaf2fc; --orange:#eb6834; --green:#16a34a; }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+  .mono { font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px; }
+  /* nav */
+  .top { position: sticky; top: 0; z-index: 10; background: rgba(247,246,243,.88); backdrop-filter: saturate(1.4) blur(10px); border-bottom: 1px solid var(--line); }
+  .top .wrap { display: flex; align-items: center; gap: 4px; height: 50px; }
+  .brand { font-weight: 800; letter-spacing: -.02em; font-size: 17px; margin-right: 14px; color: var(--ink); } .brand span { color: var(--accent); }
+  .top a.n { color: var(--ink2); font-size: 14px; padding: 6px 10px; border-radius: 7px; } .top a.n:hover { background: #ecebe6; text-decoration: none; color: var(--ink); }
+  .top .grow { flex: 1; }
+  .top a.gh { color: var(--ink); font-weight: 600; font-size: 14px; border: 1px solid var(--line); background: #fff; padding: 5px 11px; border-radius: 8px; }
+  /* hero */
+  .hero { padding: 64px 0 28px; }
+  .kicker { font: 600 13px ui-monospace, "JetBrains Mono", monospace; letter-spacing: .14em; text-transform: uppercase; color: #6e6d69; }
+  h1 { font-size: 54px; line-height: 1.04; letter-spacing: -.035em; margin: 14px 0 18px; max-width: 900px; font-weight: 750; }
+  h1 em { font-style: normal; color: var(--accent); }
+  .lede { font-size: 19px; color: var(--ink2); max-width: 760px; margin: 0; }
+  .lede b { color: var(--ink); }
+  .facts { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin: 38px 0 0; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
+  .fact { padding: 16px 18px; border-right: 1px solid var(--line2); }
+  .fact:last-child { border-right: 0; }
+  .fact .v { font: 700 26px/1.1 ui-monospace, "JetBrains Mono", monospace; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .fact .v.blue { color: var(--accent); }
+  .fact .l { font-size: 13px; color: var(--ink2); margin-top: 6px; }
+  /* start cards */
+  .starts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin: 30px 0 0; }
+  .start { display: block; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; color: var(--ink); transition: transform .15s, box-shadow .15s; }
+  .start:hover { text-decoration: none; transform: translateY(-2px); box-shadow: 0 10px 30px rgba(0,0,0,.06); }
+  .start .k { font: 600 11.5px ui-monospace, monospace; letter-spacing: .12em; color: #6e6d69; text-transform: uppercase; }
+  .start h3 { margin: 6px 0 6px; font-size: 19px; letter-spacing: -.01em; }
+  .start p { margin: 0; color: var(--ink2); font-size: 14px; }
+  section { padding: 56px 0 0; }
+  h2 { font-size: 30px; letter-spacing: -.025em; margin: 0 0 6px; }
+  h2 + .sub { color: var(--ink2); margin: 0 0 22px; max-width: 760px; }
+  /* live */
+  .live { display: grid; grid-template-columns: 1.15fr 1fr; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+  .panel h4 { margin: 0 0 10px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #bbb; display: inline-block; } .dot.on { background: var(--green); box-shadow: 0 0 0 0 rgba(22,163,74,.5); animation: ping 2s infinite; }
+  @keyframes ping { 0% { box-shadow: 0 0 0 0 rgba(22,163,74,.45); } 70% { box-shadow: 0 0 0 7px rgba(22,163,74,0); } 100% { box-shadow: 0 0 0 0 rgba(22,163,74,0); } }
+  .panel h4 .meta { margin-left: auto; font-weight: 400; color: var(--ink3); font-size: 12.5px; }
+  .semform { display: flex; gap: 8px; }
+  .semform input { flex: 1; font: inherit; font-size: 15px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fbfbfa; outline: none; min-width: 0; }
+  .semform input:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px var(--accent-soft); }
+  .semform button { font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: 0; border-radius: 10px; padding: 0 16px; cursor: pointer; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+  .chips button { font: inherit; font-size: 12.5px; color: var(--ink2); background: #f4f3ef; border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+  .chips button:hover { color: var(--ink); border-color: #d6d4cd; }
+  .semstats { font-size: 12.5px; color: var(--ink3); margin: 10px 0 6px; min-height: 18px; }
+  .semstats b { color: var(--accent); font-weight: 600; }
+  ol.res { list-style: none; margin: 0; padding: 0; }
+  ol.res li { display: grid; grid-template-columns: 54px 1fr; gap: 10px; align-items: baseline; padding: 7px 0; border-top: 1px solid var(--line2); }
+  ol.res .sim { height: 6px; border-radius: 3px; background: #f1e3d8; position: relative; top: -2px; } ol.res .sim i { position: absolute; inset: 0 auto 0 0; border-radius: 3px; background: #ff6600; }
+  ol.res a { color: var(--ink); font-weight: 550; } ol.res .d { color: var(--ink3); font-size: 12.5px; }
+  .feed { list-style: none; margin: 0; padding: 0; }
+  .feed li { padding: 7px 0; border-top: 1px solid var(--line2); display: grid; grid-template-columns: 1fr auto; gap: 10px; font-size: 14px; }
+  .feed li .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
+  .feed li .t i { font-style: normal; color: var(--ink3); font-size: 12px; margin-right: 6px; font-family: ui-monospace, monospace; }
+  .feed li .a { color: var(--ink3); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .feed li.fresh { animation: fresh 2.4s ease-out; }
+  @keyframes fresh { 0% { background: #fff5d6; } 100% { background: transparent; } }
+  .note { font-size: 12.5px; color: var(--ink3); margin-top: 10px; }
+  /* demos */
+  .demos { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .demo { display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; color: var(--ink); transition: transform .15s, box-shadow .15s; }
+  .demo:hover { text-decoration: none; transform: translateY(-3px); box-shadow: 0 14px 34px rgba(0,0,0,.08); }
+  .demo .img { aspect-ratio: 16 / 10; background-size: cover; background-position: top left; border-bottom: 1px solid var(--line); }
+  .demo .b { padding: 14px 16px 16px; }
+  .demo h3 { margin: 0 0 4px; font-size: 16px; }
+  .demo .size { font: 600 12px ui-monospace, monospace; color: var(--accent); }
+  .demo p { margin: 6px 0 0; color: var(--ink2); font-size: 13.5px; }
+  /* walkthrough */
+  .walk { display: grid; grid-template-columns: 300px 1fr; gap: 18px; align-items: stretch; }
+  .steps { list-style: none; margin: 0; padding: 0; counter-reset: s; display: flex; flex-direction: column; gap: 4px; }
+  .steps li { counter-increment: s; padding: 9px 12px 9px 40px; border-radius: 10px; cursor: pointer; position: relative; color: var(--ink2); font-size: 14px; line-height: 1.35; border: 1px solid transparent; }
+  .steps li::before { content: counter(s); position: absolute; left: 12px; top: 9px; width: 19px; height: 19px; border-radius: 50%; background: #ecebe6; color: var(--ink2); font: 600 11px/19px ui-monospace, monospace; text-align: center; }
+  .steps li b { color: var(--ink); font-weight: 600; display: block; }
+  .steps li.on { background: var(--panel); border-color: var(--line); box-shadow: 0 6px 20px rgba(0,0,0,.05); }
+  .steps li.on::before { background: var(--accent); color: #fff; }
+  .steps li .bar { position: absolute; left: 12px; right: 12px; bottom: 4px; height: 2px; background: var(--line2); border-radius: 1px; overflow: hidden; display: none; }
+  .steps li.on .bar { display: block; } .steps li.on .bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .stage { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; }
+  .stage svg { width: 100%; height: auto; display: block; }
+  .stage .cap { padding: 6px 12px 10px; color: var(--ink2); font-size: 14.5px; min-height: 68px; }
+  .stage .cap b { color: var(--ink); }
+  /* svg diagram states */
+  .dg .box { fill: #fff; stroke: #d8d6cf; stroke-width: 1.5; transition: stroke .3s, fill .3s; }
+  .dg .lbl { font: 600 15px Inter, system-ui, sans-serif; fill: var(--ink); }
+  .dg .sm { font: 500 12.5px Inter, system-ui, sans-serif; fill: var(--ink2); }
+  .dg .ms { font: 600 12px ui-monospace, monospace; fill: var(--ink3); }
+  .dg .hot .box { stroke: var(--accent); stroke-width: 2.5; fill: #f5f9ff; }
+  .dg .hot .ms { fill: var(--accent); }
+  .dg .wire { stroke: #cfccc4; stroke-width: 2; fill: none; transition: stroke .3s, opacity .3s; }
+  .dg .wire.on { stroke: var(--accent); stroke-width: 3; stroke-dasharray: 8 7; animation: flow .7s linear infinite; }
+  .dg .wire.on.back { animation-direction: reverse; }
+  .dg .wire.orange.on { stroke: var(--orange); }
+  @keyframes flow { to { stroke-dashoffset: -15; } }
+  .dg .tag { opacity: 0; transition: opacity .3s; } .dg .tag.on { opacity: 1; }
+  .dg .tag rect { fill: #1d1d1f; } .dg .tag text { fill: #fff; font: 600 12.5px Inter, system-ui, sans-serif; }
+  .dg .tier rect.box { rx: 9; }
+  /* media */
+  .media { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .media figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .media video, .media img { display: block; width: 100%; height: auto; background: #f4f3f2; }
+  .media figcaption { padding: 10px 14px 12px; font-size: 13.5px; color: var(--ink2); } .media figcaption b { color: var(--ink); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
+  .prose p { color: var(--ink2); margin: 0 0 12px; } .prose b { color: var(--ink); }
+  table.t { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 14px; }
+  table.t th, table.t td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line2); vertical-align: top; }
+  table.t th { background: #f6f5f2; color: var(--ink2); font-weight: 600; font-size: 12.5px; }
+  table.t td.n { font-variant-numeric: tabular-nums; white-space: nowrap; } table.t .win { color: #15803d; font-weight: 600; }
+  table.t tr:last-child td { border-bottom: 0; }
+  .verdict { margin-top: 14px; padding: 14px 16px; border-radius: 12px; background: #fff7f2; border: 1px solid #f6d8c8; color: #6b3a22; font-size: 14.5px; }
+  .verdict b { color: #3d1f10; }
+  .limits { columns: 2; column-gap: 32px; padding-left: 18px; color: var(--ink2); }
+  .limits li { break-inside: avoid; margin: 0 0 10px; } .limits b { color: var(--ink); }
+  footer { margin: 64px 0 0; padding: 24px 0 40px; border-top: 1px solid var(--line); color: var(--ink3); font-size: 13px; }
+  @media (max-width: 900px) {
+    h1 { font-size: 38px; } .facts { grid-template-columns: repeat(2, 1fr); } .fact { border-bottom: 1px solid var(--line2); }
+    .starts, .live, .walk, .media, .two { grid-template-columns: 1fr; } .demos { grid-template-columns: 1fr 1fr; } .limits { columns: 1; }
+    .top a.n.opt { display: none; } .top a.n { white-space: nowrap; padding: 6px 7px; font-size: 13.5px; } .brand { margin-right: 6px; }
+    .two > div { min-width: 0; } table.t { font-size: 12.5px; } table.t th, table.t td { padding: 7px 8px; } table.t td.n { white-space: normal; }
+  }
+</style></head>
+<body>
+<div class="top"><div class="wrap">
+  <a class="brand" href="/">page<span>db</span></a>
+  <a class="n opt" href="#live">Live</a>
+  <a class="n" href="#how">How it works</a>
+  <a class="n" href="#vectors">Vector search</a>
+  <a class="n opt" href="#numbers">Numbers</a>
+  <a class="n opt" href="#demos">Demos</a>
+  <span class="grow"></span>
+  <a class="n opt" href="/how">Deep dive</a>
+  <a class="gh" href="https://github.com/nyacg/pagedb">GitHub</a>
+</div></div>
+
+<div class="wrap">
+  <div class="hero">
+    <div class="kicker">pagedb · one Cloudflare Durable Object</div>
+    <h1>Hundred-gigabyte databases in R2, served <em>live</em> by one Durable Object.</h1>
+    <p class="lede">The data sits in R2 as immutable 64 KB pages. One object serves it, holding only the pages queries touch. Every view on screen is a <b>live query</b>: when anyone writes, the object works out which rows of which open views changed and pushes just those. And every Hacker News story is now <b>searchable by meaning</b>, from the same pages.</p>
+    <div class="facts">
+      <div class="fact"><div class="v">45.8 GB</div><div class="l">every HN story and comment, live</div></div>
+      <div class="fact"><div class="v blue">4.85M</div><div class="l">story vectors, searched in ~140 ms</div></div>
+      <div class="fact"><div class="v">100 GB</div><div class="l">issue tracker, 27M issues</div></div>
+      <div class="fact"><div class="v">160M</div><div class="l">r/place pixels</div></div>
+      <div class="fact"><div class="v">146M</div><div class="l">taxi trips in one spreadsheet</div></div>
+    </div>
+    <div class="starts">
+      <a class="start" href="#how"><div class="k">Start here</div><h3>How it works →</h3><p>Four tiers, one fault round, writes that push only what changed, and folds back into R2. An animated walkthrough.</p></a>
+      <a class="start" href="#vectors"><div class="k">New</div><h3>Vector search →</h3><p>turbopuffer's design on Durable Objects: semantic search over 4.85M stories for ~$5 a month, and where turbopuffer still wins.</p></a>
+      <a class="start" href="#numbers"><div class="k">The honest part</div><h3>Numbers &amp; limits →</h3><p>Cost against Supabase, Convex, Pinecone and friends, benchmarks against r2db, and everything it can't do.</p></a>
+    </div>
+  </div>
+
+  <section id="live">
+    <h2>Live, right now</h2>
+    <p class="sub">This page is a pagedb client. The search box below embeds your query and searches all 4.85M stories in the Hacker News object; the feed beside it is a live query on the same object, pushed as stories and comments arrive from HN.</p>
+    <div class="live">
+      <div class="panel">
+        <h4>Search Hacker News by meaning <span class="meta">4,848,803+ stories · one object</span></h4>
+        <form class="semform" id="semform"><input id="q" name="q" autocomplete="off" placeholder="Describe what you're looking for…" aria-label="Search by meaning"><button>Search</button></form>
+        <div class="chips" id="chips">
+          <button type="button">running a database on object storage</button><button type="button">burnout as a solo founder</button><button type="button">why is my rust code slow</button><button type="button">people who quit big tech to farm</button>
+        </div>
+        <div class="semstats" id="semstats"></div>
+        <ol class="res" id="res"></ol>
+      </div>
+      <div class="panel">
+        <h4><span class="dot" id="livedot"></span> Arriving on the HN object <span class="meta" id="feedmeta">connecting…</span></h4>
+        <ul class="feed" id="feed"></ul>
+        <div class="note">New stories are embedded as they're written, so they're searchable on the very next search.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <h2>How it works</h2>
+    <p class="sub">A database whose base is immutable files in R2, and one object that serves it. Click a step, or let it play.</p>
+    <div class="walk">
+      <ol class="steps" id="steps">
+        <li><b>A page asks for a named query</b>The Worker checks the arguments and signs the query<span class="bar"><i></i></span></li>
+        <li><b>The socket subscribes</b>One Durable Object holds every live view<span class="bar"><i></i></span></li>
+        <li><b>RAM, then the object's SQLite</b>Synchronous, microseconds<span class="bar"><i></i></span></li>
+        <li><b>Misses become one fault round</b>Every missing page, fetched together<span class="bar"><i></i></span></li>
+        <li><b>A write lands in the overlay</b>Durable in SQLite when acknowledged<span class="bar"><i></i></span></li>
+        <li><b>Only changed rows are pushed</b>To every tab whose view they touch<span class="bar"><i></i></span></li>
+        <li><b>The overlay folds into R2</b>Writes leave the object's memory<span class="bar"><i></i></span></li>
+        <li><b>Vector search: same pages</b>Centroids pinned, two stages, one round each<span class="bar"><i></i></span></li>
+      </ol>
+      <div class="stage">
+        <svg class="dg" id="dg" viewBox="0 0 860 490" role="img" aria-label="pagedb architecture">
+          <!-- browsers -->
+          <g id="n-tabs"><rect class="box" x="20" y="40" width="170" height="150" rx="12"/><text class="lbl" x="38" y="68">Browser tabs</text>
+            <rect x="38" y="84" width="134" height="26" rx="6" fill="#f4f3ef"/><rect x="38" y="116" width="134" height="26" rx="6" fill="#f4f3ef"/><rect x="38" y="148" width="134" height="26" rx="6" fill="#f4f3ef"/>
+            <text class="sm" x="48" y="102">/hn · semantic</text><text class="sm" x="48" y="134">/tracker · board</text><text class="sm" x="48" y="166">/place · canvas</text></g>
+          <g id="n-writer"><rect class="box" x="20" y="300" width="170" height="80" rx="12"/><text class="lbl" x="38" y="328">Someone writes</text><text class="sm" x="38" y="350">a story, a pixel, an edit</text></g>
+          <!-- worker -->
+          <g id="n-worker"><rect class="box" x="250" y="40" width="160" height="90" rx="12"/><text class="lbl" x="268" y="68">Worker</text><text class="sm" x="268" y="90">signs leases (HMAC)</text><text class="sm" x="268" y="110">embeds queries (AI)</text></g>
+          <!-- object -->
+          <g id="n-do"><rect class="box" x="250" y="160" width="330" height="290" rx="14"/><text class="lbl" x="268" y="188">One Durable Object</text><text class="sm" x="268" y="208">Rust engine in WebAssembly</text></g>
+          <g id="n-ram" class="tier"><rect class="box" x="268" y="222" width="140" height="60"/><text class="lbl" x="282" y="248">RAM</text><text class="ms" x="282" y="268">40 MiB · &lt;1 µs</text></g>
+          <g id="n-sqlite" class="tier"><rect class="box" x="422" y="222" width="140" height="60"/><text class="lbl" x="436" y="248">SQLite</text><text class="ms" x="436" y="268">≤10 GB · ~0.3 ms</text></g>
+          <g id="n-overlay" class="tier"><rect class="box" x="268" y="296" width="140" height="60"/><text class="lbl" x="282" y="322">Overlay</text><text class="ms" x="282" y="342">recent writes</text></g>
+          <g id="n-views" class="tier"><rect class="box" x="422" y="296" width="140" height="60"/><text class="lbl" x="436" y="322">Live views</text><text class="ms" x="436" y="342">one per open query</text></g>
+          <g id="n-vec" class="tier"><rect class="box" x="268" y="370" width="294" height="62"/><text class="lbl" x="282" y="396">Vector index</text><text class="ms" x="282" y="416">14,276 centroids · 1-bit, then 8-bit</text></g>
+          <!-- cloudflare tiers -->
+          <g id="n-cache"><rect class="box" x="650" y="160" width="190" height="90" rx="12"/><text class="lbl" x="668" y="188">City cache</text><text class="sm" x="668" y="210">1 MiB chunks, same colo</text><text class="ms" x="668" y="232">10–80 ms</text></g>
+          <g id="n-r2"><rect class="box" x="650" y="280" width="190" height="170" rx="12"/><text class="lbl" x="668" y="308">R2</text><text class="sm" x="668" y="330">base: 4 MiB parts of</text><text class="sm" x="668" y="348">64 KB B+tree pages</text>
+            <rect x="668" y="362" width="154" height="30" rx="6" fill="#f4f3ef"/><text class="sm" x="680" y="382">immutable base</text>
+            <rect id="r2-layer" x="668" y="400" width="154" height="30" rx="6" fill="#f4f3ef"/><text class="sm" x="680" y="420">layers of folded writes</text></g>
+          <!-- wires -->
+          <path id="w-lease" class="wire" d="M190 88 H250"/>
+          <path id="w-socket" class="wire" d="M190 120 C 222 120 222 232 250 232"/>
+          <path id="w-ram-sql" class="wire" d="M408 252 H422"/>
+          <path id="w-cache" class="wire" d="M580 205 H650"/>
+          <path id="w-r2" class="wire" d="M580 300 H650"/>
+          <path id="w-write" class="wire" d="M190 340 C 225 340 225 326 268 326"/>
+          <path id="w-push" class="wire" d="M250 326 C 214 326 214 172 190 172"/>
+          <path id="w-fold" class="wire orange" d="M580 352 C 622 352 628 415 668 415"/>
+          <path id="w-vec" class="wire" d="M562 392 C 600 392 610 376 668 376"/>
+          <!-- tags -->
+          <g id="t-lease" class="tag"><rect x="196" y="12" width="210" height="26" rx="7"/><text x="208" y="30">lease: signed for 60 s</text></g>
+          <g id="t-fault" class="tag"><rect x="590" y="120" width="250" height="26" rx="7"/><text x="602" y="138">all missing pages, one round</text></g>
+          <g id="t-ram" class="tag"><rect x="440" y="170" width="120" height="26" rx="7"/><text x="452" y="188">no network</text></g>
+          <g id="t-write" class="tag"><rect x="20" y="268" width="200" height="26" rx="7"/><text x="32" y="286">durable on acknowledge</text></g>
+          <g id="t-push" class="tag"><rect x="20" y="232" width="214" height="26" rx="7"/><text x="32" y="250">only the rows that changed</text></g>
+          <g id="t-fold" class="tag"><rect x="400" y="458" width="200" height="26" rx="7"/><text x="412" y="476">at 4 MB: a new layer</text></g>
+          <g id="t-vec" class="tag"><rect x="590" y="120" width="250" height="26" rx="7"/><text x="602" y="138">256 pages, then ~50 more</text></g>
+        </svg>
+        <div class="cap" id="cap"></div>
+      </div>
+    </div>
+    <p class="note" style="margin-top:12px">The long version, with every mechanism and measurement: <a href="/how">how pagedb works</a>.</p>
+  </section>
+
+  <section id="demos">
+    <h2>Four demos, one engine</h2>
+    <p class="sub">The schema is data, so the same engine and the same Durable Object code serve all four. Open one in two windows and edit in one.</p>
+    <div class="demos">
+      <a class="demo" href="/hn"><div class="img" style="background-image:url(/img/hn.jpg)"></div><div class="b"><div class="size">45.8 GB · 45.8M items</div><h3>Hacker News, live</h3><p>Every story and comment since 2006. Search by title or by meaning; new items stream in from the HN API.</p></div></a>
+      <a class="demo" href="/tracker"><div class="img" style="background-image:url(/img/tracker.jpg)"></div><div class="b"><div class="size">100 GB · 27.1M issues</div><h3>Issue tracker</h3><p>Lists, boards and threads, all live. Every list and count is one fault round from cold.</p></div></a>
+      <a class="demo" href="/place"><div class="img" style="background-image:url(/img/place.jpg)"></div><div class="b"><div class="size">32.2 GB · 160M pixels</div><h3>r/place 2022</h3><p>Every placement. Click a pixel for its history, scrub the timelapse, paint with everyone else.</p></div></a>
+      <a class="demo" href="/sheet"><div class="img" style="background-image:url(/img/sheet.jpg)"></div><div class="b"><div class="size">137 GB · 146M rows</div><h3>NYC taxi sheet</h3><p>One spreadsheet. Jump to row 73,000,000; group counts come from branch pages, without reading a row.</p></div></a>
+    </div>
+  </section>
+
+  <section id="vectors">
+    <h2>Vector search, in the same pages</h2>
+    <p class="sub">turbopuffer's architecture rebuilt on Durable Objects + R2: an IVF index made of ordinary B+tree pages, next to the rest of the database. Same 1,024-d Qwen3 vectors, benchmarked against turbopuffer and Cloudflare Vectorize.</p>
+    <div class="media">
+      <figure><video src="/media/vector-search.mp4" poster="/media/vector-search.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>One search, step by step.</b> 183 of 14,276 clusters, 255 pages in one round trip, ~80k stories scored at 1 bit per dimension, the best 100 reranked with 8 bits.</figcaption></figure>
+      <figure><video src="/media/vector-hero.mp4" poster="/media/vector-hero.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>Real windows.</b> Three searches at 43–52 ms, and a story posted in one window found by meaning in the other 0.9 s later.</figcaption></figure>
+    </div>
+    <div class="two" style="margin-top:22px">
+      <div>
+        <table class="t">
+          <tr><th>Same 4.85M vectors, 100 queries</th><th>pagedb</th><th>turbopuffer</th><th>Vectorize</th></tr>
+          <tr><td>recall@10 vs exact</td><td class="n">0.971</td><td class="n win">0.990</td><td class="n">0.786</td></tr>
+          <tr><td>p50 in the service, new query</td><td class="n">138 ms</td><td class="n win">13 ms</td><td class="n">465 ms</td></tr>
+          <tr><td>same query again</td><td class="n">38 ms (RAM)</td><td class="n win">13 ms</td><td class="n">25 ms (cached)</td></tr>
+          <tr><td>filtered (before 2011)</td><td class="n">140 ms · 0.89</td><td class="n win">13 ms · 0.91</td><td class="n">10.2 s · 0.72</td></tr>
+          <tr><td>a write searchable</td><td class="n win">next search</td><td class="n win">next search</td><td class="n">14 s p50</td></tr>
+          <tr><td>live result updates</td><td class="n win">yes</td><td class="n">no</td><td class="n">no</td></tr>
+          <tr><td>a month at 1M searches</td><td class="n win">~$5</td><td class="n">$16</td><td class="n">~$67</td></tr>
+        </table>
+        <div class="verdict"><b>turbopuffer is really good:</b> better recall, about 10× faster, real filters, billions of vectors, and someone else runs it. One Durable Object wins on price, live results, and having the vectors sit next to the rest of your data.</div>
+      </div>
+      <div class="prose">
+        <p><b>Two stages.</b> The probe tier keeps 1 bit per dimension of each vector's rotated residual (RaBitQ-style, 128 bytes a story), scored with popcounts. The best 100 are rescored with 8-bit codes. Going from 4-bit codes to this took recall from 0.895 to 0.971 at the same page budget.</p>
+        <p><b>One round per stage.</b> The 14,276 centroids are pinned in the object; a search picks the clusters within 256 pages, fetches every missing page at once, then fetches the candidates' 8-bit entries.</p>
+        <p><b>Writes are vectors too.</b> The HN tail embeds each new story (Workers AI, Qwen3) in the same write as its row, so it's searchable on the next search and pushed into open results.</p>
+        <p><b>Where it tops out.</b> The fast tier is the object's 10 GB of SQLite; this index is 7 GB. A small collection (under ~500k vectors) can skip the clusters entirely: all 1-bit codes in memory, brute force, a few ms.</p>
+        <img src="/media/vector-prices.png" alt="What semantic search over all of HN costs a month: one Durable Object ~$5, turbopuffer $16, Weaviate $45, Vectorize $67, Pinecone $343" style="width:100%;border:1px solid var(--line);border-radius:12px;margin-top:6px">
+      </div>
+    </div>
+  </section>
+
+  <section id="numbers">
+    <h2>The numbers</h2>
+    <p class="sub">What a live sync engine costs at 100 GB and 1,000 concurrent users, and how pagedb compares with r2db, the demo that started this.</p>
+    <div class="media">
+      <figure><img src="/media/sync-prices.jpg" alt="What a live sync engine costs a month: one Durable Object $9 vs $190 to $33,550 elsewhere"><figcaption><b>$9 a month</b> for 100 GB, 1,000 users online and 5 writes a second pushed to everyone: a 30 s load test scaled to a month. Others are list-price estimates for the same workload.</figcaption></figure>
+      <figure><video src="/media/sync-live.mp4" poster="/media/sync-live.jpg" muted loop playsinline preload="none" data-autoplay></video><figcaption><b>1,000 tabs, 5 writes a second:</b> all 150,000 updates delivered, median 174 ms write → every tab. Outgoing WebSocket messages aren't billed, so the fan-out is free.</figcaption></figure>
+    </div>
+    <table class="t" style="margin-top:18px">
+      <tr><th>Measured (same laptop)</th><th>pagedb</th><th>r2db demo</th></tr>
+      <tr><td>Issues on screen after opening the page (100 GB bases, median of 8 loads)</td><td class="n win">0.25 s</td><td class="n">1.09 s</td></tr>
+      <tr><td>Every list, board column and count query from cold</td><td class="n win">1 fault round</td><td class="n">rounds = dependency depth</td></tr>
+      <tr><td>Count of a project's issues</td><td class="n win">3.6 µs engine time</td><td class="n">3 ms (published)</td></tr>
+      <tr><td>Your own edit visible</td><td class="n win">instant (optimistic)</td><td class="n">after the server round trip</td></tr>
+      <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s</td><td class="n">p50 174 ms</td><td class="n">—</td></tr>
+    </table>
+    <h3 style="margin:34px 0 10px;font-size:20px">What it can't do</h3>
+    <ul class="limits">
+      <li><b>Only queries the app defines.</b> Each list is a named query with an index behind it; a new kind of query means a new index and a rebuild.</li>
+      <li><b>One object, one thread, one region.</b> No replicas yet: about 7 fresh vector searches a second before they queue, and every read and write goes through one CPU.</li>
+      <li><b>The base is built offline.</b> 100 GB bases come from a builder in a container. New writes fold into layers in R2 at 4 MB, but rebuilding the base itself is a batch job.</li>
+      <li><b>128 MB of memory.</b> The engine's page cache is 40 MiB; everything else pages through SQLite, the city cache or R2. Cold reads from R2 cost ~0.2 s a round.</li>
+      <li><b>10 GB of SQLite per object.</b> That's the fast tier. Bigger hot sets need more objects.</li>
+      <li><b>Vector search trails turbopuffer</b> on recall (0.971 vs 0.990) and speed (138 vs 13 ms), and filters only on columns the index carries.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <div>pagedb · Rust (compiled to WebAssembly) + TypeScript on Cloudflare Workers, Durable Objects and R2. Inspired by <a href="https://demo.r2db.dev">r2db</a> and <a href="https://turbopuffer.com">turbopuffer</a>. Built with Claude Code.</div>
+    <div style="margin-top:6px"><a href="https://github.com/nyacg/pagedb">github.com/nyacg/pagedb</a> · <a href="/how">How it works, in depth</a> · <a href="/hn">Hacker News</a> · <a href="/tracker">Tracker</a> · <a href="/place">r/place</a> · <a href="/sheet">Taxi sheet</a></div>
+  </footer>
+</div>
+<script type="module" src="/home.js"></script>
+</body></html>

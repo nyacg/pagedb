@@ -54,6 +54,8 @@ export interface Sub {
   complete?: boolean;
   ready: boolean;
   stats?: SubStats;
+  /** Vector searches: clusters probed, pages read, vectors scored. */
+  ann?: { clusters: number; pages: number; scanned: number; overlay: number };
   firstMs?: number;
   updates: number;
   sentAt: number;
@@ -230,6 +232,7 @@ export class Sync {
       s.complete = m.complete;
       s.ready = true;
       s.stats = m.stats;
+      s.ann = m.ann;
       s.firstMs = performance.now() - s.sentAt;
       this.retried.delete(s.key);
       this.version = Math.max(this.version, m.version ?? 0);

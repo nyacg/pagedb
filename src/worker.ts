@@ -5,25 +5,27 @@
  *   GET  /api/socket?app=                        → the app's object (subscriptions need leases)
  *   POST /api/mutate?app= {name,args,user}       → a named mutator → the object's write
  *   POST /api/query {db, ast, obj?}  POST /api/write {db, ops, obj?}   (admin: raw ASTs / ops)
- *   PUT  /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict,compact,fold}
+ *   PUT|HEAD|GET /api/admin/r2/<key>   GET /api/admin/info?db&obj   POST /api/admin/{reset,reset-overlay,evict,prewarm,compact,fold}
  */
 import { DbObject, type Env } from "./do";
 import { HnTail } from "./hn-tail";
 import { APPS, appFor, type App, type Ref } from "./apps";
 import { canon, signLease } from "./lease";
+import { embed, packVector, storyText, type EmbedEnv } from "./embed";
+import { VEC } from "./apps/hn";
 export { DbObject, HnTail };
 
 const admin = (req: Request, env: Env) => !!env.ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 const vars = (env: Env) => env as unknown as Record<string, unknown>;
 type QueryStub = {
-  query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number }; stats: unknown }>;
+  query(db: string, ast: unknown): Promise<{ result: { rows?: unknown[]; count?: number; ann?: unknown }; stats: unknown }>;
   baseStats(db: string): Promise<{ bytes: number; rows: Record<string, number>; pages: number }>;
 };
 
 async function lease(env: Env, app: App, d: Ref) {
   const key = canon({ name: d.name, args: d.args ?? {} });
   try {
-    const ast = app.namedQuery(d.name, d.args ?? {});
+    const ast = await app.namedQuery(d.name, d.args ?? {}, vars(env));
     const { token, exp } = await signLease(env.LEASE_SECRET!, { ast, db: app.db(vars(env)), obj: app.obj(vars(env)) });
     return { key, token, exp, ast };
   } catch (e) {
@@ -43,7 +45,7 @@ async function ssr(req: Request, env: Env, url: URL, app: App): Promise<Response
   const t0 = Date.now();
   try {
     const stub = env.DB.getByName(obj) as unknown as QueryStub;
-    const [results, base] = await Promise.all([Promise.all(fp.prefetch.map((p) => stub.query(db, app.namedQuery(p.name, p.args ?? {})))), stub.baseStats(db).catch(() => null)]);
+    const [results, base] = await Promise.all([Promise.all(fp.prefetch.map(async (p) => stub.query(db, await app.namedQuery(p.name, p.args ?? {}, vars(env))))), stub.baseStats(db).catch(() => null)]);
     if (base) boot.base = base;
     fp.prefetch.forEach((p, i) => {
       const r = results[i].result;
@@ -60,6 +62,9 @@ async function ssr(req: Request, env: Env, url: URL, app: App): Promise<Response
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    // A retired deployment (the old semantic-search-only Worker) sends visitors to the live site.
+    const to = (env as unknown as { REDIRECT_TO?: string }).REDIRECT_TO;
+    if (to && !url.pathname.startsWith("/api/admin/")) return Response.redirect(`${to}${url.pathname}${url.search}`, 301);
     const app = appFor(url);
     try {
       if (url.pathname === "/api/lease" && req.method === "POST") {
@@ -72,7 +77,11 @@ export default {
       if ((url.pathname === "/api/query" || url.pathname === "/api/write") && !admin(req, env)) return new Response("unauthorized", { status: 401 });
       if (url.pathname === "/api/query" && req.method === "POST") {
         const { db, ast, obj, salt } = (await req.json()) as { db: string; ast: unknown; obj?: string; salt?: string };
-        return Response.json(await env.DB.getByName(obj ?? db).query(db, ast, { salt }));
+        // workerMs: the Worker's round trip to the object, its CPU included (Workers clocks only
+        // advance across I/O, so the object can't time its own synchronous engine run).
+        const t0 = Date.now();
+        const r = await env.DB.getByName(obj ?? db).query(db, ast, { salt });
+        return Response.json({ ...r, workerMs: Date.now() - t0 });
       }
       if (url.pathname === "/api/mutate" && req.method === "POST") {
         const { name, args, user } = (await req.json()) as { name: string; args: Record<string, unknown>; user?: string };
@@ -82,10 +91,13 @@ export default {
         } catch (e) {
           return Response.json({ error: (e as Error).message }, { status: 400 });
         }
-        const r = await env.DB.getByName(app.obj(vars(env))).write(app.db(vars(env)), { ops: built.ops });
+        const ops = app.enrich ? await app.enrich(built.ops, vars(env)) : built.ops;
+        const r = await env.DB.getByName(app.obj(vars(env))).write(app.db(vars(env)), { ops });
         return Response.json({ ...r, created: built.created }, { status: "error" in r ? 400 : 200 });
       }
-      if (url.pathname === "/" || url.pathname === "/index.html") return ssr(req, env, url, APPS.tracker);
+      // The overview (a static page whose script is a live client of the HN object).
+      if (url.pathname === "/" || url.pathname === "/index.html") return env.ASSETS.fetch(new Request(new URL("/home", url), req));
+      if (url.pathname === "/tracker" || url.pathname === "/tracker/") return ssr(req, env, url, APPS.tracker);
       if (url.pathname === "/hn" || url.pathname === "/hn/") {
         // Keep the live tail running while anyone is looking.
         (env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown> }).kick().catch(() => {});
@@ -114,22 +126,55 @@ export default {
       }
       if (url.pathname.startsWith("/api/admin/")) {
         if (!admin(req, env)) return new Response("unauthorized", { status: 401 });
-        if (url.pathname.startsWith("/api/admin/r2/") && req.method === "PUT") {
+        if (url.pathname.startsWith("/api/admin/r2/")) {
           const key = decodeURIComponent(url.pathname.slice("/api/admin/r2/".length));
-          await (env.BUCKET as R2Bucket).put(key, req.body);
-          return Response.json({ ok: true, key });
+          const bucket = env.BUCKET as R2Bucket;
+          if (req.method === "PUT") {
+            await bucket.put(key, req.body);
+            return Response.json({ ok: true, key });
+          }
+          if (req.method === "HEAD") return new Response(null, { status: (await bucket.head(key)) ? 200 : 404 });
+          const obj = await bucket.get(key);
+          return obj ? new Response(obj.body) : new Response("not found", { status: 404 });
         }
         if (url.pathname === "/api/admin/hn-tail") {
-          const tail = env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown>; status(): Promise<unknown> };
+          const tail = env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown>; status(): Promise<unknown>; rewind(): Promise<unknown> };
+          if (req.method === "POST" && url.searchParams.has("rewind")) return Response.json(await tail.rewind());
           return Response.json(req.method === "POST" ? await tail.kick() : await tail.status());
         }
         const db = url.searchParams.get("db") ?? "db1g";
         const stub = env.DB.getByName(url.searchParams.get("obj") ?? db);
-        if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset());
+        if (url.pathname === "/api/admin/reset") return Response.json(await stub.reset(db));
         if (url.pathname === "/api/admin/info") return Response.json(await stub.info());
+        if (url.pathname === "/api/admin/remanifest") return Response.json(await stub.remanifest(db));
+        if (url.pathname === "/api/admin/drop-pages")
+          return Response.json(await stub.dropPages(Number(url.searchParams.get("from") ?? 0), Number(url.searchParams.get("to") ?? 2 ** 53), Number(url.searchParams.get("limit") ?? 2000)));
+        if (url.pathname === "/api/admin/prewarm") {
+          const n = (k: string) => (url.searchParams.has(k) ? Number(url.searchParams.get(k)) : undefined);
+          return Response.json(await stub.prewarm(db, n("from"), n("to")));
+        }
+        if (url.pathname === "/api/admin/sqlite-bench") return Response.json(await stub.sqliteBench(Number(url.searchParams.get("n") ?? 100), (url.searchParams.get("how") ?? "one") as "one"));
         if (url.pathname === "/api/admin/reset-overlay") return Response.json(await stub.resetOverlay(db));
         if (url.pathname === "/api/admin/fold") return Response.json(await (stub as unknown as { foldNow(db: string): Promise<unknown> }).foldNow(db));
         if (url.pathname === "/api/admin/compact") return Response.json(await (stub as unknown as { compactOverlay(): Promise<unknown> }).compactOverlay());
+        // Vectors for stories written since the vector index was built (newest first, a page of
+        // up to 100 per call): ?since=<ms>&start={"time":…,"id":"…"}. Same text and model as the
+        // live tail's (apps/hn withVectors).
+        if (url.pathname === "/api/admin/vec-backfill" && req.method === "POST") {
+          const since = Number(url.searchParams.get("since") ?? Date.now());
+          const start = url.searchParams.get("start");
+          const q = { table: "story", orderBy: [["time", "desc"], ["id", "asc"]], limit: 100, ...(start ? { start: { row: JSON.parse(start) } } : {}) };
+          const page = (await (stub as unknown as { query(db: string, ast: unknown): Promise<{ result: { rows: Record<string, any>[] } }> }).query(db, q)).result.rows;
+          const rows = page.filter((r) => r.time >= since);
+          if (rows.length) {
+            const vecs = await embed(env as unknown as EmbedEnv, rows.map((r) => storyText(r) || "(untitled)"));
+            const ops = rows.map((r, i) => ({ op: "vec_put", index: VEC.index, id: r.id, vec: packVector(vecs[i], VEC.dims) }));
+            const w = await (stub as unknown as { write(db: string, ops: unknown): Promise<{ error?: string }> }).write(db, { ops });
+            if (w.error) return Response.json({ error: w.error }, { status: 500 });
+          }
+          const last = page.at(-1);
+          return Response.json({ n: rows.length, oldest: rows.at(-1)?.time, next: rows.length === page.length && last ? { time: last.time, id: last.id } : null });
+        }
         if (url.pathname === "/api/admin/evict") return Response.json(await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true })));
       }
       return env.ASSETS.fetch(req);

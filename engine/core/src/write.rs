@@ -13,6 +13,7 @@ use crate::merged;
 use crate::overlay::{Entry, View};
 use crate::query::{prefix_key, read_row, Roots};
 use crate::tree::{Ctx, Miss, Range};
+use crate::vector::{self, VecIndex};
 use serde_json::Value as J;
 use std::collections::HashMap;
 
@@ -23,6 +24,19 @@ pub enum Op {
     /// `splice` overwrites part of a string column in place (a pixel in a tile of pixels).
     Update { table: TableId, id: String, set: Vec<(usize, Value)>, add: Vec<(usize, f64)>, splice: Vec<(usize, usize, String)> },
     Delete { table: TableId, id: String },
+    /// File `vec` as row `id`'s vector in vector index `index` (position in `Roots::vectors`).
+    VecPut { index: usize, id: String, vec: Vec<f32> },
+    VecDel { index: usize, id: String },
+}
+
+/// A vector entry a batch filed or removed (what live vector searches react to).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VecChange {
+    pub index: usize,
+    pub pk: String,
+    pub old_key: Option<Vec<u8>>,
+    /// (key, entry) now filed; None if removed.
+    pub new: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,8 +82,36 @@ fn col_value(schema: &Schema, table: TableId, col: usize, v: &J) -> Result<Value
 
 /// `{"ops":[{"op":"insert","table":"issue","row":{…}}, {"op":"update","table":"issue","id":"…","set":{…},"add":{"n":1}}, {"op":"delete","table":"comment","id":"…"}]}`
 pub fn parse_ops(schema: &Schema, j: &J) -> Result<Vec<Op>, String> {
+    parse_ops_in(schema, &[], j)
+}
+
+/// As `parse_ops`, plus vector ops on `vectors`:
+/// `{"op":"vec_put","index":"story_vec","id":"…","vec":"<base64 f32 LE>"|[…]}`, `{"op":"vec_del","index":…,"id":…}`.
+pub fn parse_ops_in(schema: &Schema, vectors: &[VecIndex], j: &J) -> Result<Vec<Op>, String> {
     let mut out = Vec::new();
     for o in j.get("ops").and_then(J::as_array).ok_or("missing ops")? {
+        if let Some(kind @ ("vec_put" | "vec_del")) = o.get("op").and_then(J::as_str) {
+            let name = o.get("index").and_then(J::as_str).ok_or("vector op without index")?;
+            let index = vectors.iter().position(|v| v.name == name).ok_or_else(|| format!("unknown vector index {name}"))?;
+            let id = o.get("id").and_then(J::as_str).filter(|s| !s.is_empty()).ok_or("vector op without id")?.to_string();
+            if schema.table(vectors[index].table).read_only {
+                return Err(format!("{} is read-only", schema.table(vectors[index].table).name));
+            }
+            if kind == "vec_del" {
+                out.push(Op::VecDel { index, id });
+                continue;
+            }
+            let vec: Vec<f32> = match o.get("vec") {
+                Some(J::String(s)) => vector::b64decode(s).ok_or("vec is not base64")?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+                Some(J::Array(a)) => a.iter().map(|x| x.as_f64().unwrap_or(0.0) as f32).collect(),
+                _ => return Err("vec_put without vec".into()),
+            };
+            if vec.len() < vectors[index].dims {
+                return Err(format!("{name} needs vectors of at least {} dims", vectors[index].dims));
+            }
+            out.push(Op::VecPut { index, id, vec });
+            continue;
+        }
         let tname = o.get("table").and_then(J::as_str).ok_or("op without table")?;
         let table = schema.table_named(tname).ok_or_else(|| format!("unknown table {tname}"))?;
         let tdef = schema.table(table);
@@ -179,6 +221,7 @@ fn stage_change(schema: &Schema, view: &View, ch: &RowChange) {
 /// Fault in every row the batch names (and the parents of inserted children) in one round.
 fn prefetch(ctx: &Ctx, roots: &Roots, ops: &[Op]) -> Result<(), Miss> {
     let mut missed = false;
+    let mut vecs_missed = false;
     let mut look = |t: TableId, id: &str| {
         if read_row(ctx, roots, t, id).is_err() {
             missed = true;
@@ -195,9 +238,14 @@ fn prefetch(ctx: &Ctx, roots: &Roots, ops: &[Op]) -> Result<(), Miss> {
                 }
             }
             Op::Update { table, id, .. } | Op::Delete { table, id } => look(*table, id),
+            Op::VecPut { index, id, .. } | Op::VecDel { index, id } => {
+                let vi = &roots.vectors[*index];
+                look(vi.table, id);
+                vecs_missed |= vi.centroids(ctx, roots).is_err() || merged::get(ctx, &roots.get(vi.by_id), &roots.schema.pk_key(vi.table, id)).is_err();
+            }
         }
     }
-    if missed {
+    if missed || vecs_missed {
         Err(Miss)
     } else {
         Ok(())
@@ -211,6 +259,27 @@ struct Planner<'a, 'v> {
     schema: &'static Schema,
     changes: Vec<RowChange>,
     idx: HashMap<(TableId, String), usize>,
+    vec_changes: Vec<VecChange>,
+}
+
+/// Stage `k` → `v`; `existed`: the key is in the base (a replace, not a new row).
+fn stage_put(view: &View, tree: u16, k: Vec<u8>, v: Vec<u8>, existed: bool) {
+    let delta = match view.get(tree, &k) {
+        Some(Entry { val: None, .. }) => 0,
+        Some(Entry { val: Some(_), delta }) => delta,
+        None if existed => 0,
+        None => 1,
+    };
+    view.stage(tree, k, Some(Entry { val: Some(v), delta }));
+}
+
+/// Stage the removal of `k` (whether it's in the base or only in the overlay).
+fn stage_remove(view: &View, tree: u16, k: &[u8]) {
+    match view.get(tree, k) {
+        Some(Entry { val: Some(_), delta: 1 }) => view.stage(tree, k.to_vec(), None),
+        Some(Entry { val: Some(_), .. }) | None => view.stage(tree, k.to_vec(), Some(Entry { val: None, delta: -1 })),
+        Some(Entry { val: None, .. }) => {}
+    }
 }
 
 impl Planner<'_, '_> {
@@ -359,6 +428,11 @@ impl Planner<'_, '_> {
             }
         }
         self.apply(RowChange { table, old: Some(old.clone()), new: None });
+        for index in 0..self.roots.vectors.len() {
+            if self.roots.vectors[index].table == table {
+                self.vec_del(index, id)?;
+            }
+        }
         for rel in self.schema.relations.iter().filter(|r| r.child == table) {
             let Some(pid) = old[rel.fk].as_str().filter(|p| !p.is_empty()) else { continue };
             if from_parent == Some((rel.parent, pid)) {
@@ -370,21 +444,81 @@ impl Planner<'_, '_> {
     }
 }
 
+impl Planner<'_, '_> {
+    /// Where row `id`'s vector is filed in index `vi` (through the overlay), if anywhere.
+    fn vec_key(&self, vi: &VecIndex, id: &str) -> Result<Option<Vec<u8>>, WriteError> {
+        let at = merged::get(self.ctx, &self.roots.get(vi.by_id), &self.schema.pk_key(vi.table, id))?;
+        Ok(at.filter(|c| c.len() == 4).map(|c| vector::key(u32::from_be_bytes(c[..4].try_into().unwrap()), id)))
+    }
+
+    fn vec_put(&mut self, index: usize, id: &str, vec: &[f32]) -> Result<(), WriteError> {
+        let vi = &self.roots.vectors[index];
+        let row = self.read(vi.table, id)?.ok_or_else(|| WriteError::Invalid(format!("no {} {id}", self.schema.table(vi.table).name)))?;
+        let mut v = vec[..vi.dims].to_vec();
+        if !vector::normalize(&mut v) {
+            return Err(WriteError::Invalid("a zero vector".into()));
+        }
+        let cents = vi.centroids(self.ctx, self.roots)?;
+        let old_key = self.vec_key(vi, id)?;
+        let (cid, k, val, probe_val) = vector::encode_entries(vi, &cents, &v, &vi.project(&row));
+        if val.len() + k.len() + 16 > crate::page::MAX_CELL {
+            return Err(WriteError::Invalid(format!("{} entry too large", vi.name)));
+        }
+        if let Some(ok) = old_key.as_ref().filter(|ok| **ok != k) {
+            stage_remove(self.view, vi.tree, ok);
+            if let Some(p) = &vi.probe {
+                stage_remove(self.view, p.tree, ok);
+            }
+        }
+        let in_base = |tree: u16, key: &[u8]| merged::base_has(self.ctx, &self.roots.get(tree), key);
+        let replacing = old_key.as_ref() == Some(&k) && in_base(vi.tree, &k)?;
+        stage_put(self.view, vi.tree, k.clone(), val.clone(), replacing);
+        if let (Some(p), Some(pv)) = (&vi.probe, probe_val) {
+            // (Searches score new vectors from the rerank entries; the probe entry keeps the
+            // tiers identical for anything that reads them later.)
+            stage_put(self.view, p.tree, k.clone(), pv, replacing);
+        }
+        let pk = self.schema.pk_key(vi.table, id);
+        stage_put(self.view, vi.by_id, pk.clone(), cid.to_be_bytes().to_vec(), in_base(vi.by_id, &pk)?);
+        self.vec_changes.push(VecChange { index, pk: id.to_string(), old_key, new: Some((k, val)) });
+        Ok(())
+    }
+
+    fn vec_del(&mut self, index: usize, id: &str) -> Result<(), WriteError> {
+        let vi = &self.roots.vectors[index];
+        let Some(k) = self.vec_key(vi, id)? else { return Ok(()) };
+        stage_remove(self.view, vi.tree, &k);
+        if let Some(p) = &vi.probe {
+            stage_remove(self.view, p.tree, &k);
+        }
+        stage_remove(self.view, vi.by_id, &self.schema.pk_key(vi.table, id));
+        self.vec_changes.push(VecChange { index, pk: id.to_string(), old_key: Some(k), new: None });
+        Ok(())
+    }
+}
+
 /// Plan and stage a batch. Returns the row changes (coalesced per row: first old → last new).
 pub fn plan_write(ctx: &Ctx, roots: &Roots, view: &View, ops: &[Op]) -> Result<Vec<RowChange>, WriteError> {
+    plan_write_all(ctx, roots, view, ops).map(|(c, _)| c)
+}
+
+/// As `plan_write`, with the vector entries the batch filed or removed.
+pub fn plan_write_all(ctx: &Ctx, roots: &Roots, view: &View, ops: &[Op]) -> Result<(Vec<RowChange>, Vec<VecChange>), WriteError> {
     prefetch(ctx, roots, ops)?;
-    let mut p = Planner { ctx, roots, view, schema: roots.schema, changes: Vec::new(), idx: HashMap::new() };
+    let mut p = Planner { ctx, roots, view, schema: roots.schema, changes: Vec::new(), idx: HashMap::new(), vec_changes: Vec::new() };
     for op in ops {
         match op {
             Op::Insert { table, row } => p.insert(*table, row)?,
             Op::Update { table, id, set, add, splice } => p.update(*table, id, set, add, splice)?,
             Op::Delete { table, id } => p.delete(*table, id, None)?,
+            Op::VecPut { index, id, vec } => p.vec_put(*index, id, vec)?,
+            Op::VecDel { index, id } => p.vec_del(*index, id)?,
         }
     }
     // Drop no-op changes (e.g. a row changed and changed back).
     let mut changes = p.changes;
     changes.retain(|c| c.old != c.new);
-    Ok(changes)
+    Ok((changes, p.vec_changes))
 }
 
 /// Current row by id (re-exported for callers of the write path).

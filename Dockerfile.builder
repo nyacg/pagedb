@@ -12,5 +12,5 @@ RUN curl -sL -o /tmp/duckdb.zip https://github.com/duckdb/duckdb/releases/downlo
 COPY --from=build /src/engine/target/release/pagedb-builder /usr/local/bin/pagedb-builder
 COPY datasets /datasets
 COPY builder-container/run.sh /run.sh
-RUN chmod +x /run.sh /datasets/*/build.sh
+RUN chmod +x /run.sh /datasets/*/*.sh
 CMD ["/run.sh"]

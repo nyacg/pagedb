@@ -17,6 +17,7 @@ interface Exports {
   init(ptr: number, len: number): number;
   query(ptr: number, len: number): number;
   page_put(lo: number, hi: number, ptr: number): number;
+  page_put_trusted(lo: number, hi: number, ptr: number): void;
   set_ram_budget(pages: number): void;
   stats(): number;
   subscribe(ptr: number, len: number): number;
@@ -45,14 +46,24 @@ export class Engine {
   private x: Exports;
 
   /** `pageGet` = the synchronous tier below RAM (DO SQLite): fill `dst` and return true if held.
-   *  `pageOut` stores a page a fold wrote (synchronously; the bytes are only valid during the call). */
-  constructor(pageGet: (id: number, dst: Uint8Array) => boolean, pageOut: (id: number, page: Uint8Array) => void = () => {
-    throw new Error("this engine can't fold");
-  }) {
+   *  `pageOut` stores a page a fold wrote (synchronously; the bytes are only valid during the call).
+   *  `pagesGet` (optional) = the synchronous tier for many pages at once, calling `put` for each one held. */
+  constructor(
+    pageGet: (id: number, dst: Uint8Array) => boolean,
+    pageOut: (id: number, page: Uint8Array) => void = () => {
+      throw new Error("this engine can't fold");
+    },
+    pagesGet?: (ids: number[], put: (id: number, page: Uint8Array) => void) => void,
+  ) {
     const instance = new WebAssembly.Instance(wasmModule, {
       host: {
         host_page_get: (lo: number, hi: number, dst: number) =>
           pageGet(hi * 2 ** 32 + lo, new Uint8Array(this.x.memory.buffer, dst, PAGE)) ? 1 : 0,
+        host_pages_prefetch: (ptr: number, n: number) => {
+          if (!pagesGet) return;
+          const ids = [...new BigUint64Array(this.x.memory.buffer, ptr, n)].map(Number);
+          pagesGet(ids, (id, page) => this.withBytes(page, (p) => this.x.page_put_trusted(id % 2 ** 32, Math.floor(id / 2 ** 32), p)));
+        },
         host_page_out: (lo: number, hi: number, src: number) => pageOut(hi * 2 ** 32 + lo, new Uint8Array(this.x.memory.buffer, src, PAGE)),
       },
     });

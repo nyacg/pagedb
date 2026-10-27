@@ -11,3 +11,4 @@ pub mod merged;
 pub mod fold;
 pub mod write;
 pub mod ivm;
+pub mod vector;

@@ -15,11 +15,12 @@ Four apps run on the same engine, each one database in R2 and one object serving
 
 | App | Data | What's live |
 |---|---|---|
-| [Issue tracker](https://pagedb.do-pool-lab.workers.dev) | 27.1M generated issues, 96 GB | lists, board, threads, search (titles, tags, comments) |
-| [Hacker News](https://pagedb.do-pool-lab.workers.dev/hn) | every story and comment since 2006 (~49M items) | new items stream in from the HN API; front page, threads, comments, votes |
+| [Hacker News](https://pagedb.do-pool-lab.workers.dev/hn) | every story and comment since 2006 (~49M items), 4.85M story vectors | new items stream in from the HN API and are embedded on write; front page, threads, comments, votes, search by title or by meaning |
+| [Issue tracker](https://pagedb.do-pool-lab.workers.dev/tracker) | 27.1M generated issues, 96 GB | lists, board, threads, search (titles, tags, comments) |
 | [r/place 2022](https://pagedb.do-pool-lab.workers.dev/place) | all ~160M pixel placements | each pixel's history, each user's pixels, a timelapse, painting |
 | [Taxi sheet](https://pagedb.do-pool-lab.workers.dev/sheet) | every NYC yellow-cab trip of 2015 (~146M) | sort, jump to any row, group counts, shared cell edits |
 
+- Overview (live HN feed, semantic search, an animated walkthrough): https://pagedb.do-pool-lab.workers.dev
 - How it works: https://pagedb.do-pool-lab.workers.dev/how
 - The same object in a container: https://pagedb-node.do-pool-lab.workers.dev/api/…
 
@@ -83,6 +84,62 @@ Details: `bench/results/*.md`.
      project (~20–35 MB, read as a few large ranged GETs). Once a project's comments are in the
      object it's instant. Live: adding or deleting a matching comment moves the issue in or out.
 
+## Semantic search (pagevec)
+
+Vector search in the same pages, tiers and object: **every HN story since 2006 is an embedding
+in an IVF index stored as ordinary B+trees**, next to the relational data. It's turbopuffer's
+design (object storage first, centroids pinned, one round trip per query, unindexed writes
+searched directly) on Durable Objects + R2. Try it: https://pagedb.do-pool-lab.workers.dev/hn?p=semantic or the search box on the overview.
+
+- **Index format** (`engine/core/src/vector`): two trees keyed `cluster ‖ pk`. The probe tree's
+  entries hold 1 bit per dimension of the rotated residual (RaBitQ-style, 128 B at 1024 dims)
+  and the filter columns; the rerank tree's hold an 8-bit residual code and the columns a result
+  shows. Plus a pinned centroid tree and a `byId` tree for replacing and deleting.
+- **Two stages, one fault round each:** score the centroids, take the best clusters within
+  `maxPages` probe pages, ask for all of them at once, score every entry with popcounts against
+  a 4-bit query, then fetch the best `rerank` (100) candidates' 8-bit entries and rescore them
+  (SIMD128 i8 dot products). Vector segments use 256 KiB chunks; a prewarmed object reads them
+  from its SQLite in batches. (Without `probe` in `vectors.json`, an index is single-stage.)
+- **Writes are searchable at once:** `vec_put` / `vec_del` go into the overlay with the row ops
+  of the same batch; a search scans overlay vectors too and tombstones hide base entries. New HN
+  stories (the live tail) and visitors' submissions are embedded on write.
+- **Live semantic results:** a semantic page is a live query. A newly written story that scores
+  into its top k is pushed to every tab showing that search; points and comment counts update
+  in place.
+- **Embeddings:** Workers AI `@cf/qwen/qwen3-embedding-0.6b` (1024 dims) for documents (builder
+  container, PVEC shards in R2, resumable and parallel) and queries (the Worker, cached). Any
+  OpenAI-compatible endpoint (e.g. EmbeddingGemma behind AI Gateway) plugs in via `EMBED_URL`.
+
+Build and attach (see `datasets/hn/embed.sh`, `vec.sh`, `vectors.json`):
+
+```sh
+POST pagedb-builder/start?db=emb-a&job=hn/embed                 # stories → PVEC shards in R2
+pagedb-builder vec-build --schema datasets/hn/schema.json --config datasets/hn/vectors.json \
+  --shards LIST --first-page 1099511627776 --out data/seg        # k-means, codes, trees
+pagedb-builder vec-gt … && pagedb-builder vec-eval …             # recall vs exact, offline
+node scripts/attach-vec.mjs data/seg hn hn                       # base + segment → db "hn"'s manifest
+npm run deploy:vec                                               # pagedb-vec Worker (HN_DB=hnv)
+```
+
+Measured on all 4,848,803 HN stories (1024-d Qwen3 embeddings, 14,276 clusters, 7.0 GB).
+Latency is p50 in the Worker (its round trip to the object, CPU included; a laptop adds its own
+network on top):
+
+| | pagevec |
+|---|---|
+| recall@10 vs exact search over all 4.85M | 0.971 (100 hand-written queries), 0.943 (300 incl. titles) |
+| search, prewarmed object | 138 ms (SQLite tier), 44 ms (RAM) |
+| search, cold (nothing resident) | 1.86 s from R2, 578 ms from the city cache (2 fault rounds) |
+| per search | ~255 probe pages + ~45 rerank pages, ~70k vectors scored |
+| a write searchable | on the next search (Vectorize: 1–66 s, p50 14 s) |
+| vs turbopuffer, same vectors, 100 queries | recall@10 0.971 vs **0.990**; 138 ms vs **13 ms** in the service; ~$0.41 vs $10.03 per 1M searches |
+| vs Vectorize, same vectors, 100 queries | recall@10 **0.971 vs 0.786**; 138 ms vs 465 ms; with a date filter 140 ms vs 10.2 s |
+| embedding all stories / building the index | ~50 min on Workers AI (9 jobs), ~$1.60 / 162 s on a laptop |
+| storage | 7.0 GB in R2 ($0.10/mo) + the object's SQLite once prewarmed ($1.40/mo) |
+
+Results: `bench/results/v0-vec-synth.md`, `v1-hn-recall.md`, `v3-vs-vectorize.md`,
+`v4-vs-turbopuffer.md`.
+
 ## Schemas and datasets
 
 A base carries its schema in `manifest.json`: tables (typed columns, column 0 is the primary
@@ -130,19 +187,22 @@ leases, sockets and mutations carry `?app=`.
 
 ```
 engine/core      Rust: key/row codec, 64 KiB pages, B+tree (bulk build + fault-aware reads),
-                 catalog, generator, queries, overlay, writes, IVM
+                 catalog, generator, queries, overlay, writes, IVM, vector (IVF search, live top k)
                  tests: oracle queries, write+IVM fuzz with fault injection, B+tree property tests
 engine/wasm      the engine as WebAssembly (raw exports, synchronous host import for SQLite pages)
-engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container)
+engine/builder   native builder → 4 MiB parts + manifest (Dockerfile.builder runs it in a Container);
+                 embed (PVEC shards), vec-build / vec-gt / vec-eval / vec-merge
 src/do.ts        DbObject: tiers, fault rounds, sockets, overlay persistence, hibernation
 src/apps/        the apps' named queries and validated mutators (tracker, hn, place, taxi)
-src/hn-tail.ts   HnTail: keeps the HN base live from the official API
+src/hn-tail.ts   HnTail: keeps the HN base live from the official API (and embeds new stories)
+src/embed.ts     embeddings in the Worker: query vectors (cached), story text shared with the builder
 datasets/        per-app schema.json and build.sh (run in the builder container)
 src/lease.ts     signed queries: lease signing and verification
 src/worker.ts    edge Worker: SSR first paint, /api/socket, /api/mutate, admin, nightly reset
 src/node-*.ts    the same DbObject in workerd in a Container (pagedb-node)
 web/             the tracker UI (optimistic sync client) and the how-it-works page
-bench/           R2/tier spikes, query tiers, fan-out load, WASM microbenchmarks
+bench/           R2/tier spikes, query tiers, fan-out load, WASM microbenchmarks, vector tiers,
+                 write visibility, Vectorize comparison (spikes/vectorize-bench)
 test/            live sync and hibernation end-to-end tests (deployed)
 ```
 

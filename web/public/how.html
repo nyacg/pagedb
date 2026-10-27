@@ -19,7 +19,7 @@
   .back { color: var(--accent); text-decoration: none; font-size: 14px; }
 </style></head>
 <body><div class="doc">
-<a class="back" href="/">← back to the tracker</a>
+<a class="back" href="/">← pagedb</a> · <a class="back" href="/tracker">the tracker</a>
 <h1>How pagedb works</h1>
 <p class="lede">A database whose base lives in R2 as immutable pages, served by <b>one Durable Object</b> that only ever holds what queries touch. Every list, board column and thread in the tracker is a <b>live query</b>: when anyone writes, the object works out exactly which rows of which open views changed and pushes just those.</p>
 <p>Our take on <a href="https://demo.r2db.dev">r2db</a>, rebuilt from its public behaviour and built to be measured. The engine is Rust compiled to WebAssembly (the same code builds the dataset natively); the object, sync protocol and UI are TypeScript.</p>
@@ -58,7 +58,16 @@
   <li><b><a href="/sheet">146 million taxi trips</a></b>: a spreadsheet you can scroll from the first row to the last. Jumping to row 73,000,000 reads only one path down the tree: branch pages count the rows under each child. Group counts are answered the same way, without reading a row.</li>
 </ul>
 
-<h2>6 · Measured</h2>
+<h2>6 · Search by meaning, in the same pages</h2>
+<p><a href="/hn?p=semantic">Semantic search on Hacker News</a> runs in the same object as everything else. Every story since 2006 is an embedding (Workers AI, Qwen3-Embedding-0.6B, 1024 dimensions) in a <b>vector index made of ordinary B+trees</b>: one keyed by <i>cluster, story id</i>, whose entries hold 1 bit per dimension of the story's vector (for a fast first pass) or an 8-bit code and the columns a result shows (to rerank the best candidates), and a small tree of cluster centroids that sits in the pinned region.</p>
+<ul>
+  <li><b>Two rounds, each fetching everything it needs at once.</b> The engine scores the centroids, picks the nearest clusters and asks for all their 1-bit pages together; it scores ~70,000 vectors with popcounts, then fetches the 8-bit entries of the best 100 and reranks them.</li>
+  <li><b>Writes are searchable immediately.</b> A new story and its vector go into the overlay in the same write; searches scan overlay vectors too. A managed vector index (Vectorize) makes writes visible after its next indexing job: seconds to a minute in our measurements.</li>
+  <li><b>Semantic results are live.</b> A new story that scores into an open search's top results is pushed to every tab showing it, and points and comment counts update in place.</li>
+  <li><b>It's turbopuffer's shape</b> (object storage as the source of truth, centroids cached, one round trip to object storage per cold query, unindexed writes searched directly) built from Durable Objects, SQLite and R2.</li>
+</ul>
+
+<h2>7 · Measured</h2>
 <table>
   <tr><th>Measured</th><th>pagedb</th><th>r2db demo</th></tr>
   <tr><td>Issues on screen after opening the page (both 100 GB bases, same laptop, median of 8 loads)</td><td class="n win">0.25 s</td><td class="n">1.09 s</td></tr>
@@ -69,20 +78,31 @@
   <tr><td>Object waking from sleep (1 GB base)</td><td class="n">~0 ms of I/O (state in its SQLite)</td><td class="n">—</td></tr>
   <tr><td>Write → other tabs, 1,000 sockets, 5 writes/s (1 GB base)</td><td class="n">p50 255 ms, p99 684 ms (laptop ↔ Cloudflare both ways)</td><td class="n">—</td></tr>
 </table>
+<p style="font-size:13px;margin-top:14px"><b>Semantic search</b> (all 4.85 million HN stories, compared with Cloudflare Vectorize on the same vectors):</p>
+<table>
+  <tr><th>Measured</th><th>pagevec</th><th>Vectorize</th></tr>
+  <tr><td>Recall@10 against exact search (100 queries, same vectors)</td><td class="n win">0.971</td><td class="n">0.786</td></tr>
+  <tr><td>Search, new query (p50 in the Worker)</td><td class="n win">138 ms (SQLite), 44 ms (RAM)</td><td class="n">465 ms</td></tr>
+  <tr><td>Search with a date filter (~8% of stories)</td><td class="n win">140 ms, recall 0.89</td><td class="n">10.2 s, recall 0.72</td></tr>
+  <tr><td>Search, cold</td><td class="n">1.86 s from R2, 0.58 s from the city cache</td><td class="n">—</td></tr>
+  <tr><td>A write is searchable</td><td class="n win">on the next search</td><td class="n">after 1–66 s (p50 14 s)</td></tr>
+  <tr><td>Results update live</td><td class="n win">yes</td><td class="n">no</td></tr>
+  <tr><td>Monthly cost at this size, before queries</td><td class="n win">~$1.50</td><td class="n">~$52</td></tr>
+</table>
 <p style="font-size:13px">Comparisons are against r2db's public demo, measured the same way from the same laptop, both on 100 GB bases (r2db as a returning visitor with its intro panel closed). The tracker runs on the <b>100 GB base</b> (27.1 million issues, 1.47 million pages): every query is still one fault round and warm queries take 35–49 ms from a laptop. Size changes only how often a page is already cached, and a brand-new object's one-time start (it loads 73 MB of interior pages, 0.2–2 s).</p>
 
-<h2>7 · The same object in a container</h2>
+<h2>8 · The same object in a container</h2>
 <p>The database object is ordinary Durable Object code, so it also runs inside <b>workerd in a Cloudflare Container</b> (4 vCPU, 12 GiB). There it gets a 6 GiB page tier instead of 32 MiB and a dedicated CPU. Measured on the 10 GB base: warm queries are the same (~45 ms from a laptop), and fan-out to 1,000 sockets is about twice as fast (write → every tab: p50 <b>128 ms</b> vs 255 ms; p99 296 ms vs 684 ms). The trade-offs: a container takes at most 4,096 connections, its cold start takes seconds, and it reaches R2 through a bridge.</p>
 
-<h2>8 · Limits (honest list)</h2>
+<h2>9 · Limits (honest list)</h2>
 <ul>
   <li><b>Only indexed queries.</b> A query must be answerable from an index (equalities, then the index order); anything else is refused rather than scanning 100 GB.</li>
   <li><b>One object's CPU.</b> All reads, writes and pushes for a database run on one thread. Read replicas (more objects sharing the base) are the next step.</li>
   <li><b>Cold reads cost R2 latency</b> (~200 ms+ per round for parts nobody has read recently).</li>
   <li><b>Base data is generated</b> and users/projects are read-only in the demo; the activity feed's index holds the newest 500k comments of the base plus everything written since.</li>
 </ul>
-<h2>9 · Layout</h2>
-<pre>engine/core     Rust: codec, 64 KiB pages, B+tree, overlay, queries, writes, IVM (tests: oracle + fault-injection fuzz)
+<h2>10 · Layout</h2>
+<pre>engine/core     Rust: codec, 64 KiB pages, B+tree, overlay, queries, writes, IVM, vector search (tests: oracle + fault-injection fuzz)
 engine/wasm     the engine as WebAssembly for the Durable Object
 engine/builder  native: generates the dataset, writes 4 MiB parts (runs in a Cloudflare Container for 100 GB)
 src/do.ts       the Durable Object: tiers, fault rounds, sockets, overlay persistence

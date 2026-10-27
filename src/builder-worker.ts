@@ -3,6 +3,7 @@
  * written straight into R2 (a laptop uploads at ~11 MB/s; this doesn't).
  *   POST /start?db=db100g&projects=2710&comments=6.8   (Bearer ADMIN_TOKEN)
  *   POST /start?db=hn&job=hn                          (a dataset job: datasets/<job>/build.sh)
+ *   POST /start?db=hnvec&job=hn/embed&env.LAST=2026-08 (a step: datasets/hn/embed.sh, with env)
  *   GET  /status?db=db100g
  * When done, the manifest is written as db/<db>/manifest-<base>.json; promote it to
  * db/<db>/manifest.json once checked (POST /promote?db=…&base=…).
@@ -17,12 +18,23 @@ interface Env {
   R2_AK?: string;
   R2_SK?: string;
   R2_ENDPOINT?: string;
+  /** Embedding jobs (hn/embed): Workers AI over REST, or an OpenAI-compatible endpoint. */
+  AI_ACCOUNT?: string;
+  AI_TOKEN?: string;
+  EMBED_URL?: string;
+  EMBED_KEY?: string;
+  EMBED_MODEL?: string;
 }
 
-/** The container's only egress: PUT http://r2.internal/put/<key> → R2. */
+/** The container's R2 route: PUT (and HEAD) http://r2.internal/put/<key>, GET …/get/<key>. */
 export class R2Put extends WorkerEntrypoint<Env> {
   override async fetch(req: Request) {
     const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname.startsWith("/get/")) {
+      // Inputs a job reads back (e.g. embedding shards for the vector index build).
+      const obj = await this.env.BUCKET.get(decodeURIComponent(url.pathname.slice(5)));
+      return obj ? new Response(obj.body) : new Response("not found", { status: 404 });
+    }
     if (req.method === "HEAD" && url.pathname.startsWith("/put/")) {
       // Resume support: parts are deterministic, so one that already exists is skipped.
       const head = await this.env.BUCKET.head(decodeURIComponent(url.pathname.slice(5)));
@@ -35,7 +47,7 @@ export class R2Put extends WorkerEntrypoint<Env> {
 }
 
 export class BuilderBox extends DurableObject<Env> {
-  async start(db: string, projects: number, comments: number, resumeBase?: string, job?: string) {
+  async start(db: string, projects: number, comments: number, resumeBase?: string, job?: string, extra?: Record<string, string>) {
     const c = this.ctx.container!;
     if (c.running) return { running: true, base: this.ctx.storage.kv.get("base") };
     // Resuming reuses a base id: the builder is deterministic, so parts already in R2 are skipped.
@@ -54,6 +66,8 @@ export class BuilderBox extends DurableObject<Env> {
         BASE: base,
         ...(job ? { JOB: job } : {}),
         ...(job && this.env.R2_AK ? { R2_AK: this.env.R2_AK, R2_SK: this.env.R2_SK!, R2_ENDPOINT: this.env.R2_ENDPOINT! } : {}),
+        ...(job ? Object.fromEntries((["AI_ACCOUNT", "AI_TOKEN", "EMBED_URL", "EMBED_KEY", "EMBED_MODEL"] as const).filter((k) => this.env[k]).map((k) => [k, this.env[k]!])) : {}),
+        ...(extra ?? {}),
       },
     } as any);
     await c.interceptOutboundHttp("r2.internal", (this.ctx.exports as any).R2Put({ props: {} }));
@@ -106,7 +120,7 @@ export default {
     const db = url.searchParams.get("db") ?? "db100g";
     // (RPC return types are deep; a narrow view keeps the checker fast.)
     const box = env.BOX.getByName(db) as unknown as {
-      start(db: string, p: number, c: number, base?: string, job?: string): Promise<unknown>;
+      start(db: string, p: number, c: number, base?: string, job?: string, extra?: Record<string, string>): Promise<unknown>;
       info(): Promise<unknown>;
       stop(): Promise<unknown>;
       reattach(): Promise<unknown>;
@@ -114,7 +128,15 @@ export default {
     };
     if (url.pathname === "/start" && req.method === "POST")
       return Response.json(
-        await box.start(db, Number(url.searchParams.get("projects") ?? 2710), Number(url.searchParams.get("comments") ?? 6.8), url.searchParams.get("base") ?? undefined, url.searchParams.get("job") ?? undefined),
+        await box.start(
+          db,
+          Number(url.searchParams.get("projects") ?? 2710),
+          Number(url.searchParams.get("comments") ?? 6.8),
+          url.searchParams.get("base") ?? undefined,
+          url.searchParams.get("job") ?? undefined,
+          // Job settings: ?env.NAME=value (e.g. env.LAST=2026-08, env.FIRST_PAGE=…).
+          Object.fromEntries([...url.searchParams].filter(([k]) => k.startsWith("env.")).map(([k, v]) => [k.slice(4), v])),
+        ),
       );
     if (url.pathname === "/status") {
       const s = await env.BUCKET.get(`db/${db}/build-status.json`);

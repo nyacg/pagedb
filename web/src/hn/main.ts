@@ -107,6 +107,8 @@ function subscribe() {
       return sync.sub("list", { name: "from", args: { domain: params.get("site") ?? "", ...(next ? { start: next } : {}) } });
     case "search":
       return words.length ? sync.sub("list", { name: "search", args: { words, ...(next ? { start: next } : {}) } }) : undefined;
+    case "semantic":
+      return semanticArgs().q.length >= 2 ? sync.sub("list", { name: "semantic", args: semanticArgs() }, seed) : undefined;
     case "user":
       sync.sub("ustories", { name: "userStories", args: { by: id, limit: 30 } });
       return sync.sub("ucomments", { name: "userComments", args: { by: id, limit: 30 } });
@@ -118,11 +120,26 @@ function subscribe() {
 }
 subscribe();
 
+/** The semantic search in the URL: ?q= (meaning, not words), &since=, &kind=. */
+function semanticArgs(): Record<string, string> {
+  const a: Record<string, string> = { q: (params.get("q") ?? "").trim().slice(0, 200) };
+  const since = params.get("since") ?? "";
+  if (["day", "week", "month", "year"].includes(since)) a.since = since;
+  const kind = params.get("kind") ?? "";
+  if (["story", "ask", "show", "job", "poll"].includes(kind)) a.kind = kind;
+  return a;
+}
+
 // ---------------------------------------------------------------- views
 
-function storyRows(rows: Row[], start: number) {
+function storyRows(rows: Row[], start: number, scores = false) {
+  // Similarity bars span the scores on screen (good matches all sit in a narrow band).
+  const ss = rows.map((r) => r._score ?? 0);
+  const [lo, hi] = [Math.min(...ss), Math.max(...ss)];
   return rows
     .map((r, i) => {
+      const w = hi > lo ? 20 + (80 * ((r._score ?? 0) - lo)) / (hi - lo) : 100;
+      const sim = scores && r._score !== undefined ? `<span class="sim" title="cosine similarity ${r._score.toFixed(3)}"><i style="width:${w.toFixed(0)}%"></i></span>` : "";
       const dom = r.domain ? ` <span class="sitebit">(<a href="?p=from&site=${esc(r.domain)}">${esc(r.domain)}</a>)</span>` : "";
       const href = r.url ? esc(r.url) : `?p=item&id=${esc(r.id)}`;
       const job = r.kind === "job";
@@ -130,10 +147,34 @@ function storyRows(rows: Row[], start: number) {
         ? itemLink(r.id, ago(r.time))
         : `<span class="score">${r.score} point${r.score === 1 ? "" : "s"}</span> by ${userLink(r.by)} ${itemLink(r.id, ago(r.time))} | ${itemLink(r.id, r.descendants ? `${r.descendants}&nbsp;comment${r.descendants === 1 ? "" : "s"}` : "discuss")}`;
       return `<tr class="athing${fresh(r.id)}"><td class="rank">${start + i + 1}.</td><td class="votelinks">${job ? "" : `<a class="votearrow${voted.has(r.id) ? " voted" : ""}" data-vote="${esc(r.id)}" title="upvote"></a>`}</td>
-        <td class="titleline"><a href="${href}" ${r.url ? 'rel="nofollow noreferrer" target="_blank"' : ""}>${esc(r.title)}</a>${dom}</td></tr>
+        <td class="titleline">${sim}<a href="${href}" ${r.url ? 'rel="nofollow noreferrer" target="_blank"' : ""}>${esc(r.title)}</a>${dom}</td></tr>
         <tr><td colspan="2"></td><td class="subtext">${meta}</td></tr><tr class="spacer"></tr>`;
     })
     .join("");
+}
+
+function semanticView() {
+  const a = semanticArgs();
+  const opt = (name: string, v: string, label: string) => `<option value="${v}"${(params.get(name) ?? "") === v ? " selected" : ""}>${label}</option>`;
+  const form = `<form class="semform" action="">
+    <input type="hidden" name="p" value="semantic">
+    <input type="search" name="q" value="${esc(a.q)}" placeholder="Describe what you're looking for…" ${a.q ? "" : "autofocus"} maxlength="200" aria-label="Search by meaning">
+    <select name="since" aria-label="When">${opt("since", "", "Any time")}${opt("since", "year", "Past year")}${opt("since", "month", "Past month")}${opt("since", "week", "Past week")}${opt("since", "day", "Past day")}</select>
+    <select name="kind" aria-label="Kind">${opt("kind", "", "All stories")}${opt("kind", "story", "Links")}${opt("kind", "ask", "Ask HN")}${opt("kind", "show", "Show HN")}${opt("kind", "job", "Jobs")}</select>
+    <button>Search</button></form>`;
+  const examples = ["running a database on object storage", "burnout as a solo founder", "why is my rust code slow", "learning to draw as an adult"];
+  if (a.q.length < 2)
+    return `${form}<div class="semintro"><p>Search every HN story by meaning, not keywords. Each story's title (and Ask HN text) is an embedding in a vector index that lives in the same Durable Object as the rest of HN, so new stories are searchable the moment they're posted.</p>
+      <p class="semtry">Try: ${examples.map((x) => `<a href="?p=semantic&q=${encodeURIComponent(x)}">${esc(x)}</a>`).join("")}</p></div>`;
+  const s = sync.get("list");
+  if (!s?.ready && !s?.rows.size) return `${form}<p class="note">Embedding your query and searching…</p>`;
+  const rows = sync.view("list").sort((x, y) => (y._score ?? 0) - (x._score ?? 0));
+  if (!rows.length) return `${form}<p class="note">Nothing found.</p>`;
+  const st = s?.stats;
+  const tier = st ? (st.r2Gets ? "from R2" : st.cacheHits ? "from the city cache" : st.sqliteHits ? "from the object's SQLite" : "in memory") : "";
+  const ann = s?.ann;
+  const line = ann ? `<p class="semstats">${ann.scanned.toLocaleString()} story vectors compared in ${ann.clusters} clusters (${ann.pages} pages, ${tier})${s?.firstMs !== undefined ? `, ${Math.round(s.firstMs)} ms including the query's embedding` : ""}</p>` : "";
+  return `${form}${line}<table class="items">${storyRows(rows, 0, true)}</table>`;
 }
 
 function moreLink(rows: Row[], key: "time" | "score") {
@@ -280,7 +321,7 @@ function put(sel: string, html: string) {
 function render() {
   const active = document.activeElement as HTMLTextAreaElement | null;
   const typing = active?.matches("textarea, input") ? { form: active.closest("form")?.getAttribute("data-parent") ?? (active.closest("[data-submit]") ? "submit" : null), name: active.name, value: active.value, a: active.selectionStart, b: active.selectionEnd } : null;
-  const views: Record<string, () => string> = { comments: commentsView, user: userView, item: threadView, submit: submitView };
+  const views: Record<string, () => string> = { comments: commentsView, user: userView, item: threadView, submit: submitView, semantic: semanticView };
   put("#main", (views[page] ?? listView)());
   put("#me", esc(me));
   put("#foot", footer());
@@ -361,8 +402,16 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+// Back to a page from the back/forward cache: its filters may still be disabled from the submit.
+addEventListener("pageshow", () => document.querySelectorAll<HTMLSelectElement>(".semform select").forEach((el) => (el.disabled = false)));
+
 document.addEventListener("submit", async (e) => {
   const form = e.target as HTMLFormElement;
+  // Search forms navigate (GET) as usual, minus empty filters (no "&since=&kind=").
+  if (form.matches(".semform")) {
+    for (const el of form.querySelectorAll("select")) el.disabled = !el.value;
+    return;
+  }
   if (!form.matches("[data-parent], [data-submit]")) return; // the search box is a plain GET form
   e.preventDefault();
   if (form.matches("[data-parent]")) {

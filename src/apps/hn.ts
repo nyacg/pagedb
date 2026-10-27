@@ -7,6 +7,8 @@
 const eq = (c: string, v: unknown) => ({ type: "simple", op: "=", left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const cond = (op: string, c: string, v: unknown) => ({ type: "simple", op, left: { type: "column", name: c }, right: { type: "literal", value: v } });
 const and = (...c: unknown[]) => (c.length === 1 ? c[0] : { type: "and", conditions: c });
+import { embed, packVector, queryVector, storyText, type EmbedEnv } from "../embed";
+
 const BY_TIME = [["time", "desc"], ["id", "asc"]];
 const THREAD = [["time", "asc"], ["id", "asc"]];
 
@@ -77,8 +79,38 @@ function after(q: Record<string, unknown>, start: unknown, cols: string[]) {
 const stories = (where: unknown, a: Record<string, any>, dflt = 30) =>
   after({ table: "story", ...(where ? { where } : {}), orderBy: BY_TIME, limit: limit(a.limit, dflt, 100) }, a.start, ["time", "id"]);
 
-export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
+/** The stories' vector index (datasets/hn/vectors.json): all 1024 dims, 4-bit residuals. */
+export const VEC = { index: "story_vec", dims: 1024 };
+const SINCE: Record<string, number> = { day: 86400e3, week: 7 * 86400e3, month: 30 * 86400e3, year: 365 * 86400e3 };
+
+/** A semantic search's arguments from a page URL (?q=…&since=…&kind=…). */
+export function semanticArgs(p: URLSearchParams): Record<string, string> {
+  const a: Record<string, string> = { q: (p.get("q") ?? "").trim() };
+  if (SINCE[p.get("since") ?? ""]) a.since = p.get("since")!;
+  if (KINDS.includes(p.get("kind") as any)) a.kind = p.get("kind")!;
+  return a;
+}
+
+/** Stories closest in meaning to a text: its embedding, then the object's vector index. */
+async function semantic(a: Record<string, any>, env?: Record<string, unknown>) {
+  const q = need(typeof a.q === "string" && a.q.trim().length >= 2 && a.q.length <= 200, a.q as string, "query");
+  const k = limit(a.limit, 30, 50);
+  const conds: unknown[] = [];
+  if (a.since !== undefined) {
+    need(SINCE[a.since] !== undefined, 0, "since");
+    // Rounded to the hour, so the same search signs the same AST for a while.
+    conds.push(cond(">=", "time", Math.floor((Date.now() - SINCE[a.since]) / 3600e3) * 3600e3));
+  }
+  if (a.kind !== undefined) conds.push(eq("kind", need(KINDS.includes(a.kind), a.kind, "kind")));
+  if (!env) throw new Error("semantic search needs the Worker's embedding model");
+  const { vec } = await queryVector(env as EmbedEnv, q, VEC.dims);
+  return { table: "story", ann: { index: VEC.index, vec, k }, ...(conds.length ? { where: and(...conds) } : {}) };
+}
+
+export function namedQuery(name: string, a: Record<string, any> = {}, env?: Record<string, unknown>): unknown {
   switch (name) {
+    case "semantic":
+      return semantic(a, env);
     case "top":
       return { table: "story", where: cond("IS NOT", "topRank", null), orderBy: [["topRank", "asc"], ["id", "asc"]], limit: limit(a.limit, 90, 120) };
     case "new":
@@ -121,6 +153,23 @@ export function namedQuery(name: string, a: Record<string, any> = {}): unknown {
       return { table: "comment", where: eq("id", need(typeof a.id === "string" && ID.test(a.id), a.id, "comment")), one: true };
   }
   throw new Error(`unknown query ${name}`);
+}
+
+/**
+ * Vector ops for story inserts among `ops` (their embeddings, so new stories are found by
+ * semantic search at once). Only when the base has the vector index (HN_VEC set). If the
+ * model is unavailable the ops go out without them.
+ */
+export async function withVectors(ops: unknown[], env: Record<string, unknown>): Promise<unknown[]> {
+  if (!env.HN_VEC) return ops;
+  const stories = ops.filter((o: any) => o?.op === "insert" && o.table === "story") as { row: Record<string, any> }[];
+  if (!stories.length) return ops;
+  try {
+    const vecs = await embed(env as EmbedEnv, stories.map((o) => storyText(o.row) || "(untitled)"));
+    return [...ops, ...stories.map((o, i) => ({ op: "vec_put", index: VEC.index, id: o.row.id, vec: packVector(vecs[i], VEC.dims) }))];
+  } catch {
+    return ops;
+  }
 }
 
 // ------------------------------------------------------------------ mutators

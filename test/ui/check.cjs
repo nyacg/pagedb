@@ -10,7 +10,7 @@ const B = process.env.B || "https://pagedb.do-pool-lab.workers.dev";
   };
   const a = await ctx.newPage(); watch(a, "A");
   let leaseCalls = 0; a.on("request", (r) => { if (r.url().endsWith("/api/lease")) leaseCalls++; });
-  await a.goto(B + "/?project=p0003");
+  await a.goto(B + "/tracker?project=p0003");
   await a.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50, null, { timeout: 15000 });
   console.log("list rows", await a.evaluate(() => window.__pagedb.listRows().length), "lease calls after boot", leaseCalls);
   // infinite scroll
@@ -42,7 +42,7 @@ const B = process.env.B || "https://pagedb.do-pool-lab.workers.dev";
   console.log("feed items", await a.locator(".fi").count());
   // two tabs: edit in A (via the mutate API), see it in B
   const b = await ctx.newPage(); watch(b, "B");
-  await b.goto(B + "/?project=p0003");
+  await b.goto(B + "/tracker?project=p0003");
   await b.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50, null, { timeout: 15000 });
   const row = await b.evaluate(() => window.__pagedb.listRows()[3]);
   const mark = `lease check ${Date.now().toString(36)}`;

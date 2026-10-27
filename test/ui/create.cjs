@@ -8,7 +8,7 @@ const B = process.env.B || "https://pagedb.do-pool-lab.workers.dev";
     const p = await ctx.newPage();
     if (process.env.LOCAL) await p.route("**/app.js*", (r) => r.fulfill({ contentType: "text/javascript", body: require("fs").readFileSync("/Users/robertchandler/conductor/repos/pagedb/web/public/app.js", "utf8") }));
     p.on("websocket", (ws) => { ws.on("framereceived", (f) => frames.push(`${tag} < ${String(f.payload).slice(0, 300)}`)); ws.on("framesent", (f) => frames.push(`${tag} > ${String(f.payload).slice(0, 100)}`)); });
-    await p.goto(B + "/?project=p0003");
+    await p.goto(B + "/tracker?project=p0003");
     await p.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50);
     return p;
   };

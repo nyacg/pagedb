@@ -22,6 +22,9 @@ use std::rc::Rc;
 extern "C" {
     /// Copy page `id` into `dst` (PAGE_SIZE bytes) if the host's synchronous tier has it.
     fn host_page_get(id_lo: u32, id_hi: u32, dst: *mut u8) -> u32;
+    /// Pages (u64 ids at `ids`) about to be read: the host loads the ones its synchronous tier
+    /// has in batches, handing each back through `page_put_trusted`.
+    fn host_pages_prefetch(ids: *const u64, n: u32);
     /// A fold wrote page `id` (PAGE_SIZE bytes at `src`): the host stores it synchronously.
     fn host_page_out(id_lo: u32, id_hi: u32, src: *const u8);
 }
@@ -64,9 +67,16 @@ struct Db {
 
 /// A live partition and how many subscriptions share it.
 struct Live {
-    part: pagedb_core::ivm::Partition,
+    kind: LiveKind,
     refs: u32,
     ast: String,
+}
+
+enum LiveKind {
+    /// A window of an index (ivm).
+    Ivm(pagedb_core::ivm::Partition),
+    /// A vector search's top k.
+    Ann(pagedb_core::vector::live::AnnLive),
 }
 
 thread_local! {
@@ -78,6 +88,16 @@ thread_local! {
 struct Tiers;
 
 impl PageStore for Tiers {
+    fn prefetch(&self, ids: &[PageId]) {
+        let missing: Vec<u64> = RAM.with(|r| {
+            let r = r.borrow();
+            ids.iter().copied().filter(|id| !r.pages.contains_key(id)).collect()
+        });
+        if missing.len() > 8 {
+            unsafe { host_pages_prefetch(missing.as_ptr(), missing.len() as u32) };
+        }
+    }
+
     fn get(&self, id: PageId) -> Option<Rc<[u8]>> {
         let hit = RAM.with(|r| {
             let mut r = r.borrow_mut();
@@ -149,6 +169,18 @@ pub unsafe extern "C" fn page_put(id_lo: u32, id_hi: u32, ptr: *const u8) -> u32
     let id = (id_hi as u64) << 32 | id_lo as u64;
     RAM.with(|r| r.borrow_mut().insert(id, bytes.to_vec().into()));
     1
+}
+
+/// A page from the host's own synchronous tier (checked when it first arrived): no checksum.
+#[no_mangle]
+pub unsafe extern "C" fn page_put_trusted(id_lo: u32, id_hi: u32, ptr: *const u8) {
+    let bytes = std::slice::from_raw_parts(ptr, PAGE_SIZE);
+    let id = (id_hi as u64) << 32 | id_lo as u64;
+    RAM.with(|r| {
+        let mut r = r.borrow_mut();
+        r.host_hits += 1;
+        r.insert(id, bytes.to_vec().into())
+    });
 }
 
 #[no_mangle]
@@ -292,6 +324,9 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
         Ok(t) => t,
         Err(_) => return error("query is not UTF-8"),
     };
+    if is_ann(text) {
+        return ann_query(text);
+    }
     let plan = DB.with(|d| {
         let mut d = d.borrow_mut();
         let db = d.as_mut()?;
@@ -341,6 +376,36 @@ pub unsafe extern "C" fn query(ptr: *const u8, len: u32) -> u32 {
     })
 }
 
+// ------------------------------------------------------------------ vector search
+
+/// A vector query (`{"ann":{…}}`)? Checked on the text so ordinary queries skip a parse.
+fn is_ann(text: &str) -> bool {
+    text.contains("\"ann\"")
+        && serde_json::from_str::<serde_json::Value>(text).map_or(false, |a| a.get("ann").is_some())
+}
+
+/// Run a vector query. OK payload: {"rows":[…],"complete":true,"ann":{clusters,pages,scanned,overlay}}.
+fn ann_query(text: &str) -> u32 {
+    let guard = DB.with(|d| d.as_ptr());
+    let db = match unsafe { (*guard).as_ref() } {
+        Some(db) => db,
+        None => return error("engine not initialized"),
+    };
+    let ast: serde_json::Value = match serde_json::from_str(text) {
+        Ok(a) => a,
+        Err(e) => return error(format!("bad query JSON: {e}")),
+    };
+    let aq = match pagedb_core::vector::compile(&db.roots, &ast) {
+        Ok(q) => q,
+        Err(e) => return error(e),
+    };
+    let store = Tiers;
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    let r = pagedb_core::vector::search(&ctx, &db.roots, &aq);
+    finish(&ctx, r, |(hits, stats)| pagedb_core::vector::output_json(&hits, &stats).into_bytes())
+}
+
 // ------------------------------------------------------------------ live queries and writes
 
 fn plan_for(db: &mut Db, text: &str) -> Result<Rc<pagedb_core::query::Plan>, String> {
@@ -385,6 +450,9 @@ pub unsafe extern "C" fn subscribe(ptr: *const u8, len: u32) -> u32 {
         Some(db) => db,
         None => return error("engine not initialized"),
     };
+    if is_ann(&text) {
+        return ann_subscribe(db, text);
+    }
     let plan = match plan_for(db, &text) {
         Ok(p) => p,
         Err(e) => return error(e),
@@ -405,9 +473,50 @@ pub unsafe extern "C" fn subscribe(ptr: *const u8, len: u32) -> u32 {
         Ok((part, out)) => {
             let pid = db.next_pid;
             db.next_pid += 1;
-            db.parts.insert(pid, Live { part, refs: 1, ast: text.clone() });
+            db.parts.insert(pid, Live { kind: LiveKind::Ivm(part), refs: 1, ast: text.clone() });
             db.by_ast.insert(text, pid);
             set_out(format!("{{\"pid\":{pid},{}}}", rows_json(&out)).into_bytes());
+            0
+        }
+        Err(Miss) => {
+            set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
+            1
+        }
+    }
+}
+
+/// Subscribe to a vector search: its top k, kept live as vectors are filed (see vector::live).
+/// Identical searches share one partition.
+fn ann_subscribe(db: &mut Db, text: String) -> u32 {
+    let ast: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(a) => a,
+        Err(e) => return error(format!("bad query JSON: {e}")),
+    };
+    let aq = match pagedb_core::vector::compile(&db.roots, &ast) {
+        Ok(q) => q,
+        Err(e) => return error(e),
+    };
+    let store = Tiers;
+    let view = pagedb_core::overlay::View::new(&db.overlay);
+    let ctx = Ctx::with_view(&store, &view);
+    let r = pagedb_core::vector::live::hydrate(&ctx, &db.roots, aq);
+    match r {
+        Ok((live, hits, stats)) => {
+            let body = pagedb_core::vector::output_json(&hits, &stats);
+            let pid = match db.by_ast.get(&text) {
+                Some(&pid) => {
+                    db.parts.get_mut(&pid).unwrap().refs += 1;
+                    pid
+                }
+                None => {
+                    let pid = db.next_pid;
+                    db.next_pid += 1;
+                    db.parts.insert(pid, Live { kind: LiveKind::Ann(live), refs: 1, ast: text.clone() });
+                    db.by_ast.insert(text, pid);
+                    pid
+                }
+            };
+            set_out(format!("{{\"pid\":{pid},{}", &body[1..]).into_bytes());
             0
         }
         Err(Miss) => {
@@ -504,7 +613,7 @@ pub unsafe extern "C" fn ovl_load(ptr: *const u8, len: u32, version: f64) -> u32
 #[no_mangle]
 pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
     use pagedb_core::ivm::{compute, DeltaOp};
-    use pagedb_core::write::{parse_ops, plan_write, WriteError};
+    use pagedb_core::write::{parse_ops_in, plan_write_all, WriteError};
     let ops_json: serde_json::Value = match serde_json::from_slice(slice(ptr, len)) {
         Ok(v) => v,
         Err(e) => return error(format!("bad ops JSON: {e}")),
@@ -514,7 +623,7 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
         Some(db) => db,
         None => return error("engine not initialized"),
     };
-    let ops = match parse_ops(db.roots.schema, &ops_json) {
+    let ops = match parse_ops_in(db.roots.schema, &db.roots.vectors, &ops_json) {
         Ok(o) => o,
         Err(e) => return error(e),
     };
@@ -522,7 +631,7 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
     let (writes, results, changes) = {
         let view = pagedb_core::overlay::View::new(&db.overlay);
         let ctx = Ctx::with_view(&store, &view);
-        let changes = match plan_write(&ctx, &db.roots, &view, &ops) {
+        let (changes, vec_changes) = match plan_write_all(&ctx, &db.roots, &view, &ops) {
             Ok(c) => c,
             Err(WriteError::Miss) => {
                 set_out(ctx.take_want().iter().flat_map(|id| id.to_le_bytes()).collect());
@@ -533,7 +642,11 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
         let mut results = Vec::new();
         let mut missed = false;
         for (pid, live) in db.parts.iter() {
-            match compute(&ctx, &db.roots, &live.part, &changes) {
+            let r = match &live.kind {
+                LiveKind::Ivm(part) => compute(&ctx, &db.roots, part, &changes).map(|(st, ops)| (Next::Ivm(st), ops)),
+                LiveKind::Ann(a) => pagedb_core::vector::live::compute(&ctx, &db.roots, a, &vec_changes, &changes).map(|(w, ops)| (Next::Ann(w), ops)),
+            };
+            match r {
                 Ok(r) => results.push((*pid, r)),
                 Err(Miss) => missed = true,
             }
@@ -549,8 +662,12 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
     db.overlay.version += 1;
     let mut json = format!("{{\"version\":{},\"changes\":{changes},\"pokes\":{{", db.overlay.version);
     let mut first = true;
-    for (pid, (state, ops)) in results {
-        db.parts.get_mut(&pid).unwrap().part.state = state;
+    for (pid, (next, ops)) in results {
+        match (&mut db.parts.get_mut(&pid).unwrap().kind, next) {
+            (LiveKind::Ivm(part), Next::Ivm(state)) => part.state = state,
+            (LiveKind::Ann(a), Next::Ann(w)) => a.window = w,
+            _ => {}
+        }
         if ops.is_empty() {
             continue;
         }
@@ -595,6 +712,12 @@ pub unsafe extern "C" fn write(ptr: *const u8, len: u32) -> u32 {
     encode_writes(&writes, &mut out);
     set_out(out);
     0
+}
+
+/// A partition's state after a write (committed only once every partition has computed).
+enum Next {
+    Ivm(pagedb_core::ivm::State),
+    Ann(Vec<(f32, String)>),
 }
 
 /// The whole committed overlay as records (every entry kind 1), for compacting the log into

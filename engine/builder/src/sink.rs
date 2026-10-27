@@ -19,8 +19,15 @@ pub struct PartSink {
 
 impl PartSink {
     pub fn new(dir: &Path) -> Self {
+        Self::starting_at(dir, 0)
+    }
+
+    /// Pages numbered from `first` (a multiple of PAGES_PER_PART): a segment that extends an
+    /// existing base keeps the base's page ids and part numbers.
+    pub fn starting_at(dir: &Path, first: PageId) -> Self {
+        assert_eq!(first % PAGES_PER_PART, 0);
         fs::create_dir_all(dir.join("parts")).unwrap();
-        Self { dir: dir.to_path_buf(), next: 0, part: None, crcs: Vec::new(), part_hasher: Vec::new() }
+        Self { dir: dir.to_path_buf(), next: first, part: None, crcs: Vec::new(), part_hasher: Vec::new() }
     }
 
     fn part_path(&self, n: u64) -> PathBuf {

@@ -10,9 +10,10 @@ let done = 0, bytes = 0;
 const t0 = Date.now();
 const put = async (key, body) => {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(`${base}/api/admin/r2/${encodeURIComponent(key)}`, { method: "PUT", headers: { authorization: `Bearer ${token}` }, body });
+    // Network errors (a reset connection mid-upload) are retried like bad statuses.
+    const res = await fetch(`${base}/api/admin/r2/${encodeURIComponent(key)}`, { method: "PUT", headers: { authorization: `Bearer ${token}` }, body }).catch((e) => ({ ok: false, status: 0, text: async () => String(e.cause?.code ?? e.message) }));
     if (res.ok) return;
-    if (attempt >= 4) throw new Error(`${key}: ${res.status} ${await res.text()}`);
+    if (attempt >= 6) throw new Error(`${key}: ${res.status} ${await res.text()}`);
     await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
   }
 };
