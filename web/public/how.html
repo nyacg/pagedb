@@ -19,7 +19,7 @@
   .back { color: var(--accent); text-decoration: none; font-size: 14px; }
 </style></head>
 <body><div class="doc">
-<a class="back" href="/">← back to the tracker</a>
+<a class="back" href="/">← pagedb</a> · <a class="back" href="/tracker">the tracker</a>
 <h1>How pagedb works</h1>
 <p class="lede">A database whose base lives in R2 as immutable pages, served by <b>one Durable Object</b> that only ever holds what queries touch. Every list, board column and thread in the tracker is a <b>live query</b>: when anyone writes, the object works out exactly which rows of which open views changed and pushes just those.</p>
 <p>Our take on <a href="https://demo.r2db.dev">r2db</a>, rebuilt from its public behaviour and built to be measured. The engine is Rust compiled to WebAssembly (the same code builds the dataset natively); the object, sync protocol and UI are TypeScript.</p>

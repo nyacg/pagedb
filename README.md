@@ -15,11 +15,12 @@ Four apps run on the same engine, each one database in R2 and one object serving
 
 | App | Data | What's live |
 |---|---|---|
-| [Issue tracker](https://pagedb.do-pool-lab.workers.dev) | 27.1M generated issues, 96 GB | lists, board, threads, search (titles, tags, comments) |
-| [Hacker News](https://pagedb.do-pool-lab.workers.dev/hn) | every story and comment since 2006 (~49M items) | new items stream in from the HN API; front page, threads, comments, votes |
+| [Hacker News](https://pagedb.do-pool-lab.workers.dev/hn) | every story and comment since 2006 (~49M items), 4.85M story vectors | new items stream in from the HN API and are embedded on write; front page, threads, comments, votes, search by title or by meaning |
+| [Issue tracker](https://pagedb.do-pool-lab.workers.dev/tracker) | 27.1M generated issues, 96 GB | lists, board, threads, search (titles, tags, comments) |
 | [r/place 2022](https://pagedb.do-pool-lab.workers.dev/place) | all ~160M pixel placements | each pixel's history, each user's pixels, a timelapse, painting |
 | [Taxi sheet](https://pagedb.do-pool-lab.workers.dev/sheet) | every NYC yellow-cab trip of 2015 (~146M) | sort, jump to any row, group counts, shared cell edits |
 
+- Overview (live HN feed, semantic search, an animated walkthrough): https://pagedb.do-pool-lab.workers.dev
 - How it works: https://pagedb.do-pool-lab.workers.dev/how
 - The same object in a container: https://pagedb-node.do-pool-lab.workers.dev/api/…
 
@@ -88,7 +89,7 @@ Details: `bench/results/*.md`.
 Vector search in the same pages, tiers and object: **every HN story since 2006 is an embedding
 in an IVF index stored as ordinary B+trees**, next to the relational data. It's turbopuffer's
 design (object storage first, centroids pinned, one round trip per query, unindexed writes
-searched directly) on Durable Objects + R2. Try it: `/hn?p=semantic&q=…` on the vec Worker.
+searched directly) on Durable Objects + R2. Try it: https://pagedb.do-pool-lab.workers.dev/hn?p=semantic or the search box on the overview.
 
 - **Index format** (`engine/core/src/vector`): two trees keyed `cluster ‖ pk`. The probe tree's
   entries hold 1 bit per dimension of the rotated residual (RaBitQ-style, 128 B at 1024 dims)
@@ -116,7 +117,7 @@ POST pagedb-builder/start?db=emb-a&job=hn/embed                 # stories → PV
 pagedb-builder vec-build --schema datasets/hn/schema.json --config datasets/hn/vectors.json \
   --shards LIST --first-page 1099511627776 --out data/seg        # k-means, codes, trees
 pagedb-builder vec-gt … && pagedb-builder vec-eval …             # recall vs exact, offline
-node scripts/attach-vec.mjs data/seg hn hnv                      # base + segment → db "hnv"
+node scripts/attach-vec.mjs data/seg hn hn                       # base + segment → db "hn"'s manifest
 npm run deploy:vec                                               # pagedb-vec Worker (HN_DB=hnv)
 ```
 

@@ -123,7 +123,7 @@ function url() {
   p.set("project", state.project);
   if (state.view !== "list") p.set("view", state.view);
   if (state.issue) p.set("issue", state.issue);
-  history.replaceState(null, "", `/?${p}`);
+  history.replaceState(null, "", `/tracker?${p}`);
 }
 
 // ---------------------------------------------------------------- subscriptions per view

@@ -4,7 +4,7 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "observability": { "enabled": true },
-  "assets": { "directory": "web/public", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/hn", "/hn/", "/place", "/place/", "/sheet", "/sheet/"] },
+  "assets": { "directory": "web/public", "binding": "ASSETS", "run_worker_first": ["/api/*", "/", "/index.html", "/tracker", "/tracker/", "/hn", "/hn/", "/place", "/place/", "/sheet", "/sheet/"] },
   "durable_objects": { "bindings": [{ "name": "DB", "class_name": "DbObject" }, { "name": "HN_TAIL", "class_name": "HnTail" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DbObject"] }, { "tag": "v2", "new_sqlite_classes": ["HnTail"] }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],

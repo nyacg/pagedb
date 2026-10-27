@@ -9,7 +9,7 @@ const eq = (c, v) => ({ type: "simple", op: "=", left: { type: "column", name: c
   if (process.env.LOCAL) await p.route("**/app.js*", (r) => r.fulfill({ contentType: "text/javascript", body: require("fs").readFileSync("/Users/robertchandler/conductor/repos/pagedb/web/public/app.js", "utf8") }));
   const errors = [];
   p.on("websocket", (ws) => ws.on("framereceived", (f) => { if (String(f.payload).includes('"t":"error"')) errors.push(String(f.payload).slice(0, 200)); }));
-  await p.goto(B + `/?project=${process.env.P || "p0003"}`);
+  await p.goto(B + `/tracker?project=${process.env.P || "p0003"}`);
   await p.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50, null, { timeout: 30000 });
   const listReady = async () => {
     const t0 = Date.now();

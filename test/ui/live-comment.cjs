@@ -4,7 +4,7 @@ const B = process.env.B || "https://pagedb-preview.do-pool-lab.workers.dev";
   const browser = await chromium.launch();
   const p = await (await browser.newContext({ viewport: { width: 1300, height: 900 } })).newPage();
   if (process.env.LOCAL) await p.route("**/app.js*", (r) => r.fulfill({ contentType: "text/javascript", body: require("fs").readFileSync("/Users/robertchandler/conductor/repos/pagedb/web/public/app.js", "utf8") }));
-  await p.goto(B + "/?project=p0005");
+  await p.goto(B + "/tracker?project=p0005");
   await p.waitForFunction(() => window.__pagedb && window.__pagedb.listRows().length >= 50, null, { timeout: 30000 });
   const word = `zebra${Date.now().toString(36)}`;
   const t0 = Date.now();

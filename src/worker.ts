@@ -95,7 +95,9 @@ export default {
         const r = await env.DB.getByName(app.obj(vars(env))).write(app.db(vars(env)), { ops });
         return Response.json({ ...r, created: built.created }, { status: "error" in r ? 400 : 200 });
       }
-      if (url.pathname === "/" || url.pathname === "/index.html") return ssr(req, env, url, APPS.tracker);
+      // The overview (a static page whose script is a live client of the HN object).
+      if (url.pathname === "/" || url.pathname === "/index.html") return env.ASSETS.fetch(new Request(new URL("/home", url), req));
+      if (url.pathname === "/tracker" || url.pathname === "/tracker/") return ssr(req, env, url, APPS.tracker);
       if (url.pathname === "/hn" || url.pathname === "/hn/") {
         // Keep the live tail running while anyone is looking.
         (env.HN_TAIL.getByName("hn") as unknown as { kick(): Promise<unknown> }).kick().catch(() => {});
