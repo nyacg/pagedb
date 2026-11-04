@@ -11,6 +11,7 @@ const seconds = Number(process.argv[2] ?? 120), clients = Number(process.argv[3]
 const db = new URL(url).pathname.slice(1);
 const token = decodeURIComponent(new URL(url).password);
 const N = 1000, START = 1000;
+const KILLS = (process.env.KILLS ?? "evict,oom").split(","); // which ways to kill the object
 
 async function connect() {
   for (;;) {
@@ -63,7 +64,7 @@ async function killer() {
   const U = "https://pagedb-pg-spike.do-pool-lab.workers.dev";
   while (Date.now() < until - 5000) {
     await new Promise((r) => setTimeout(r, 2000 + Math.random() * 4000));
-    if (Math.random() < 0.5) {
+    if (KILLS.includes("evict") && (!KILLS.includes("oom") || Math.random() < 0.5)) {
       kills.evict++;
       await fetch(`${U}/evict?db=${encodeURIComponent(db)}`, { headers: { authorization: `Bearer ${token}` } }).catch(() => {});
     } else {

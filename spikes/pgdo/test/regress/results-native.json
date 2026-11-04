@@ -1,0 +1,926 @@
+{
+ "test_setup": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "boolean": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "char": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "name": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "varchar": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "text": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "int2": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "int4": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "int8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "oid": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "float4": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "float8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "bit": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "numeric": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "txid": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "uuid": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "enum": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "money": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "rangetypes": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "pg_lsn": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "regproc": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "strings": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "md5": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "numerology": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "point": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "lseg": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "line": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "box": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "path": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "polygon": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "circle": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "date": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "time": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "timetz": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "timestamp": {
+  "status": "ok",
+  "s": 0.4
+ },
+ "timestamptz": {
+  "status": "ok",
+  "s": 0.4
+ },
+ "interval": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "inet": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "macaddr": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "macaddr8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "multirangetypes": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "geometry": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "horology": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tstypes": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "regex": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "type_sanity": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "opr_sanity": {
+  "status": "ok",
+  "s": 3.0
+ },
+ "misc_sanity": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "comments": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "expressions": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "unicode": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "xid": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "mvcc": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "database": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "stats_import": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "encoding": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "euc_kr": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "copy": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "copyselect": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "copydml": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "copyencoding": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "insert": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "insert_conflict": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "create_function_c": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_misc": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_operator": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_procedure": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_table": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "create_type": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_schema": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_index": {
+  "status": "ok",
+  "s": 0.3
+ },
+ "create_index_spgist": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "create_view": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "index_including": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "index_including_gist": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "create_aggregate": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_function_sql": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_cast": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "constraints": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "triggers": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "select": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "inherit": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "typed_table": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "vacuum": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "drop_if_exists": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "updatable_views": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "roleattributes": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_am": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "hash_func": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "errors": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "infinite_recurse": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "sanity_check": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "select_into": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "select_distinct": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "select_distinct_on": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "select_implicit": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "select_having": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "subselect": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "union": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "case": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "join": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "aggregates": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "transactions": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "random": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "portals": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "arrays": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "btree_index": {
+  "status": "ok",
+  "s": 0.5
+ },
+ "hash_index": {
+  "status": "ok",
+  "s": 0.3
+ },
+ "update": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "delete": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "namespace": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "prepared_xacts": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "brin": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "gin": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "gist": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "spgist": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "privileges": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "init_privs": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "security_label": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "collate": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "matview": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "lock": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "replica_identity": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "rowsecurity": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "object_address": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "tablesample": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "groupingsets": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "drop_operator": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "password": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "identity": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "generated_stored": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "join_hash": {
+  "status": "ok",
+  "s": 0.5
+ },
+ "brin_bloom": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "brin_multi": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "create_table_like": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "alter_generic": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "alter_operator": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "misc": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "async": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "dbsize": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "merge": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "misc_functions": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "sysviews": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tsrf": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tid": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tidscan": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tidrangescan": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "collate.utf8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "collate.icu.utf8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "incremental_sort": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "create_role": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "without_overlaps": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "generated_virtual": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "rules": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "psql": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "psql_crosstab": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "psql_pipeline": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "amutils": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "stats_ext": {
+  "status": "ok",
+  "s": 0.4
+ },
+ "collate.linux.utf8": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "collate.windows.win1252": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "select_parallel": {
+  "status": "ok",
+  "s": 0.5
+ },
+ "write_parallel": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "vacuum_parallel": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "maintain_every": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "publication": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "subscription": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "select_views": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "portals_p2": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "foreign_key": {
+  "status": "ok",
+  "s": 0.3
+ },
+ "cluster": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "dependency": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "guc": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "bitmapops": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "combocid": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tsearch": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "tsdicts": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "foreign_data": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "window": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "xmlmap": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "functional_deps": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "advisory_lock": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "indirect_toast": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "equivclass": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "json": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "jsonb": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "json_encoding": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "jsonpath": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "jsonpath_encoding": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "jsonb_jsonpath": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "sqljson": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "sqljson_queryfuncs": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "sqljson_jsontable": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "plancache": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "limit": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "plpgsql": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "copy2": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "temp": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "domain": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "rangefuncs": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "prepare": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "conversion": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "truncate": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "alter_table": {
+  "status": "ok",
+  "s": 0.4
+ },
+ "sequence": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "polymorphism": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "rowtypes": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "returning": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "largeobject": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "with": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "xml": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "partition_join": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "partition_prune": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "reloptions": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "hash_part": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "indexing": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "partition_aggregate": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "partition_info": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "tuplesort": {
+  "status": "ok",
+  "s": 0.2
+ },
+ "explain": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "memoize": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "stats": {
+  "status": "ok",
+  "s": 0.7
+ },
+ "predicate": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "numa": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "compression": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "compression_pglz": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "oidjoins": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "event_trigger": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "event_trigger_login": {
+  "status": "ok",
+  "s": 0.0
+ },
+ "fast_default": {
+  "status": "ok",
+  "s": 0.1
+ },
+ "tablespace": {
+  "status": "ok",
+  "s": 0.1
+ }
+}

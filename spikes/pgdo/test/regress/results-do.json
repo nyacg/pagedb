@@ -1,0 +1,926 @@
+{
+ "test_setup": {
+  "status": "fail",
+  "s": 4.9
+ },
+ "boolean": {
+  "status": "ok",
+  "s": 3.6
+ },
+ "char": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "name": {
+  "status": "ok",
+  "s": 1.9
+ },
+ "varchar": {
+  "status": "ok",
+  "s": 1.1
+ },
+ "text": {
+  "status": "ok",
+  "s": 2.1
+ },
+ "int2": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "int4": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "int8": {
+  "status": "ok",
+  "s": 5.2
+ },
+ "oid": {
+  "status": "ok",
+  "s": 1.6
+ },
+ "float4": {
+  "status": "ok",
+  "s": 3.3
+ },
+ "float8": {
+  "status": "ok",
+  "s": 5.1
+ },
+ "bit": {
+  "status": "ok",
+  "s": 5.0
+ },
+ "numeric": {
+  "status": "ok",
+  "s": 30.2
+ },
+ "txid": {
+  "status": "ok",
+  "s": 1.8
+ },
+ "uuid": {
+  "status": "ok",
+  "s": 3.3
+ },
+ "enum": {
+  "status": "ok",
+  "s": 8.2
+ },
+ "money": {
+  "status": "ok",
+  "s": 3.4
+ },
+ "rangetypes": {
+  "status": "ok",
+  "s": 15.7
+ },
+ "pg_lsn": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "regproc": {
+  "status": "ok",
+  "s": 2.7
+ },
+ "strings": {
+  "status": "ok",
+  "s": 15.6
+ },
+ "md5": {
+  "status": "ok",
+  "s": 0.8
+ },
+ "numerology": {
+  "status": "ok",
+  "s": 3.1
+ },
+ "point": {
+  "status": "ok",
+  "s": 2.0
+ },
+ "lseg": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "line": {
+  "status": "ok",
+  "s": 1.6
+ },
+ "box": {
+  "status": "ok",
+  "s": 3.9
+ },
+ "path": {
+  "status": "ok",
+  "s": 1.4
+ },
+ "polygon": {
+  "status": "ok",
+  "s": 3.4
+ },
+ "circle": {
+  "status": "ok",
+  "s": 1.7
+ },
+ "date": {
+  "status": "ok",
+  "s": 8.3
+ },
+ "time": {
+  "status": "ok",
+  "s": 2.0
+ },
+ "timetz": {
+  "status": "ok",
+  "s": 2.7
+ },
+ "timestamp": {
+  "status": "ok",
+  "s": 7.5
+ },
+ "timestamptz": {
+  "status": "ok",
+  "s": 12.8
+ },
+ "interval": {
+  "status": "ok",
+  "s": 12.6
+ },
+ "inet": {
+  "status": "ok",
+  "s": 5.2
+ },
+ "macaddr": {
+  "status": "ok",
+  "s": 1.9
+ },
+ "macaddr8": {
+  "status": "ok",
+  "s": 3.0
+ },
+ "multirangetypes": {
+  "status": "ok",
+  "s": 18.8
+ },
+ "geometry": {
+  "status": "ok",
+  "s": 4.5
+ },
+ "horology": {
+  "status": "ok",
+  "s": 10.2
+ },
+ "tstypes": {
+  "status": "ok",
+  "s": 6.4
+ },
+ "regex": {
+  "status": "fail",
+  "s": 2.9
+ },
+ "type_sanity": {
+  "status": "fail",
+  "s": 5.0
+ },
+ "opr_sanity": {
+  "status": "hang",
+  "s": 423.5
+ },
+ "misc_sanity": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "comments": {
+  "status": "ok",
+  "s": 0.6
+ },
+ "expressions": {
+  "status": "ok",
+  "s": 3.8
+ },
+ "unicode": {
+  "status": "ok",
+  "s": 1.2
+ },
+ "xid": {
+  "status": "ok",
+  "s": 2.8
+ },
+ "mvcc": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "database": {
+  "status": "ok",
+  "s": 3.1
+ },
+ "stats_import": {
+  "status": "ok",
+  "s": 7.2
+ },
+ "encoding": {
+  "status": "fail",
+  "s": 2.9
+ },
+ "euc_kr": {
+  "status": "hang",
+  "s": 423.1
+ },
+ "copy": {
+  "status": "fail",
+  "s": 6.9
+ },
+ "copyselect": {
+  "status": "fail",
+  "s": 2.2
+ },
+ "copydml": {
+  "status": "ok",
+  "s": 3.4
+ },
+ "copyencoding": {
+  "status": "hang",
+  "s": 423.2
+ },
+ "insert": {
+  "status": "ok",
+  "s": 22.9
+ },
+ "insert_conflict": {
+  "status": "ok",
+  "s": 11.9
+ },
+ "create_function_c": {
+  "status": "fail",
+  "s": 0.6
+ },
+ "create_misc": {
+  "status": "ok",
+  "s": 5.1
+ },
+ "create_operator": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "create_procedure": {
+  "status": "ok",
+  "s": 4.4
+ },
+ "create_table": {
+  "status": "ok",
+  "s": 22.5
+ },
+ "create_type": {
+  "status": "fail",
+  "s": 4.0
+ },
+ "create_schema": {
+  "status": "ok",
+  "s": 2.2
+ },
+ "create_index": {
+  "status": "ok",
+  "s": 36.9
+ },
+ "create_index_spgist": {
+  "status": "ok",
+  "s": 7.6
+ },
+ "create_view": {
+  "status": "fail",
+  "s": 18.7
+ },
+ "index_including": {
+  "status": "ok",
+  "s": 7.9
+ },
+ "index_including_gist": {
+  "status": "ok",
+  "s": 4.4
+ },
+ "create_aggregate": {
+  "status": "ok",
+  "s": 2.9
+ },
+ "create_function_sql": {
+  "status": "ok",
+  "s": 7.9
+ },
+ "create_cast": {
+  "status": "ok",
+  "s": 1.7
+ },
+ "constraints": {
+  "status": "ok",
+  "s": 38.2
+ },
+ "triggers": {
+  "status": "fail",
+  "s": 24.6
+ },
+ "select": {
+  "status": "ok",
+  "s": 5.9
+ },
+ "inherit": {
+  "status": "ok",
+  "s": 68.5
+ },
+ "typed_table": {
+  "status": "ok",
+  "s": 2.9
+ },
+ "vacuum": {
+  "status": "ok",
+  "s": 15.8
+ },
+ "drop_if_exists": {
+  "status": "ok",
+  "s": 6.5
+ },
+ "updatable_views": {
+  "status": "ok",
+  "s": 49.9
+ },
+ "roleattributes": {
+  "status": "ok",
+  "s": 3.9
+ },
+ "create_am": {
+  "status": "ok",
+  "s": 5.8
+ },
+ "hash_func": {
+  "status": "ok",
+  "s": 1.9
+ },
+ "errors": {
+  "status": "ok",
+  "s": 2.9
+ },
+ "infinite_recurse": {
+  "status": "hang",
+  "s": 423.2
+ },
+ "sanity_check": {
+  "status": "fail",
+  "s": 2.7
+ },
+ "select_into": {
+  "status": "ok",
+  "s": 6.0
+ },
+ "select_distinct": {
+  "status": "ok",
+  "s": 3.8
+ },
+ "select_distinct_on": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "select_implicit": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "select_having": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "subselect": {
+  "status": "ok",
+  "s": 13.0
+ },
+ "union": {
+  "status": "ok",
+  "s": 7.0
+ },
+ "case": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "join": {
+  "status": "fail",
+  "s": 35.1
+ },
+ "aggregates": {
+  "status": "fail",
+  "s": 18.4
+ },
+ "transactions": {
+  "status": "ok",
+  "s": 14.3
+ },
+ "random": {
+  "status": "ok",
+  "s": 1.9
+ },
+ "portals": {
+  "status": "ok",
+  "s": 10.2
+ },
+ "arrays": {
+  "status": "ok",
+  "s": 15.0
+ },
+ "btree_index": {
+  "status": "ok",
+  "s": 8.0
+ },
+ "hash_index": {
+  "status": "ok",
+  "s": 7.1
+ },
+ "update": {
+  "status": "ok",
+  "s": 15.9
+ },
+ "delete": {
+  "status": "ok",
+  "s": 1.0
+ },
+ "namespace": {
+  "status": "ok",
+  "s": 2.2
+ },
+ "prepared_xacts": {
+  "status": "ok",
+  "s": 0.6
+ },
+ "brin": {
+  "status": "ok",
+  "s": 4.9
+ },
+ "gin": {
+  "status": "ok",
+  "s": 3.8
+ },
+ "gist": {
+  "status": "ok",
+  "s": 4.7
+ },
+ "spgist": {
+  "status": "ok",
+  "s": 3.2
+ },
+ "privileges": {
+  "status": "ok",
+  "s": 70.4
+ },
+ "init_privs": {
+  "status": "ok",
+  "s": 0.8
+ },
+ "security_label": {
+  "status": "ok",
+  "s": 1.7
+ },
+ "collate": {
+  "status": "ok",
+  "s": 6.5
+ },
+ "matview": {
+  "status": "ok",
+  "s": 11.7
+ },
+ "lock": {
+  "status": "fail",
+  "s": 5.4
+ },
+ "replica_identity": {
+  "status": "ok",
+  "s": 6.4
+ },
+ "rowsecurity": {
+  "status": "ok",
+  "s": 49.8
+ },
+ "object_address": {
+  "status": "fail",
+  "s": 4.0
+ },
+ "tablesample": {
+  "status": "ok",
+  "s": 2.8
+ },
+ "groupingsets": {
+  "status": "ok",
+  "s": 8.8
+ },
+ "drop_operator": {
+  "status": "ok",
+  "s": 1.1
+ },
+ "password": {
+  "status": "ok",
+  "s": 2.8
+ },
+ "identity": {
+  "status": "ok",
+  "s": 19.0
+ },
+ "generated_stored": {
+  "status": "ok",
+  "s": 33.3
+ },
+ "join_hash": {
+  "status": "ok",
+  "s": 13.1
+ },
+ "brin_bloom": {
+  "status": "ok",
+  "s": 2.4
+ },
+ "brin_multi": {
+  "status": "ok",
+  "s": 7.6
+ },
+ "create_table_like": {
+  "status": "ok",
+  "s": 17.1
+ },
+ "alter_generic": {
+  "status": "fail",
+  "s": 14.1
+ },
+ "alter_operator": {
+  "status": "ok",
+  "s": 3.2
+ },
+ "misc": {
+  "status": "fail",
+  "s": 3.1
+ },
+ "async": {
+  "status": "ok",
+  "s": 0.7
+ },
+ "dbsize": {
+  "status": "ok",
+  "s": 1.0
+ },
+ "merge": {
+  "status": "ok",
+  "s": 26.8
+ },
+ "misc_functions": {
+  "status": "fail",
+  "s": 5.0
+ },
+ "sysviews": {
+  "status": "ok",
+  "s": 1.7
+ },
+ "tsrf": {
+  "status": "ok",
+  "s": 2.7
+ },
+ "tid": {
+  "status": "ok",
+  "s": 2.5
+ },
+ "tidscan": {
+  "status": "ok",
+  "s": 2.0
+ },
+ "tidrangescan": {
+  "status": "ok",
+  "s": 1.4
+ },
+ "collate.utf8": {
+  "status": "ok",
+  "s": 2.3
+ },
+ "collate.icu.utf8": {
+  "status": "fail",
+  "s": 25.2
+ },
+ "incremental_sort": {
+  "status": "fail",
+  "s": 4.7
+ },
+ "create_role": {
+  "status": "ok",
+  "s": 7.1
+ },
+ "without_overlaps": {
+  "status": "ok",
+  "s": 40.0
+ },
+ "generated_virtual": {
+  "status": "ok",
+  "s": 30.8
+ },
+ "rules": {
+  "status": "ok",
+  "s": 33.0
+ },
+ "psql": {
+  "status": "fail",
+  "s": 28.1
+ },
+ "psql_crosstab": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "psql_pipeline": {
+  "status": "ok",
+  "s": 3.1
+ },
+ "amutils": {
+  "status": "ok",
+  "s": 0.8
+ },
+ "stats_ext": {
+  "status": "ok",
+  "s": 38.6
+ },
+ "collate.linux.utf8": {
+  "status": "ok",
+  "s": 0.6
+ },
+ "collate.windows.win1252": {
+  "status": "ok",
+  "s": 0.4
+ },
+ "select_parallel": {
+  "status": "fail",
+  "s": 3.2
+ },
+ "write_parallel": {
+  "status": "ok",
+  "s": 9.1
+ },
+ "vacuum_parallel": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "maintain_every": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "publication": {
+  "status": "ok",
+  "s": 48.1
+ },
+ "subscription": {
+  "status": "fail",
+  "s": 6.3
+ },
+ "select_views": {
+  "status": "fail",
+  "s": 2.9
+ },
+ "portals_p2": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "foreign_key": {
+  "status": "ok",
+  "s": 72.9
+ },
+ "cluster": {
+  "status": "ok",
+  "s": 11.8
+ },
+ "dependency": {
+  "status": "ok",
+  "s": 4.2
+ },
+ "guc": {
+  "status": "fail",
+  "s": 6.3
+ },
+ "bitmapops": {
+  "status": "ok",
+  "s": 2.6
+ },
+ "combocid": {
+  "status": "ok",
+  "s": 2.3
+ },
+ "tsearch": {
+  "status": "fail",
+  "s": 14.0
+ },
+ "tsdicts": {
+  "status": "fail",
+  "s": 4.9
+ },
+ "foreign_data": {
+  "status": "fail",
+  "s": 36.1
+ },
+ "window": {
+  "status": "ok",
+  "s": 13.5
+ },
+ "xmlmap": {
+  "status": "ok",
+  "s": 1.6
+ },
+ "functional_deps": {
+  "status": "ok",
+  "s": 2.0
+ },
+ "advisory_lock": {
+  "status": "ok",
+  "s": 1.3
+ },
+ "indirect_toast": {
+  "status": "fail",
+  "s": 1.8
+ },
+ "equivclass": {
+  "status": "ok",
+  "s": 4.4
+ },
+ "json": {
+  "status": "hang",
+  "s": 423.4
+ },
+ "jsonb": {
+  "status": "fail",
+  "s": 3.3
+ },
+ "json_encoding": {
+  "status": "ok",
+  "s": 2.4
+ },
+ "jsonpath": {
+  "status": "ok",
+  "s": 5.9
+ },
+ "jsonpath_encoding": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "jsonb_jsonpath": {
+  "status": "ok",
+  "s": 21.6
+ },
+ "sqljson": {
+  "status": "ok",
+  "s": 7.7
+ },
+ "sqljson_queryfuncs": {
+  "status": "ok",
+  "s": 10.9
+ },
+ "sqljson_jsontable": {
+  "status": "ok",
+  "s": 5.2
+ },
+ "plancache": {
+  "status": "ok",
+  "s": 4.6
+ },
+ "limit": {
+  "status": "ok",
+  "s": 3.8
+ },
+ "plpgsql": {
+  "status": "fail",
+  "s": 47.0
+ },
+ "copy2": {
+  "status": "fail",
+  "s": 13.5
+ },
+ "temp": {
+  "status": "fail",
+  "s": 10.3
+ },
+ "domain": {
+  "status": "ok",
+  "s": 23.0
+ },
+ "rangefuncs": {
+  "status": "ok",
+  "s": 19.6
+ },
+ "prepare": {
+  "status": "fail",
+  "s": 1.7
+ },
+ "conversion": {
+  "status": "fail",
+  "s": 3.4
+ },
+ "truncate": {
+  "status": "ok",
+  "s": 10.5
+ },
+ "alter_table": {
+  "status": "ok",
+  "s": 106.7
+ },
+ "sequence": {
+  "status": "ok",
+  "s": 11.5
+ },
+ "polymorphism": {
+  "status": "ok",
+  "s": 16.0
+ },
+ "rowtypes": {
+  "status": "ok",
+  "s": 8.4
+ },
+ "returning": {
+  "status": "ok",
+  "s": 6.1
+ },
+ "largeobject": {
+  "status": "fail",
+  "s": 5.7
+ },
+ "with": {
+  "status": "ok",
+  "s": 13.0
+ },
+ "xml": {
+  "status": "ok",
+  "s": 8.8
+ },
+ "partition_join": {
+  "status": "ok",
+  "s": 34.8
+ },
+ "partition_prune": {
+  "status": "fail",
+  "s": 39.5
+ },
+ "reloptions": {
+  "status": "ok",
+  "s": 3.2
+ },
+ "hash_part": {
+  "status": "ok",
+  "s": 1.5
+ },
+ "indexing": {
+  "status": "ok",
+  "s": 45.0
+ },
+ "partition_aggregate": {
+  "status": "ok",
+  "s": 6.7
+ },
+ "partition_info": {
+  "status": "ok",
+  "s": 3.1
+ },
+ "tuplesort": {
+  "status": "ok",
+  "s": 6.1
+ },
+ "explain": {
+  "status": "ok",
+  "s": 2.9
+ },
+ "memoize": {
+  "status": "ok",
+  "s": 4.8
+ },
+ "stats": {
+  "status": "fail",
+  "s": 19.9
+ },
+ "predicate": {
+  "status": "ok",
+  "s": 2.1
+ },
+ "numa": {
+  "status": "ok",
+  "s": 0.7
+ },
+ "compression": {
+  "status": "ok",
+  "s": 7.7
+ },
+ "compression_pglz": {
+  "status": "fail",
+  "s": 1.2
+ },
+ "oidjoins": {
+  "status": "ok",
+  "s": 1.2
+ },
+ "event_trigger": {
+  "status": "ok",
+  "s": 13.4
+ },
+ "event_trigger_login": {
+  "status": "fail",
+  "s": 2.3
+ },
+ "fast_default": {
+  "status": "ok",
+  "s": 16.8
+ },
+ "tablespace": {
+  "status": "ok",
+  "s": 19.7
+ }
+}

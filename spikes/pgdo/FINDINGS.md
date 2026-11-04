@@ -1,17 +1,122 @@
-# Postgres in a Durable Object: spike findings (Nov 3, 2026)
+# Postgres in a Durable Object: spike findings (Nov 3–4, 2026)
 
-**Verdict: it works, and it scales out well.** Postgres 18.6 (PGlite 0.5.15, compiled to
-WebAssembly) runs inside a Cloudflare Durable Object with its data directory in the object's own
-SQLite. It survives restarts, branches copy-on-write from template images in R2, and passes 34 of
-36 compatibility checks run side by side with Neon, including all the JSONB ones.
+**Verdict: it works as a drop-in Postgres, and it scales out well.**
 
-Sauna's 153 drizzle migrations apply cleanly and produce a schema identical to Neon's.
+Postgres 18.6 (PGlite 0.5.15, compiled to WebAssembly) runs inside a Cloudflare Durable Object, with
+its data directory in the object's own SQLite. It speaks the Postgres wire protocol, so these work
+against it unchanged:
+- psql, node-postgres and postgres.js;
+- Drizzle ORM and drizzle-kit;
+- pgbench;
+- Postgres's own regression suite.
 
-With one database per tenant, 1,000 tenants did **9,080 ops/s at p50 16 ms**. Neon's endpoint
-peaked at **~2,900 ops/s at p50 300 ms** under the same load. One object is one CPU core, though:
-a single database tops out around 700–900 ops/s.
+On that suite it passes **191 of 231** tests through the wire layer, PGlite in Node with no
+Workers (native 18.6: 231). In the Durable Object it passes **186**: the five extra failures are plan choices from a smaller
+`work_mem`, and two statements that hit the 128 MB isolate limit. Every failure is
+classified: one is the wire layer's (private statement names show in `pg_prepared_statements`),
+and the rest are PGlite or the platform.
 
-Live: `https://pagedb-pg-spike.do-pool-lab.workers.dev/sql?db=<name>[&image=hn150|tenant|sauna]` (POST the SQL).
+The rest of the evidence:
+- **Sauna's real migrations:** applied by `drizzle-kit migrate`, then introspected by
+  `drizzle-kit pull`. The result is identical to the same pull from Neon.
+- **Compatibility:** 34 of 36 checks match Neon side by side, including all the JSONB ones.
+- **Durability:** it survives restarts and branches copy-on-write from template images in R2.
+- **Crash consistency:** transfers kept running while the object was killed 64 times, by evicts
+  and by out-of-memory resets. No acknowledged commit was lost, money was conserved, and amcheck
+  passed (section 6).
+- **Many tenants:** with one database each, 1,000 tenants did **9,080 ops/s at p50 16 ms**. Neon's
+  endpoint peaked at **~2,900 ops/s at p50 300 ms** under the same load.
+- **The limit:** one object is one CPU core and one backend. A single database tops out around
+  700–900 ops/s, and multi-statement transactions over the wire run one at a time.
+
+## 0. A drop-in Postgres
+
+```sh
+node scripts/pgdo-proxy.mjs 6543     # local TCP endpoint, carried over a WebSocket to the Worker
+psql "postgres://postgres:$PGDO_TOKEN@localhost:6543/mydb"     # a new name is a new database
+```
+
+### How it's built
+
+- **No inbound TCP in Workers.** A ~60-line proxy (`scripts/pgdo-proxy.mjs`) carries each
+  connection over a WebSocket to `/wire`. The database name in the URL picks the object, and the
+  password is the deployment token, checked inside the protocol before Postgres starts.
+- **The object terminates the protocol itself** (`src/wire.ts`) and passes query messages through
+  to PGlite's raw protocol. PGlite is one single-user backend, so the layer makes one session
+  look like many:
+  - a connection inside a transaction block holds the backend until it's idle again;
+  - per-connection session settings are saved and restored when the backend switches between
+    connections;
+  - prepared statement and portal names are kept private per connection. That includes each
+    connection's *unnamed* statement, because postgres.js parses in one round trip and binds in
+    the next;
+  - error texts map the names back to what the client used.
+- **PGlite gaps the layer papers over:**
+  - `COPY … FROM STDIN` makes PGlite's raw protocol exit. The object collects the data and loads
+    it through PGlite's blob device, rewriting the statement to the same length so error
+    positions still match. It runs as the client's own role, so privileges and RLS still apply.
+  - Startup parameters (TimeZone, DateStyle, `options`) are ignored by PGlite. They're applied
+    per connection, and `RESET` returns to them.
+  - `RESET SESSION AUTHORIZATION` is a no-op in single-user mode. It's rewritten to name the
+    connection's user.
+  - ParameterStatus isn't sent for changed settings. psql's lexer needs it for
+    `standard_conforming_strings`, so the layer sends it.
+  - `current_database()` was always `postgres`. The database is now renamed at first boot to
+    what clients connect to.
+  - PGlite's defaults allow altering system catalogs (`-O`) and pin `search_path`; both are back
+    to stock.
+- **Platform fixes:**
+  - **Clock:** Workers freeze the clock while code runs, so `pg_sleep` spun to the 300 s CPU
+    limit. Postgres now reads a clock that never stands still (`src/clock.ts`).
+  - **FATAL errors:** a backend that reports FATAL, or a PGlite that exits, is thrown away. The
+    next connection boots Postgres again from SQLite, with crash recovery.
+
+### Drizzle, unchanged (`test/drizzle`)
+
+| | |
+|---|---|
+| `drizzle-kit migrate` with Sauna's own migrations folder (153 migrations) | applied, 49 s from a laptop |
+| `drizzle-kit pull` from the DO vs the same from Neon | identical: 51 tables and enums, 41 relation blocks |
+| App test (`app.ts`), node-postgres pool of 10 and postgres.js, 12 checks | all pass |
+
+The app test covers:
+- inserts with RETURNING, upserts, JSONB and array filters, relational queries;
+- commit and rollback;
+- named prepared statements used from every pooled connection;
+- 200 concurrent inserts;
+- 100 concurrent transfers with `FOR UPDATE`, with money conserved;
+- session settings kept per connection;
+- postgres.js queries and transactions.
+
+### pgbench, from a laptop in California (scale 1 for the DO, 16 for Neon)
+
+| | Durable Object (SJC) | Neon (us-east-2) |
+|---|---|---|
+| round trip (`select 1`) | ~20–25 ms | 65 ms |
+| `pgbench -i` (COPY FROM STDIN, 100k rows) | 3.3 s | 2.2 s |
+| TPC-B, 1 client | **7.1 tps** | 2.3 tps |
+| TPC-B, 4 clients | 7.2 tps | 9.1 tps |
+| TPC-B, 16 clients | 7.2 tps | **33.5 tps** |
+| select-only, 16 clients | **533 tps** | 255 tps |
+
+**Interactive transactions don't scale inside one database.** A TPC-B transaction is 7 statements,
+so 7 round trips, and it holds the only backend throughout. Throughput is about
+1 / (statements × round trip) whatever the client count. Neon runs transactions concurrently.
+
+Ways around it:
+- run the client next to the object, where a round trip is ~1–2 ms;
+- send a transaction in one round trip (the RPC `tx()`, or Neon-style HTTP transactions);
+- shard (section 4).
+
+Reads from many connections interleave cheaply and beat Neon here.
+
+### Security
+
+- Every HTTP route requires `Authorization: Bearer $PGDO_TOKEN`. The token is a 256-bit secret,
+  kept in `.env` and as a Worker secret.
+- The wire route authenticates inside the Postgres protocol with the same token. Nothing boots
+  before the password checks out.
+- The old open `/sql` and `/vs` routes, which could reach Neon, are closed.
 
 ## 1. Against Neon
 
@@ -141,13 +246,18 @@ The bundle is 8.2 MB gzipped, against the 10 MB limit.
 - Hashes of every column, index and constraint definition match exactly: 50 tables, 152 indexes,
   434 constraints.
 - Applying them took 29 s on the DO and 43 s on Neon (one round trip per statement).
+- `drizzle-kit migrate` applies Sauna's migrations folder over the wire unchanged, and
+  `drizzle-kit pull` reads back exactly what it reads from Neon (section 0).
 - A `sauna` template image is in R2, so a new empty Sauna database answers its first query in **2.5 s**.
 
 **All of Sauna in one object: no, for concurrency rather than size.**
 - One object serializes every query on one core: ~700 mixed ops/s at best. A heavy query (an
   admin report, a big group by) stalls everyone behind it.
 - Sauna runs ~93 transactional code paths over Hyperdrive with up to 1,000 connections, plus a Go
-  pgx pool. The Go service would also need a Postgres-wire proxy in front.
+  pgx pool. Over the wire, multi-statement transactions in one database run one at a time (7 tps
+  for pgbench's TPC-B from a laptop, section 0).
+- The Go service could connect through the wire endpoint. Hyperdrive would need the proxy hosted
+  where it can reach it (it runs locally today).
 - Size isn't known from here. `select pg_database_size(current_database())` on prod would settle
   it; up to a few GB fits.
 
@@ -220,6 +330,89 @@ A per-database `/config?db=…&cacheMB=&sharedBuffers=` lets a big tenant trade 
    need WAL shipping from the primary (not built).
 5. **Global and analytical data stays out** of tenant shards: a global database and a warehouse.
 
+## 5. Postgres's own regression suite (pg_regress)
+
+PGlite doesn't publish pg_regress results or a skip list: its CI runs its own unit tests and
+per-extension tests. So this is, as far as I can tell, the first run of the suite against it.
+
+### Method
+
+`test/regress/run.py` runs the full 18.6 `parallel_schedule` (231 tests), one test at a time and
+in order, against one database, with the stock psql and pg_regress. A test still running at the
+timeout is killed and recorded as `hang`. The backend is then restarted: it recovers from its own
+storage, and the run continues.
+
+The same runner was pointed at three backends:
+
+| backend | pass | fail | hang |
+|---|---|---|---|
+| native Postgres 18.6 (the baseline: the method itself is sound) | 231 | 0 | 0 |
+| PGlite 0.5.15 + the wire layer, in Node (no Workers) | **191** | 34 | 6 |
+| the same in a Durable Object (SQLite storage, Workers) | **186** | 40 | 5 |
+
+The Durable Object fails five tests that pass in Node. None is a correctness difference:
+- **Different but valid query plans** (`join`, `aggregates`, `incremental_sort`). The object
+  starts Postgres with `work_mem=1MB` to fit four instances per isolate; stock is 4 MB.
+- **The 128 MB isolate limit** (`regex`: a deliberately huge regular expression; `sanity_check`: a
+  database-wide `VACUUM`). The isolate was reset and Postgres recovered for the next test.
+
+### Why the 40 fail under PGlite
+
+One is the wire layer's: `pg_prepared_statements` lists the per-connection private names. The rest
+trace to PGlite, the wasm platform, a remote server's filesystem, or a feature that's deliberately
+off.
+
+| cause | tests |
+|---|---|
+| pg_regress's native C helper library (`regress.so`) can't load into wasm, plus one view that depends on it | 16: test_setup, type_sanity, encoding, create_function_c, create_type, create_view, triggers, lock, alter_generic, misc, misc_functions, foreign_data, indirect_toast, conversion, compression_pglz, select_views |
+| **PGlite wedges** on non-UTF8 encoding conversion (upstream bug) | 3 hangs: opr_sanity, euc_kr, copyencoding |
+| **PGlite wedges** when the stack-depth check fires | 3 hangs: infinite_recurse, json, jsonb |
+| COPY FROM STDIN inside a multi-statement query (refused: PGlite's raw protocol would exit) | copyselect, copy2 |
+| COPY details: a CSV file round trip through the server filesystem; progress reported as FILE rather than PIPE | copy |
+| parallel query (workers are off in a single process) | select_parallel, partition_prune, plpgsql |
+| replication, statistics collector, logical decoding libraries | object_address, subscription, stats |
+| client and server don't share a disk (psql's `\lo_import` of a file the server wrote) | largeobject |
+| **wire layer:** `pg_prepared_statements` shows `_c96_stmt1`, not `stmt1` (plus pipeline-mode details) | psql |
+| text-search dictionaries (Node build's snowball module) | tsearch, tsdicts |
+| prepared transactions disabled; temp_buffers | temp |
+| no separate `postgres` database (the one database is renamed to its connection name) | prepare |
+| login event triggers (no real backend login) | event_trigger_login |
+| ICU collations not built | collate.icu.utf8 |
+| plpgsql prefix reserved earlier (WARNING vs ERROR) | guc |
+
+### What it found in the wire layer, fixed along the way
+
+The suite took the wire layer from 172 to 191 passing:
+- session settings leaking between connections;
+- RESET semantics;
+- ParameterStatus;
+- the unnamed statement;
+- error texts;
+- COPY FROM STDOUT;
+- COPY run as a non-superuser;
+- notices raised during COPY;
+- `current_database()`;
+- temp tables surviving psql's `\c`.
+
+## 6. Crash consistency
+
+`test/drizzle/crash.mjs` runs 8–10 clients doing money transfers in real transactions (two
+updates plus a ledger insert, `BEGIN … COMMIT`). Each client records every COMMIT the server
+acknowledged. Meanwhile the object is killed every 2–6 s, in two ways:
+- `/evict`: `ctx.abort`, usually between the statements of open transactions;
+- a query that blows the isolate's 128 MB: the isolate dies wherever Postgres happens to be.
+
+Afterwards the test checks that money is conserved, that every acknowledged commit is in the
+ledger, that every balance matches the ledger, and runs `amcheck` (`bt_index_check` with heap
+verification) on every index.
+
+| run | kills | acked commits | lost | balances vs ledger | amcheck | verdict |
+|---|---|---|---|---|---|---|
+| 2 min, evicts only | 29 | 567 | 0 | all match | 3/3 ok | **consistent** |
+| 3 min, evicts and out-of-memory kills (verified: Postgres restarts) | 35 (16 + 19) | 1,627 | 0 | all match | 3/3 ok | **consistent** |
+
+In both runs some transactions committed whose acknowledgment never arrived, because the kill came between commit and reply: 12 and 18 extra ledger rows. That's allowed; an acknowledged commit going missing is not, and none did.
+
 ## Earlier results
 
 ### Postgres in a DO at all (the first four questions)
@@ -261,7 +454,19 @@ Other measurements:
 - **Cold starts:** 1.3 s to boot, 2.5 s to create. Fixes: a smaller eager prefix (lazy catalogs)
   and a colo cache of image ranges.
 - **Retry semantics:** a fault on a lazy branch page retries the whole request. JSPI removes this.
-- **No wire protocol:** HTTP/RPC only.
+- **The wire endpoint needs the proxy.** Workers can't accept TCP. The proxy runs locally today;
+  to serve Hyperdrive or remote apps it needs a host (a small VM or container), or clients use a
+  WebSocket-aware driver directly.
+- **One transaction at a time per database:** multi-statement transactions over the wire
+  serialize, at about 1 / (statements × round trip).
+- **PGlite bugs that wedge a database:** non-UTF8 `convert`, and hitting `max_stack_depth`.
+  A FATAL now restarts it from SQLite, but a hang needs an evict.
+- **Wire fidelity gaps:**
+  - COPY FROM STDIN inside a multi-statement query is refused;
+  - `pg_prepared_statements` shows private names;
+  - cancel requests are ignored;
+  - no LISTEN/NOTIFY delivery;
+  - one database per object (no CREATE DATABASE).
 
 ## Files
 
@@ -276,4 +481,12 @@ Other measurements:
   (`tenant` from `scripts/tenant.sql`; `sauna` from Sauna's migrations)
 - `scripts/load.py <do|neon> <invocations> <ops> <prefix> [hot] [classes=8] [only=0..3]` · the
   many-tenants driver (5 clients per Worker invocation)
+- `src/wire.ts` · the Postgres wire protocol for many connections over one PGlite ·
+  `src/clock.ts` · clocks for Workers · `src/pgconfig.ts` · how Postgres starts
+- `scripts/pgdo-proxy.mjs` · local Postgres endpoint (TCP → WebSocket → `/wire`) ·
+  `scripts/local-wire.ts` · the same wire layer over PGlite in Node (reference)
+- `test/regress/run.py`, `report.py` · pg_regress per test against native / PGlite / DO, and the
+  comparison
+- `test/drizzle/` · drizzle-kit migrate/pull configs, `app.ts` (Drizzle app test), `crash.mjs`
+  (crash consistency)
 - `deploy.sh` · wrangler with the repo's credentials · `tailcheck.sh` · tail logs around one request
