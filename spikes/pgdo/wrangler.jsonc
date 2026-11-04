@@ -1,0 +1,15 @@
+{
+  // Postgres-in-a-Durable-Object spike: PGlite (Postgres compiled to WebAssembly) inside a DO.
+  "name": "pagedb-pg-spike",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "durable_objects": { "bindings": [{ "name": "PG", "class_name": "PgObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PgObject"] }],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
+  "rules": [
+    { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true },
+    { "type": "Data", "globs": ["**/*.data"], "fallthrough": true }
+  ]
+}
