@@ -12,12 +12,19 @@
 //     postgres.js parses it in one batch and binds it in the next, when another connection may
 //     have run in between);
 //   - COPY … FROM STDIN (which PGlite's raw protocol can't do: it exits) is collected here and
-//     run as COPY … FROM '/dev/blob'.
+//     run as COPY … FROM '/dev/blob';
+//   - RESET SESSION AUTHORIZATION is a no-op in PGlite (single-user mode never records the login
+//     user as the default), so it's rewritten to name the connection's user explicitly; likewise
+//     RESET of a setting the client sent at startup (DateStyle, TimeZone, …) restores that value;
+//   - changed reported settings go back to the client as ParameterStatus (psql's lexer needs
+//     standard_conforming_strings, for one).
 // Runtime-agnostic: the Durable Object and a Node test server (scripts/local-wire.ts) both use it.
 import type { PGlite } from "@electric-sql/pglite";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+/** PGlite's one login role. */
+const SUPERUSER = "postgres";
 
 export interface WireHost {
   /** The database, started if needed. */
@@ -85,7 +92,7 @@ export class Gate {
     const want = conn?.settings ?? new Map<string, string>();
     const had = prev && !prev.closed ? prev.settings : new Map<string, string>();
     if (!sameSettings(want, had) || prev?.closed || prev?.maybeSet) {
-      await pg.exec("RESET SESSION AUTHORIZATION; RESET ALL");
+      await pg.exec(`SET SESSION AUTHORIZATION ${SUPERUSER}; RESET ALL`);
       // plain settings first (some need the superuser), then who we are, then the role
       for (const [k, v] of want) if (k !== "session_authorization" && k !== "role") await pg.query("select set_config($1, $2, false)", [k, v]).catch(() => {});
       const auth = want.get("session_authorization"), role = want.get("role");
@@ -111,6 +118,7 @@ async function captureSettings(pg: PGlite) {
 
 const sameSettings = (a: Map<string, string>, b: Map<string, string>) => a.size === b.size && [...a].every(([k, v]) => b.get(k) === v);
 const quoteIdent = (s: string) => `"${s.replace(/"/g, '""')}"`;
+const quoteLiteral = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
 // ------------------------------------------------------------------ messages
 
@@ -172,6 +180,7 @@ function readCstr(b: Uint8Array, at: number): [string, number] {
   return [dec.decode(b.subarray(at, end)), end + 1];
 }
 
+const RESET_AUTH = /\b(?:reset\s+session\s+authorization|set\s+session\s+authorization\s+default)\b/i;
 const COPY_STDIN = /^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*copy\b[\s\S]*?\bfrom\s+stdin\b/i;
 /** COPY … FROM STDIN anywhere in a query (PGlite's raw protocol exits on it). */
 const COPY_STDIN_ANYWHERE = /\bcopy\b[^;]*?\bfrom\s+stdin\b/i;
@@ -190,6 +199,13 @@ export class WireConn {
   settings = new Map<string, string>();
   /** It may have changed settings since they were last captured. */
   maybeSet = false;
+  /** It has run something of its own (not just connected). */
+  used = false;
+  /** Settings sent in the startup packet (lowercase names): what RESET returns to. */
+  private startupSettings = new Map<string, string>();
+  /** ParameterStatus values the client has been told, and whether they may have changed. */
+  private reported = new Map<string, string>();
+  private paramsDirty = false;
   private host: WireHost;
   private send: (b: Uint8Array) => void;
   private hangup: () => void;
@@ -272,6 +288,7 @@ export class WireConn {
     for (const [k, v] of Object.entries(params)) if (!skip.has(k)) this.settings.set(k, v);
     // options="-c name=value --name=value"
     for (const m of (params.options ?? "").matchAll(/(?:-c\s*|--)([\w.]+)=((?:\\ |\S)+)/g)) this.settings.set(m[1].toLowerCase(), m[2].replace(/\\ /g, " "));
+    for (const [k, v] of this.settings) this.startupSettings.set(k.toLowerCase(), v);
     if (this.user !== "postgres") this.settings.set("session_authorization", this.user);
     this.state = "password";
     this.send(msg("R", int32(3))); // AuthenticationCleartextPassword
@@ -299,14 +316,17 @@ export class WireConn {
       return this.end();
     }
     if (type === "Q") {
-      const [sql] = readCstr(m, 5);
-      if (MAYBE_SET.test(sql)) this.maybeSet = true;
+      let [sql] = readCstr(m, 5);
+      const fixed = this.fixReset(this.fixAuth(sql), true);
+      if (fixed !== sql) m = msg("Q", cstr((sql = fixed)));
+      if (MAYBE_SET.test(sql)) this.maybeSet = this.paramsDirty = true;
       if (COPY_STDIN.test(sql) || COPY_STDIN_ANYWHERE.test(sql)) {
         if (!COPY_STDIN.test(sql) || /;\s*\S/.test(sql.replace(/;\s*$/, ""))) {
           this.send(errorResponse({ code: "0A000", message: "COPY FROM STDIN must be the only statement in its query" }));
           return this.send(readyForQuery(await this.status()));
         }
-        this.copy = { sql: sql.replace(/\bfrom\s+stdin\b/i, "FROM '/dev/blob'"), data: [] };
+        // same length and case as the original, so error positions still point at the right place
+        this.copy = { sql: sql.replace(/\b(from)(\s+)stdin\b/i, (_m, f: string, sp: string) => `${f}${sp}'/b' `), data: [] };
         this.state = "copyin";
         return this.send(msg("G", new Uint8Array([0]), int16(0)));
       }
@@ -331,11 +351,83 @@ export class WireConn {
       return r.rows;
     });
     const out: Uint8Array[] = [msg("R", int32(0))];
-    for (const p of params) out.push(msg("S", cstr(p.name), cstr(p.name === "session_authorization" ? this.user : p.setting)));
+    for (const p of params) {
+      const v = p.name === "session_authorization" ? this.user : p.setting;
+      this.reported.set(p.name, v);
+      out.push(msg("S", cstr(p.name), cstr(v)));
+    }
     out.push(msg("K", int32(this.id), int32(Math.floor(Math.random() * 2 ** 31))));
     out.push(readyForQuery("I"));
     this.state = "ready";
     this.send(concat(out));
+  }
+
+  private fixAuth(sql: string) {
+    if (!RESET_AUTH.test(sql)) return sql;
+    return sql.replace(new RegExp(RESET_AUTH.source, "gi"), `SET SESSION AUTHORIZATION ${quoteIdent(this.user)}`);
+  }
+
+  /** RESET (or SET … TO DEFAULT) of a startup setting goes back to the startup value, as it
+   *  would in a real backend; RESET ALL re-applies them all (simple protocol only). */
+  private fixReset(sql: string, simple: boolean) {
+    if (!this.startupSettings.size || !/\b(reset|default)\b/i.test(sql)) return sql;
+    const value = (name: string) => this.startupSettings.get(name.toLowerCase());
+    let out = sql.replace(/\b(set\s+(?:local\s+|session\s+)?)("?)([\w.]+)\2(\s*(?:to|=)\s*)default\b/gi, (m, set: string, _q, name: string, to: string) => {
+      const v = value(name);
+      return v === undefined ? m : `${set}${name}${to}${quoteLiteral(v)}`;
+    });
+    out = out.replace(/\breset\s+("?)([\w.]+)\1/gi, (m, _q, name: string) => {
+      if (name.toLowerCase() === "all") {
+        if (!simple) return m;
+        return `${m}; ${[...this.startupSettings].map(([k, v]) => `SET ${quoteIdent(k)} = ${quoteLiteral(v)}`).join("; ")}`;
+      }
+      const v = value(name);
+      return v === undefined ? m : `SET ${name} = ${quoteLiteral(v)}`;
+    });
+    return out;
+  }
+
+  /** Error and notice texts name statements as the client did, not as we renamed them. */
+  private unrename(r: Uint8Array): Uint8Array {
+    const tag = `_c${this.id}`;
+    const dv = new DataView(r.buffer, r.byteOffset, r.byteLength);
+    let parts: Uint8Array[] | null = null;
+    let from = 0;
+    for (let i = 0; i + 5 <= r.length; ) {
+      const len = dv.getInt32(i + 1);
+      if (r[i] === 69 /* E */ || r[i] === 78 /* N */) {
+        const body = dec.decode(r.subarray(i + 5, i + 1 + len));
+        if (body.includes(tag)) {
+          const fixed = body.replace(new RegExp(`${tag}#\\d+`, "g"), "").replace(new RegExp(`${tag}_`, "g"), "");
+          (parts ??= []).push(r.subarray(from, i), msg(String.fromCharCode(r[i]), enc.encode(fixed)));
+          from = i + 1 + len;
+        }
+      }
+      i += 1 + len;
+    }
+    if (!parts) return r;
+    parts.push(r.subarray(from));
+    return concat(parts);
+  }
+
+  /** ParameterStatus for reported settings that changed, placed before the last ReadyForQuery. */
+  private async reportChanges(pg: PGlite, out: Uint8Array): Promise<Uint8Array> {
+    if (!this.paramsDirty) return out;
+    this.paramsDirty = false;
+    let rows: { name: string; setting: string }[];
+    try {
+      rows = (await pg.query<{ name: string; setting: string }>("select name, setting from pg_settings where name = any($1)", [PARAMS_REPORTED])).rows;
+    } catch {
+      return out; // e.g. inside an aborted transaction: report next time
+    }
+    const changed = rows.filter((p) => this.reported.get(p.name) !== p.setting);
+    if (!changed.length) return out;
+    for (const p of changed) this.reported.set(p.name, p.setting);
+    const status = concat(changed.map((p) => msg("S", cstr(p.name), cstr(p.setting))));
+    const dv = new DataView(out.buffer, out.byteOffset, out.byteLength);
+    let z = -1;
+    for (let i = 0; i + 5 <= out.length; i += 1 + dv.getInt32(i + 1)) if (out[i] === 90) z = i;
+    return z < 0 ? concat([out, status]) : concat([out.subarray(0, z), status, out.subarray(z)]);
   }
 
   /** Prefix prepared statement and portal names with this connection's id. */
@@ -348,12 +440,13 @@ export class WireConn {
     };
     if (type === "P") {
       const [name, a] = readCstr(m, 5);
-      const [sql, b] = readCstr(m, a);
-      if (MAYBE_SET.test(sql)) this.maybeSet = true;
+      let [sql, b] = readCstr(m, a);
+      sql = this.fixReset(this.fixAuth(sql), false);
+      if (MAYBE_SET.test(sql)) this.maybeSet = this.paramsDirty = true;
       if (COPY_STDIN.test(sql)) this.refused = errorResponse({ code: "0A000", message: "COPY FROM STDIN is only supported in the simple query protocol" });
       if (!name) {
         if (this.unnamed) this.stale.push(this.unnamed);
-        this.unnamed = `_c${this.id}_u${++this.unnamedCount}`;
+        this.unnamed = `_c${this.id}#${++this.unnamedCount}`;
       }
       return msg("P", cstr(named(name)), cstr(sql), m.subarray(b));
     }
@@ -394,11 +487,12 @@ export class WireConn {
         this.stale = [];
         await pg.exec(drop.map((n) => `DEALLOCATE ${quoteIdent(n)};`).join(" ")).catch(() => {});
       }
-      const out = await this.host.exec(batch, gate.txOwner !== this);
+      this.used = true;
+      const out = this.unrename(await this.host.exec(batch, gate.txOwner !== this));
       const st = lastStatus(out);
       if (st === "T" || st === "E") gate.txOwner = this;
       else if (st === "I" && gate.txOwner === this) gate.txOwner = null;
-      return out;
+      return this.reportChanges(pg, out);
     });
     if (r.length) this.send(r);
   }
@@ -411,6 +505,12 @@ export class WireConn {
     const out = await gate.run(this, async () => {
       const pg = await this.host.pg();
       await gate.switchTo(pg, this);
+      this.used = true;
+      const FS = (pg as unknown as { mod?: { FS?: any } }).mod?.FS;
+      try {
+        // a second name for PGlite's /dev/blob device, short enough to replace "stdin" in place
+        if (FS && !FS.analyzePath("/b").exists) FS.mkdev("/b", FS.lookupPath("/dev/blob").node.rdev);
+      } catch {}
       let reply: Uint8Array;
       if (failed !== null) reply = errorResponse({ code: "57014", message: `COPY from stdin failed: ${failed}` });
       else {
@@ -445,8 +545,10 @@ export class WireConn {
           await pg.exec("ROLLBACK").catch(() => {});
           gate.txOwner = null;
         }
-        if (gate.conns.size === 0) {
-          // nobody else is connected: start the next connection with a clean session
+        if ([...gate.conns].every((c) => !c.used)) {
+          // nobody else has run anything (psql's \c connects before it disconnects): give the
+          // next connection a clean session, as a new backend would have
+          await pg.exec(`SET SESSION AUTHORIZATION ${SUPERUSER}`).catch(() => {});
           await pg.exec("DISCARD ALL").catch(() => {});
           gate.sessionOwner = null;
         } else {

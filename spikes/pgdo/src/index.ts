@@ -11,6 +11,7 @@ import pgliteWasm from "../vendor/pglite.wasm";
 import initdbWasm from "../vendor/initdb.wasm";
 import fsBundle from "../vendor/pglite.data";
 import { SqliteFS, type ImageIndex } from "./sqlitefs";
+import { SMALL_SHMEM, START } from "./pgconfig";
 import { CHECKS, runCheck } from "./compat";
 import { Gate, WireConn, type WireHost } from "./wire";
 import { explain, load, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
@@ -19,10 +20,6 @@ import { explain, load, neonTarget, run as runOps, SETUP, type Stmt, type Target
 const IMG = (name: string) => `pgspike/img/${name}`;
 
 /** Objects of one class can share an isolate (and its 128 MB): which isolate, and who's in it. */
-// PGlite's own start parameters (its defaultStartParams), to which we add memory settings.
-const START = ["--single", "-F", "-O", "-j", "-c", "search_path=public", "-c", "exit_on_error=false", "-c", "log_checkpoints=false", "-c", "max_worker_processes=0", "-c", "max_parallel_workers=0", "-c", "max_parallel_workers_per_gather=0", "-c", "io_method=sync", "-c", "max_parallel_maintenance_workers=0", "-c", "timezone=UTC"];
-// Shared memory is sized for max_connections backends; PGlite is one.
-const SMALL_SHMEM = ["-c", "max_connections=4", "-c", "max_wal_senders=0", "-c", "max_replication_slots=0", "-c", "max_prepared_transactions=0", "-c", "max_locks_per_transaction=64", "-c", "autovacuum_worker_slots=1"];
 let isolate: string | undefined; // named on first use (no randomness at global scope)
 const running = new Set<PgObject>();
 
@@ -58,8 +55,27 @@ export class PgObject extends DurableObject<Env> {
       this.ctx.storage.kv.put("image", name);
       Object.assign(st, { image: name, ...r, eagerMB: +(eager.length / 1e6).toFixed(1), branchMs: Date.now() - t0 });
     }
-    this.pg = await PGlite.create({
+    // The database inside is called what clients connect to (current_database(), information_schema):
+    // the first boot renames the image's "postgres" from template1, then reconnects.
+    const want = this.ctx.id.name && this.ctx.id.name.length < 64 ? this.ctx.id.name : "postgres";
+    const have = this.ctx.storage.kv.get<string>("pgdb") ?? "postgres";
+    if (have !== want) {
+      const pg = await this.boot(fs, conf, "template1");
+      await pg.exec(`ALTER DATABASE "${have.replace(/"/g, '""')}" RENAME TO "${want.replace(/"/g, '""')}"`);
+      await pg.close();
+      this.ctx.storage.kv.put("pgdb", want);
+      this.fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024);
+    }
+    this.pg = await this.boot(this.fs!, conf, want);
+    running.add(this);
+    this.writeExtraFiles();
+    return st;
+  }
+
+  private boot(fs: SqliteFS, conf: { sharedBuffers?: string }, database: string) {
+    return PGlite.create({
       fs,
+      database,
       pgliteWasmModule: pgliteWasm,
       initdbWasmModule: initdbWasm,
       // Every instance in the isolate reads the same bundle buffer, and MEMFS keeps views into it
@@ -71,9 +87,6 @@ export class PgObject extends DurableObject<Env> {
       initialMemory: 16 * 1024 * 1024,
       startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=4MB", ...SMALL_SHMEM],
     });
-    running.add(this);
-    this.writeExtraFiles();
-    return st;
   }
 
   // ---------------------------------------------------------------- the wire protocol
@@ -290,6 +303,7 @@ export class PgObject extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_base");
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_meta");
     this.ctx.storage.kv.delete("image");
+    this.ctx.storage.kv.delete("pgdb");
     return { ok: true };
   }
 }

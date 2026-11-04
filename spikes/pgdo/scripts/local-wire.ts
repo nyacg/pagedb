@@ -1,24 +1,40 @@
 // The wire layer (src/wire.ts) over an in-memory PGlite in Node: a reference for the Durable
 // Object (same protocol code, no SQLite storage, no Workers), and a quick local Postgres.
 //   node --experimental-strip-types scripts/local-wire.ts [port] [password] [dir to mirror …]
-// PGDATA_ROOT=/some/dir keeps each database on disk (<root>/<db>), so a restart recovers it.
+// Each database lives on disk under PGDATA_ROOT (default: a temp dir), as <root>/<db>, so a
+// restart recovers it. Postgres starts as in the Durable Object (src/pgconfig.ts), and the
+// database inside is renamed to what clients connect to, as there.
 // Mirrored directories appear at the same paths inside the database's filesystem (pg_regress
 // COPYs its data files from absolute paths on the server).
 import { createServer } from "node:net";
-import { mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { Gate, WireConn, type WireHost } from "../src/wire.ts";
+import { START } from "../src/pgconfig.ts";
 
 const port = Number(process.argv[2] ?? 6544);
 const password = process.argv[3] ?? "local";
 const mirror = process.argv.slice(4);
 const dbs = new Map<string, WireHost>();
 
+const root = process.env.PGDATA_ROOT ?? mkdtempSync(join(tmpdir(), "pglite-wire-"));
+mkdirSync(root, { recursive: true });
+
 async function boot(name: string) {
-  const root = process.env.PGDATA_ROOT;
-  if (root) mkdirSync(root, { recursive: true });
-  const pg = await PGlite.create(root ? join(root, name) : undefined);
+  const dir = join(root, name), marker = join(dir, ".pgdo-database");
+  const want = name.length < 64 ? name : "postgres";
+  if (!existsSync(marker)) {
+    await (await PGlite.create(dir, { startParams: START })).close();
+    if (want !== "postgres") {
+      const t = await PGlite.create(dir, { startParams: START, database: "template1" });
+      await t.exec(`ALTER DATABASE postgres RENAME TO "${want.replace(/"/g, '""')}"`);
+      await t.close();
+    }
+    writeFileSync(marker, want);
+  }
+  const pg = await PGlite.create(dir, { startParams: START, database: readFileSync(marker, "utf8") });
   const FS = (pg as any).mod.FS;
   const copy = (dir: string) => {
     FS.mkdirTree(dir);
