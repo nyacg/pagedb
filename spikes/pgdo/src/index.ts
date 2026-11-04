@@ -11,15 +11,23 @@ import initdbWasm from "../vendor/initdb.wasm";
 import fsBundle from "../vendor/pglite.data";
 import { SqliteFS, type ImageIndex } from "./sqlitefs";
 import { CHECKS, runCheck } from "./compat";
-import { explain, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
+import { explain, load, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
 
 /** Template images (scripts/mkimage.mjs): pgspike/img/<name>.json (the index) and .blob (PGDATA). */
 const IMG = (name: string) => `pgspike/img/${name}`;
 
-interface Env { PG: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string }
+/** Objects of one class can share an isolate (and its 128 MB): which isolate, and who's in it. */
+// PGlite's own start parameters (its defaultStartParams), to which we add memory settings.
+const START = ["--single", "-F", "-O", "-j", "-c", "search_path=public", "-c", "exit_on_error=false", "-c", "log_checkpoints=false", "-c", "max_worker_processes=0", "-c", "max_parallel_workers=0", "-c", "max_parallel_workers_per_gather=0", "-c", "io_method=sync", "-c", "max_parallel_maintenance_workers=0"];
+// Shared memory is sized for max_connections backends; PGlite is one.
+const SMALL_SHMEM = ["-c", "max_connections=4", "-c", "max_wal_senders=0", "-c", "max_replication_slots=0", "-c", "max_prepared_transactions=0", "-c", "max_locks_per_transaction=64", "-c", "autovacuum_worker_slots=1"];
+let isolate: string | undefined; // named on first use (no randomness at global scope)
+const running = new Set<PgObject>();
+
+interface Env { PG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string }
 
 export class PgObject extends DurableObject<Env> {
-  private pg?: PGlite;
+  pg?: PGlite;
   private fs?: SqliteFS;
   private started?: { templateMs?: number; files?: number };
   private readonly instance = crypto.randomUUID().slice(0, 8);
@@ -27,7 +35,9 @@ export class PgObject extends DurableObject<Env> {
   /** Start Postgres: a new database is a branch of a template image (default "base", empty). */
   private async ensure(image?: string) {
     if (this.pg) return undefined;
-    const fs = (this.fs = new SqliteFS(this.ctx.storage.sql));
+    // Memory knobs (per database, for experiments): /config?db=…&cacheMB=1&sharedBuffers=2MB
+    const conf = this.ctx.storage.kv.get<{ cacheMB?: number; sharedBuffers?: string }>("conf") ?? {};
+    const fs = (this.fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024));
     const st: { image?: string; branchMs?: number; files?: number; lazy?: number; eagerMB?: number } = {};
     if (fs.empty) {
       const t0 = Date.now();
@@ -42,12 +52,16 @@ export class PgObject extends DurableObject<Env> {
       fs,
       pgliteWasmModule: pgliteWasm,
       initdbWasmModule: initdbWasm,
-      fsBundle: new Blob([fsBundle]),
+      // Every instance in the isolate reads the same bundle buffer, and MEMFS keeps views into it
+      // (the loader writes with canOwn), so share/ costs nothing per instance.
+      fsBundle: { arrayBuffer: async () => fsBundle } as unknown as Blob,
       extensions: { contrib },
-      // A Durable Object has 128 MB in all: start the wasm heap at 32 MB (the binary is patched to
-      // allow it); Postgres's own buffers are set small in the template's postgresql.conf.
-      initialMemory: 32 * 1024 * 1024,
+      // Objects share isolates (2–4 per 128 MB isolate under load), so keep each one small: the wasm
+      // heap starts at 16 MB (the binary is patched to allow it); Postgres gets 4 MB of buffers.
+      initialMemory: 16 * 1024 * 1024,
+      startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=4MB", ...SMALL_SHMEM],
     });
+    running.add(this);
     return st;
   }
 
@@ -70,6 +84,12 @@ export class PgObject extends DurableObject<Env> {
     }
   }
 
+  /** This object's isolate and the Postgres instances running in it (RPC). */
+  where() {
+    const heaps = [...running].map((o) => (o.pg as any)?.mod?.HEAPU8?.length ?? 0);
+    return { isolate: (isolate ??= crypto.randomUUID().slice(0, 8)), postgresInIsolate: running.size, heapsMB: +(heaps.reduce((a, b) => a + b, 0) / 1e6).toFixed(1) };
+  }
+
   private mem() {
     const m = (this.pg as any)?.mod;
     const heap = m?.HEAPU8?.length ?? m?.wasmMemory?.buffer?.byteLength;
@@ -84,6 +104,22 @@ export class PgObject extends DurableObject<Env> {
     } catch (e) {
       return { error: String((e as Error).stack ?? e).slice(0, 2000), ...this.mem() };
     }
+  }
+
+  /** Set memory knobs and restart Postgres with them (RPC). */
+  async configure(conf: { cacheMB?: number; sharedBuffers?: string }) {
+    this.ctx.storage.kv.put("conf", conf);
+    this.fs?.flush();
+    await this.pg?.close().catch(() => {});
+    running.delete(this);
+    this.pg = undefined;
+    this.fs = undefined;
+    return conf;
+  }
+
+  /** Create the database from a template image if it doesn't exist yet (RPC). */
+  async init(image?: string) {
+    return this.ensure(image);
   }
 
   /** One statement with parameters (RPC). */
@@ -143,13 +179,38 @@ export class PgObject extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_block");
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_node");
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_base");
+    this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_meta");
     this.ctx.storage.kv.delete("image");
     return { ok: true };
   }
 }
 
-function doTarget(stub: DurableObjectStub<PgObject>, name: string): Target {
-  return { name, q: (sql, params) => stub.q(sql, params) as Promise<unknown[]>, tx: (stmts) => stub.tx(stmts) as Promise<unknown[][]> };
+/** The same Neon endpoint, another database on it. */
+function neonUrl(base: string, db: string | null) {
+  if (!db) return base;
+  const u = new URL(base);
+  u.pathname = `/${db}`;
+  return u.toString();
+}
+
+export class PgObject1 extends PgObject {}
+export class PgObject2 extends PgObject {}
+export class PgObject3 extends PgObject {}
+export class PgObject4 extends PgObject {}
+export class PgObject5 extends PgObject {}
+export class PgObject6 extends PgObject {}
+export class PgObject7 extends PgObject {}
+
+/** A tenant's object, its class picked by a hash of its name (classes = 1 → everything in PG). */
+function tenant(env: Env, name: string, classes: number) {
+  let h = 0;
+  for (const c of name) h = (Math.imul(h, 31) + c.charCodeAt(0)) | 0;
+  const k = Math.abs(h) % classes;
+  return (k === 0 ? env.PG : env[`PG${k}`]).getByName(name);
+}
+
+function doTarget(stub: DurableObjectStub<PgObject>, name: string): Target & { stub: DurableObjectStub<PgObject> } {
+  return { name, stub, q: (sql, params) => stub.q(sql, params) as Promise<unknown[]>, tx: (stmts) => stub.tx(stmts) as Promise<unknown[][]> };
 }
 
 export default {
@@ -161,14 +222,29 @@ export default {
     if (url.pathname === "/sql") r = await stub.exec(req.method === "POST" ? await req.text() : (url.searchParams.get("q") ?? "select 1"), url.searchParams.get("image") ?? undefined);
     else if (url.pathname === "/bench") r = await stub.bench(url.searchParams.get("kind") ?? "update", Number(url.searchParams.get("n") ?? 200));
     else if (url.pathname === "/reset") r = await stub.reset();
+    else if (url.pathname === "/config") r = await stub.configure({ cacheMB: Number(url.searchParams.get("cacheMB") ?? 4), sharedBuffers: url.searchParams.get("sharedBuffers") ?? "4MB" });
     else if (url.pathname === "/vs") {
       // Same workload on Neon and on a PgObject, timed in this Worker.
       //   /vs?target=neon|do&op=read&n=100[&db=bench][&hint=enam]   /vs?target=…&setup=1
       const which = url.searchParams.get("target") ?? "do";
       const name = url.searchParams.get("db") ?? "bench";
       const hint = url.searchParams.get("hint") as DurableObjectLocationHint | null;
-      const t: Target = which === "neon" ? neonTarget(env.NEON_DATABASE_URL) : doTarget(hint ? env.PG.get(env.PG.idFromName(name), { locationHint: hint }) : env.PG.getByName(name), `do:${name}`);
-      if (url.searchParams.has("compat")) {
+      const t: Target = which === "neon" ? neonTarget(neonUrl(env.NEON_DATABASE_URL, url.searchParams.get("neondb"))) : doTarget(hint ? env.PG.get(env.PG.idFromName(name), { locationHint: hint }) : env.PG.getByName(name), `do:${name}`);
+      if (which === "do" && url.searchParams.has("image")) await (t as Target & { stub: DurableObjectStub<PgObject> }).stub.init(url.searchParams.get("image")!);
+      if (req.method === "POST") {
+        // A list of statements, in order (e.g. a project's migrations): /vs?target=…  body: ["…", …]
+        const stmts = (await req.json()) as string[];
+        const errors: { i: number; sql: string; error: string }[] = [];
+        let last: unknown[] = [];
+        for (let i = 0; i < stmts.length; i++) {
+          try {
+            last = await t.q(stmts[i]);
+          } catch (e) {
+            errors.push({ i, sql: stmts[i].slice(0, 160), error: String((e as Error).message ?? e).slice(0, 300) });
+          }
+        }
+        r = { target: t.name, statements: stmts.length, errors: errors.length, firstErrors: errors.slice(0, 10), last: last.slice(0, 20), ms: Date.now() - t0 };
+      } else if (url.searchParams.has("compat")) {
         const only = url.searchParams.get("compat");
         const out = [];
         for (const name of only ? only.split(",") : Object.keys(CHECKS)) out.push(await runCheck(t, name));
@@ -178,6 +254,20 @@ export default {
         for (const s of SETUP) await t.q(s.sql, s.params);
         r = { ok: true, target: t.name, setupMs: Date.now() - t0 };
       } else r = await runOps(t, url.searchParams.get("op") ?? "read", Number(url.searchParams.get("n") ?? 50));
+    } else if (url.pathname === "/load") {
+      // /load?target=do|neon&clients=5&ops=40&prefix=t&inv=0[&image=tenant][&hot=1]
+      // Each client is a tenant with its own object (do), or a client of the one Neon database;
+      // with &hot=1 every client shares one object. New objects branch from &image first.
+      const which = url.searchParams.get("target") ?? "do";
+      const k = Number(url.searchParams.get("clients") ?? 5), ops = Number(url.searchParams.get("ops") ?? 40);
+      const prefix = url.searchParams.get("prefix") ?? "t", inv = url.searchParams.get("inv") ?? "0", image = url.searchParams.get("image") ?? "tenant";
+      const targets = Array.from({ length: k }, (_, i) =>
+        which === "neon" ? neonTarget(neonUrl(env.NEON_DATABASE_URL, url.searchParams.get("neondb"))) : doTarget(tenant(env, url.searchParams.has("hot") ? `${prefix}-hot` : `${prefix}-${inv}-${i}`, Number(url.searchParams.get("classes") ?? 1)), "do"));
+      const initLat: number[] = [];
+      if (which === "do") await Promise.all(targets.map(async (t) => { const s = Date.now(); await (t as ReturnType<typeof doTarget>).stub.init(image); initLat.push(Date.now() - s); }));
+      const only = url.searchParams.get("only"); // 0 read, 1 write, 2 txn, 3 jsonb
+      r = { ...(await load(targets, ops, only === null ? undefined : Number(only))), initLat: initLat.sort((a, b) => a - b) };
+      if (which === "do") (r as any).where = await Promise.all(targets.map((t) => (t as ReturnType<typeof doTarget>).stub.where().catch(() => null)));
     } else if (url.pathname === "/env") r = { jspi: { Suspending: typeof (WebAssembly as any).Suspending, promising: typeof (WebAssembly as any).promising }, typeReflection: typeof (WebAssembly as any).Function };
     else if (url.pathname === "/evict") r = await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true }));
     else return new Response("pgdo spike: /sql?q=…[&image=hn150] | /bench?kind=update|read|tpcb&n=… | /evict | /reset   (&db=name)");

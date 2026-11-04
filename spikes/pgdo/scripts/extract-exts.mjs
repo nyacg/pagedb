@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileS
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-const NAMES = ["pgcrypto", "uuid-ossp", "pg_trgm", "citext", "hstore", "ltree", "fuzzystrmatch", "unaccent", "btree_gin", "btree_gist", "intarray", "tablefunc", "cube", "earthdistance", "isn", "seg", "tsm_system_rows"];
+const NAMES = ["pgcrypto", "uuid-ossp", "pg_trgm", "citext", "hstore", "ltree", "fuzzystrmatch", "unaccent", "btree_gin", "btree_gist", "intarray", "tablefunc", "cube", "earthdistance", "isn", "seg", "tsm_system_rows", "amcheck"];
 const bundles = NAMES.map((n) => [n, `node_modules/@electric-sql/pglite/dist/${n}.tar.gz`]);
 bundles.push(["vector", "node_modules/@electric-sql/pglite-pgvector/dist/vector.tar.gz"]);
 
@@ -35,10 +35,14 @@ ${libs.map(([l]) => `import m_${id(l)} from "../vendor/lib/${l}.wasm";`).join("\
 const extLibs: Record<string, WebAssembly.Module> = { ${libs.map(([l]) => `${JSON.stringify(l)}: m_${id(l)}`).join(", ")} };
 const core = (globalThis as any).__pgSideModule;
 (globalThis as any).__pgSideModule = (libName: string) => core?.(libName) ?? extLibs[String(libName).split("/").pop()!.replace(/\\.so$/, "")];
+const enc = new TextEncoder();
 const files: [string, string][] = [
 ${text.map(([p, t]) => `  [${JSON.stringify(p)}, ${JSON.stringify(t)}],`).join("\n")}
 ${libs.map(([, p]) => `  [${JSON.stringify(p)}, "\\0"],`).join("\n")}
 ];
+
+// Encoded once per isolate; each instance's MEMFS keeps views (canOwn) rather than copies.
+const encoded = files.map(([path, text]) => [path, enc.encode(text)] as const);
 
 /** A PGlite extension whose setup writes the files in before Postgres starts. */
 export const contrib = {
@@ -49,9 +53,9 @@ export const contrib = {
       preRun: [
         ...(opts.preRun ?? []),
         (mod: any) => {
-          for (const [path, data] of files) {
+          for (const [path, data] of encoded) {
             mod.FS.mkdirTree(path.slice(0, path.lastIndexOf("/")));
-            mod.FS.writeFile(path, data);
+            mod.FS.writeFile(path, data, { canOwn: true });
           }
         },
       ],

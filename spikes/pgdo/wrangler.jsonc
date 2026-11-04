@@ -7,8 +7,19 @@
   "observability": { "enabled": true },
   // Big statements (a 1M-row insert, an index build) run long inside one request.
   "limits": { "cpu_ms": 300000 },
-  "durable_objects": { "bindings": [{ "name": "PG", "class_name": "PgObject" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PgObject"] }],
+  // PG1..PG7 are the same class under other names: objects of one class share isolates, so
+  // hashing tenants over several classes spreads them over more isolates.
+  "durable_objects": {
+    "bindings": [
+      { "name": "PG", "class_name": "PgObject" },
+      { "name": "PG1", "class_name": "PgObject1" }, { "name": "PG2", "class_name": "PgObject2" }, { "name": "PG3", "class_name": "PgObject3" },
+      { "name": "PG4", "class_name": "PgObject4" }, { "name": "PG5", "class_name": "PgObject5" }, { "name": "PG6", "class_name": "PgObject6" }, { "name": "PG7", "class_name": "PgObject7" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PgObject"] },
+    { "tag": "v2", "new_sqlite_classes": ["PgObject1", "PgObject2", "PgObject3", "PgObject4", "PgObject5", "PgObject6", "PgObject7"] }
+  ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
   "rules": [
     { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true },

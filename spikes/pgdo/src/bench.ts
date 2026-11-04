@@ -105,3 +105,38 @@ export async function explain(t: Target, name: string, n = 5) {
   times.sort((a, b) => a - b);
   return { target: t.name, query: name, execMs: +times[Math.floor(times.length / 2)].toFixed(3) };
 }
+
+/** The many-tenants mix: mostly point reads, some writes, a few transactions and JSONB lookups.
+ *  Ids stay within 10k rows (the tenant image's size). */
+const MIX: [number, (t: Target) => Promise<unknown>][] = [
+  [0.6, (t) => t.q("select bal, note from acct where id = $1", [rnd(10000)])],
+  [0.2, (t) => t.q("update acct set bal = bal + 1 where id = $1", [rnd(10000)])],
+  [0.1, (t) => t.tx([
+    { sql: "update acct set bal = bal - 1 where id = $1", params: [rnd(10000)] },
+    { sql: "update acct set bal = bal + 1 where id = $1", params: [rnd(10000)] },
+  ])],
+  [0.1, (t) => t.q("select id from docs where data @> $1::jsonb limit 20", [JSON.stringify({ tags: [`t${rnd(50) - 1}`] })])],
+];
+
+/** Several clients at once, each running `ops` operations back to back on its own target. */
+export async function load(targets: Target[], ops: number, only?: number) {
+  const lat: number[] = [];
+  let errors = 0, firstError: string | undefined;
+  const t0 = Date.now();
+  await Promise.all(targets.map(async (t) => {
+    for (let i = 0; i < ops; i++) {
+      let x = Math.random(), j = 0;
+      if (only !== undefined) j = only;
+      else while (x > MIX[j][0]) x -= MIX[j++][0];
+      const s = Date.now();
+      try {
+        await MIX[j][1](t);
+        lat.push(Date.now() - s);
+      } catch (e) {
+        errors++;
+        firstError ??= String((e as Error).message ?? e).slice(0, 200);
+      }
+    }
+  }));
+  return { clients: targets.length, ops: lat.length, wallMs: Date.now() - t0, errors, firstError, lat: lat.sort((a, b) => a - b) };
+}

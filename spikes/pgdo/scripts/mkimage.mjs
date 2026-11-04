@@ -1,9 +1,9 @@
 // Build a branchable template image: PGDATA as one blob (files on 64 KiB block boundaries,
-// small files first) plus an index. node mkimage.mjs <name> <rows>
+// small files first) plus an index. node mkimage.mjs <name> <rows> [schema.sql | statements.json]
 import { PGlite } from "@electric-sql/pglite";
 import { writeFileSync, readFileSync } from "node:fs";
 import { gunzipSync } from "node:zlib";
-const [name, rowsArg] = process.argv.slice(2);
+const [name, rowsArg, schema] = process.argv.slice(2);
 const rows = Number(rowsArg ?? 0);
 const conf = "shared_buffers=8MB\nwal_buffers=256kB\nmax_wal_size=16MB\nmin_wal_size=2MB\nwork_mem=1MB\nmaintenance_work_mem=8MB\n";
 const pg = await PGlite.create({ initDbStartParams: ["--wal-segsize=1"], postgresqlconf: conf });
@@ -12,6 +12,9 @@ if (rows) {
     insert into story select g, 'user' || (g % 50000), (g::bigint * 7919) % 1000, timestamp '2006-10-09' + (g || ' minutes')::interval, 'story ' || md5(g::text) || ' about ' || (array['rust','postgres','durable objects','startups','ai','hardware'])[1 + g % 6] from generate_series(1, ${rows}) g;
     create index story_by_score on story(score, id); analyze story; checkpoint;`);
 }
+if (schema?.endsWith(".json")) for (const q of JSON.parse(readFileSync(schema, "utf8"))) await pg.exec(q);
+else if (schema) await pg.exec(readFileSync(schema, "utf8"));
+if (schema) await pg.exec("analyze; checkpoint");
 const info = (await pg.query("select pg_size_pretty(pg_database_size(current_database())) s")).rows[0].s;
 // After a checkpoint, recovery starts in the current WAL segment: the recycled ones are dead weight.
 await pg.exec("checkpoint");

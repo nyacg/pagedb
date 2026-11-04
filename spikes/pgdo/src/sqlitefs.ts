@@ -6,10 +6,12 @@
 // page writes become a handful of row writes, durable before the object replies.
 import { BaseFilesystem, ERRNO_CODES, type FsStats } from "@electric-sql/pglite/basefs";
 
-const BLOCK = 64 * 1024;
+/** Block size for new databases: Postgres's page size, so a page write rewrites one 8 KiB row
+ *  (64 KiB blocks turned every commit into ~128 KiB of SQLite writes). Older databases keep 64 KiB. */
+const NEW_BLOCK = 8 * 1024;
 /** Dirty blocks beyond this are written to SQLite mid-statement (a request's writes still commit
  *  together), so one big statement never holds its whole output in memory. */
-const DIRTY_LIMIT = 8 * 1024 * 1024;
+const DIRTY_LIMIT = 2 * 1024 * 1024;
 const S_IFDIR = 0o040000;
 const S_IFREG = 0o100000;
 
@@ -43,7 +45,9 @@ export class SqliteFS extends BaseFilesystem {
   private nodes = new Map<string, Node>();
   private dirtyNodes = new Set<string>();
   private cache = new Map<string, Uint8Array>(); // `${path}\0${n}` → block, in LRU order
-  private dirty = new Set<string>();
+  /** Written blocks not yet in SQLite. They own their bytes, so evicting one from the cache can't
+   *  lose a write, and reads look here before SQLite. */
+  private dirty = new Map<string, Uint8Array>();
   private dirtyBytes = 0;
   private cacheBytes = 0;
   private fds = new Map<number, string>();
@@ -54,13 +58,19 @@ export class SqliteFS extends BaseFilesystem {
   private nextFd = 3;
   readonly stats = { reads: 0, readMisses: 0, rowsWritten: 0, flushes: 0, faults: 0, fetchedMB: 0 };
 
-  constructor(private sql: SqlStorage, private cacheLimit = 24 * 1024 * 1024, debug = false) {
+  private readonly bs: number;
+
+  constructor(private sql: SqlStorage, private cacheLimit = 4 * 1024 * 1024, debug = false) {
     super(undefined, { debug });
     sql.exec("CREATE TABLE IF NOT EXISTS fs_node (path TEXT PRIMARY KEY, mode INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL) WITHOUT ROWID");
     sql.exec("CREATE TABLE IF NOT EXISTS fs_block (path TEXT NOT NULL, n INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY (path, n)) WITHOUT ROWID");
     sql.exec("CREATE TABLE IF NOT EXISTS fs_base (path TEXT PRIMARY KEY, off INTEGER NOT NULL, size INTEGER NOT NULL) WITHOUT ROWID");
     for (const r of sql.exec<{ path: string; mode: number; size: number; mtime: number }>("SELECT path, mode, size, mtime FROM fs_node")) this.nodes.set(r.path, { mode: r.mode, size: r.size, mtime: r.mtime });
     for (const r of sql.exec<{ path: string; off: number; size: number }>("SELECT path, off, size FROM fs_base")) this.base.set(r.path, { off: r.off, size: r.size });
+    sql.exec("CREATE TABLE IF NOT EXISTS fs_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL) WITHOUT ROWID");
+    const bs = sql.exec<{ v: number }>("SELECT v FROM fs_meta WHERE k = 'block'").toArray()[0]?.v;
+    this.bs = bs ?? (this.nodes.size === 0 ? NEW_BLOCK : 64 * 1024);
+    if (!bs) sql.exec("INSERT INTO fs_meta (k, v) VALUES ('block', ?)", this.bs);
     if (!this.nodes.has("/")) this.putNode("/", { mode: S_IFDIR | 0o700, size: 0, mtime: Date.now() });
   }
 
@@ -86,7 +96,7 @@ export class SqliteFS extends BaseFilesystem {
     for (const f of index.files) {
       this.putNode(f.path, { mode: S_IFREG | (f.mode || 0o600), size: f.size, mtime: f.mtime });
       if (f.off + f.size <= index.eagerEnd) {
-        for (let n = 0; n * BLOCK < f.size; n++) this.sql.exec("INSERT INTO fs_block (path, n, data) VALUES (?, ?, ?)", f.path, n, eager.subarray(f.off + n * BLOCK, f.off + Math.min(f.size, (n + 1) * BLOCK)));
+        for (let n = 0; n * this.bs < f.size; n++) this.sql.exec("INSERT INTO fs_block (path, n, data) VALUES (?, ?, ?)", f.path, n, eager.subarray(f.off + n * this.bs, f.off + Math.min(f.size, (n + 1) * this.bs)));
       } else {
         this.base.set(f.path, { off: f.off, size: f.size });
         this.sql.exec("INSERT INTO fs_base (path, off, size) VALUES (?, ?, ?)", f.path, f.off, f.size);
@@ -110,12 +120,12 @@ export class SqliteFS extends BaseFilesystem {
       [...want].map(async ([p, n0]) => {
         const b = this.base.get(p);
         if (!b) return;
-        const w = this.window.get(p) ?? 16; // 1 MiB first
-        this.window.set(p, Math.min(w * 2, 1024));
-        const last = Math.min(Math.ceil(b.size / BLOCK), n0 + w);
-        const buf = new Uint8Array(await get(b.off + n0 * BLOCK, Math.min(b.size, last * BLOCK) - n0 * BLOCK));
+        const w = this.window.get(p) ?? (1 << 20) / this.bs; // 1 MiB first
+        this.window.set(p, Math.min(w * 2, (64 << 20) / this.bs));
+        const last = Math.min(Math.ceil(b.size / this.bs), n0 + w);
+        const buf = new Uint8Array(await get(b.off + n0 * this.bs, Math.min(b.size, last * this.bs) - n0 * this.bs));
         this.stats.fetchedMB += buf.length / 1e6;
-        for (let n = n0; n < last; n++) this.sql.exec("INSERT OR IGNORE INTO fs_block (path, n, data) VALUES (?, ?, ?)", p, n, buf.subarray((n - n0) * BLOCK, Math.min(buf.length, (n - n0 + 1) * BLOCK)));
+        for (let n = n0; n < last; n++) this.sql.exec("INSERT OR IGNORE INTO fs_block (path, n, data) VALUES (?, ?, ?)", p, n, buf.subarray((n - n0) * this.bs, Math.min(buf.length, (n - n0 + 1) * this.bs)));
       }),
     );
   }
@@ -140,18 +150,17 @@ export class SqliteFS extends BaseFilesystem {
   }
   private block(path: string, n: number): Uint8Array | undefined {
     const k = this.key(path, n);
-    const hit = this.cache.get(k);
+    const hit = this.cache.get(k) ?? this.dirty.get(k);
     this.stats.reads++;
     if (hit) {
-      this.cache.delete(k);
-      this.cache.set(k, hit);
+      this.remember(k, hit);
       return hit;
     }
     this.stats.readMisses++;
     const row = this.sql.exec<{ data: ArrayBuffer }>("SELECT data FROM fs_block WHERE path = ? AND n = ?", path, n).toArray()[0];
     if (!row) {
       const b = this.base.get(path);
-      if (b && n * BLOCK < b.size) {
+      if (b && n * this.bs < b.size) {
         // Still in the template image: Postgres gets an I/O error for this statement; the object
         // fetches the block and runs the statement again.
         this.missing.add(k);
@@ -174,21 +183,16 @@ export class SqliteFS extends BaseFilesystem {
       if (this.dirtyBytes > this.cacheLimit / 2) this.flush();
       for (const [ck, cb] of this.cache) {
         if (this.cacheBytes <= this.cacheLimit * 0.8) break;
-        if (this.dirty.has(ck)) continue; // dirty blocks stay until flushed (bounded by DIRTY_LIMIT)
+        if (ck === k || this.dirty.has(ck)) continue; // dirty blocks stay until flushed (bounded by DIRTY_LIMIT)
         this.cache.delete(ck);
         this.cacheBytes -= cb.length;
       }
     }
   }
   private dropBlocks(path: string, from = 0) {
-    for (const k of [...this.cache.keys()]) {
-      if (!k.startsWith(`${path}\0`)) continue;
-      if (Number(k.slice(path.length + 1)) < from) continue;
-      const len = this.cache.get(k)!.length;
-      this.cacheBytes -= len;
-      this.cache.delete(k);
-      if (this.dirty.delete(k)) this.dirtyBytes -= len;
-    }
+    const mine = (k: string) => k.startsWith(`${path}\0`) && Number(k.slice(path.length + 1)) >= from;
+    for (const [k, b] of [...this.cache]) if (mine(k)) (this.cacheBytes -= b.length), this.cache.delete(k);
+    for (const [k, b] of [...this.dirty]) if (mine(k)) (this.dirtyBytes -= b.length), this.dirty.delete(k);
     this.sql.exec("DELETE FROM fs_block WHERE path = ? AND n >= ?", path, from);
   }
   private flushNodes() {
@@ -201,11 +205,10 @@ export class SqliteFS extends BaseFilesystem {
     this.dirtyNodes.clear();
   }
 
-  private markDirty(k: string, len: number) {
-    if (!this.dirty.has(k)) {
-      this.dirty.add(k);
-      this.dirtyBytes += len;
-    }
+  private markDirty(k: string, b: Uint8Array) {
+    const old = this.dirty.get(k);
+    this.dirtyBytes += b.length - (old?.length ?? 0);
+    this.dirty.set(k, b);
     if (this.dirtyBytes > DIRTY_LIMIT) this.flush();
   }
 
@@ -213,9 +216,7 @@ export class SqliteFS extends BaseFilesystem {
   flush() {
     if (!this.dirty.size && !this.dirtyNodes.size) return;
     this.stats.flushes++;
-    for (const k of this.dirty) {
-      const b = this.cache.get(k);
-      if (!b) continue;
+    for (const [k, b] of this.dirty) {
       const i = k.indexOf("\0");
       this.sql.exec("INSERT OR REPLACE INTO fs_block (path, n, data) VALUES (?, ?, ?)", k.slice(0, i), Number(k.slice(i + 1)), b);
       this.stats.rowsWritten++;
@@ -287,7 +288,7 @@ export class SqliteFS extends BaseFilesystem {
     const end = Math.min(n.size, position + length);
     let done = 0;
     for (let pos = position; pos < end; ) {
-      const bn = Math.floor(pos / BLOCK), bo = pos % BLOCK, take = Math.min(BLOCK - bo, end - pos);
+      const bn = Math.floor(pos / this.bs), bo = pos % this.bs, take = Math.min(this.bs - bo, end - pos);
       const b = this.block(p, bn);
       const dst = buffer.subarray(offset + done, offset + done + take);
       if (b && bo < b.length) {
@@ -335,7 +336,7 @@ export class SqliteFS extends BaseFilesystem {
   truncate(path: string, len: number) {
     const p = norm(path);
     const n = this.node(p);
-    const keep = Math.ceil(len / BLOCK);
+    const keep = Math.ceil(len / this.bs);
     const bb = this.base.get(p);
     if (bb && len === 0) this.unbase(p);
     else if (bb && len < bb.size) {
@@ -343,12 +344,12 @@ export class SqliteFS extends BaseFilesystem {
       this.sql.exec("UPDATE fs_base SET size = ? WHERE path = ?", len, p);
     }
     this.dropBlocks(p, keep);
-    if (len % BLOCK && keep > 0) {
+    if (len % this.bs && keep > 0) {
       const last = this.block(p, keep - 1);
-      if (last && last.length > len % BLOCK) {
-        const t = last.slice(0, len % BLOCK);
+      if (last && last.length > len % this.bs) {
+        const t = last.slice(0, len % this.bs);
         this.remember(this.key(p, keep - 1), t);
-        this.markDirty(this.key(p, keep - 1), t.length);
+        this.markDirty(this.key(p, keep - 1), t);
       }
     }
     this.putNode(p, { ...n, size: len, mtime: Date.now() });
@@ -385,17 +386,17 @@ export class SqliteFS extends BaseFilesystem {
     const src = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     let done = 0;
     while (done < length) {
-      const pos = position + done, bn = Math.floor(pos / BLOCK), bo = pos % BLOCK, take = Math.min(BLOCK - bo, length - done);
+      const pos = position + done, bn = Math.floor(pos / this.bs), bo = pos % this.bs, take = Math.min(this.bs - bo, length - done);
       const k = this.key(p, bn);
       let b = this.block(p, bn) ?? new Uint8Array(0);
       if (b.length < bo + take) {
-        const grown = new Uint8Array(Math.min(BLOCK, bo + take));
+        const grown = new Uint8Array(Math.min(this.bs, bo + take));
         grown.set(b);
         b = grown;
       } else if (!this.dirty.has(k)) b = b.slice(); // don't mutate a buffer SQLite handed us
       b.set(src.subarray(offset + done, offset + done + take), bo);
       this.remember(k, b);
-      this.markDirty(k, b.length);
+      this.markDirty(k, b);
       done += take;
     }
     const size = Math.max(n.size, position + length);
