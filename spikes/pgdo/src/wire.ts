@@ -33,6 +33,8 @@ export interface WireHost {
   /** Run raw protocol messages (the host may retry them, e.g. after fetching lazy pages, when
    *  the batch started outside a transaction). */
   exec(bytes: Uint8Array, idle: boolean): Promise<Uint8Array>;
+  /** Throw the running Postgres away (it reported FATAL/PANIC); the next use boots it again. */
+  restart(): Promise<void>;
   gate: Gate;
 }
 
@@ -151,7 +153,9 @@ function msg(type: string, ...body: Uint8Array[]) {
 const readyForQuery = (status: string) => msg("Z", enc.encode(status));
 const commandComplete = (tag: string) => msg("C", cstr(tag));
 
-export function errorResponse(f: { severity?: string; code?: string; message: string; detail?: string; hint?: string; where?: string; position?: string }) {
+type Fields = { severity?: string; code?: string; message: string; detail?: string; hint?: string; where?: string; position?: string };
+
+export function errorResponse(f: Fields, type = "E") {
   const sev = f.severity ?? "ERROR";
   const fields: Uint8Array[] = [enc.encode("S"), cstr(sev), enc.encode("V"), cstr(sev), enc.encode("C"), cstr(f.code ?? "XX000"), enc.encode("M"), cstr(f.message)];
   if (f.detail) fields.push(enc.encode("D"), cstr(f.detail));
@@ -159,7 +163,21 @@ export function errorResponse(f: { severity?: string; code?: string; message: st
   if (f.position) fields.push(enc.encode("P"), cstr(f.position));
   if (f.where) fields.push(enc.encode("W"), cstr(f.where));
   fields.push(new Uint8Array([0]));
-  return msg("E", ...fields);
+  return msg(type, ...fields);
+}
+
+/** Whether a response carries a FATAL or PANIC error (a real backend would have exited). */
+function fatalIn(r: Uint8Array): boolean {
+  const dv = new DataView(r.buffer, r.byteOffset, r.byteLength);
+  for (let i = 0; i + 5 <= r.length; ) {
+    const len = dv.getInt32(i + 1);
+    if (r[i] === 69 /* E */) {
+      const s = dec.decode(r.subarray(i + 5, Math.min(i + 1 + len, i + 32)));
+      if (/^S(FATAL|PANIC)\0/.test(s)) return true;
+    }
+    i += 1 + len;
+  }
+  return false;
 }
 
 /** The transaction status in the last ReadyForQuery of a response, if any. */
@@ -181,9 +199,10 @@ function readCstr(b: Uint8Array, at: number): [string, number] {
 }
 
 const RESET_AUTH = /\b(?:reset\s+session\s+authorization|set\s+session\s+authorization\s+default)\b/i;
-const COPY_STDIN = /^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*copy\b[\s\S]*?\bfrom\s+stdin\b/i;
+// (psql accepts COPY … FROM STDOUT as a synonym)
+const COPY_STDIN = /^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*copy\b[\s\S]*?\bfrom\s+std(?:in|out)\b/i;
 /** COPY … FROM STDIN anywhere in a query (PGlite's raw protocol exits on it). */
-const COPY_STDIN_ANYWHERE = /\bcopy\b[^;]*?\bfrom\s+stdin\b/i;
+const COPY_STDIN_ANYWHERE = /\bcopy\b[^;]*?\bfrom\s+std(?:in|out)\b/i;
 const MAYBE_SET = /\b(set|reset|set_config|discard)\b|\bsession\s+authorization\b/i;
 const BATCH_END = new Set(["S", "Q", "H", "X", "F", "c", "f"]);
 const PARAMS_REPORTED = ["server_version", "server_encoding", "client_encoding", "DateStyle", "IntervalStyle", "TimeZone", "integer_datetimes", "standard_conforming_strings", "is_superuser", "session_authorization", "application_name", "default_transaction_read_only", "in_hot_standby", "search_path", "scram_iterations"];
@@ -326,7 +345,7 @@ export class WireConn {
           return this.send(readyForQuery(await this.status()));
         }
         // same length and case as the original, so error positions still point at the right place
-        this.copy = { sql: sql.replace(/\b(from)(\s+)stdin\b/i, (_m, f: string, sp: string) => `${f}${sp}'/b' `), data: [] };
+        this.copy = { sql: sql.replace(/\b(from)(\s+)(std(?:in|out))\b/i, (_m, f: string, sp: string, w: string) => `${f}${sp}${"'/b'".padEnd(w.length)}`), data: [] };
         this.state = "copyin";
         return this.send(msg("G", new Uint8Array([0]), int16(0)));
       }
@@ -346,9 +365,17 @@ export class WireConn {
     const gate = this.host.gate;
     const params = await gate.run(this, async () => {
       const pg = await this.host.pg();
-      await gate.switchTo(pg, this);
-      const r = await pg.query<{ name: string; setting: string }>("select name, setting from pg_settings where name = any($1)", [PARAMS_REPORTED]);
-      return r.rows;
+      try {
+        await gate.switchTo(pg, this);
+        const r = await pg.query<{ name: string; setting: string }>("select name, setting from pg_settings where name = any($1)", [PARAMS_REPORTED]);
+        return r.rows;
+      } catch (e) {
+        if (/FATAL|PANIC/.test(String((e as { severity?: string }).severity))) {
+          await this.host.restart();
+          gate.sessionOwner = null;
+        }
+        throw e;
+      }
     });
     const out: Uint8Array[] = [msg("R", int32(0))];
     for (const p of params) {
@@ -370,9 +397,11 @@ export class WireConn {
   /** RESET (or SET … TO DEFAULT) of a startup setting goes back to the startup value, as it
    *  would in a real backend; RESET ALL re-applies them all (simple protocol only). */
   private fixReset(sql: string, simple: boolean) {
-    if (!this.startupSettings.size || !/\b(reset|default)\b/i.test(sql)) return sql;
+    if (!this.startupSettings.size || !/\b(reset|default|local)\b/i.test(sql)) return sql;
     const value = (name: string) => this.startupSettings.get(name.toLowerCase());
-    let out = sql.replace(/\b(set\s+(?:local\s+|session\s+)?)("?)([\w.]+)\2(\s*(?:to|=)\s*)default\b/gi, (m, set: string, _q, name: string, to: string) => {
+    const tz = value("timezone");
+    let out = tz === undefined ? sql : sql.replace(/\breset\s+time\s+zone\b/gi, `SET TIME ZONE ${quoteLiteral(tz)}`).replace(/\b(set\s+(?:local\s+|session\s+)?time\s+zone\s+)(?:default|local)\b/gi, (_m, set: string) => `${set}${quoteLiteral(tz)}`);
+    out = out.replace(/\b(set\s+(?:local\s+|session\s+)?)("?)([\w.]+)\2(\s*(?:to|=)\s*)default\b/gi, (m, set: string, _q, name: string, to: string) => {
       const v = value(name);
       return v === undefined ? m : `${set}${name}${to}${quoteLiteral(v)}`;
     });
@@ -489,10 +518,21 @@ export class WireConn {
       }
       this.used = true;
       const out = this.unrename(await this.host.exec(batch, gate.txOwner !== this));
+      if (fatalIn(out)) {
+        // the backend is done for: everyone reconnects to a fresh one, as after a backend exit
+        await this.host.restart();
+        gate.txOwner = null;
+        gate.sessionOwner = null;
+        this.send(out);
+        this.hangup();
+        void this.end();
+        return new Uint8Array(0);
+      }
       const st = lastStatus(out);
       if (st === "T" || st === "E") gate.txOwner = this;
       else if (st === "I" && gate.txOwner === this) gate.txOwner = null;
-      return this.reportChanges(pg, out);
+      // (not inside the client's transaction: a query there could change its outcome)
+      return st === "I" ? this.reportChanges(pg, out) : out;
     });
     if (r.length) this.send(r);
   }
@@ -515,8 +555,9 @@ export class WireConn {
       if (failed !== null) reply = errorResponse({ code: "57014", message: `COPY from stdin failed: ${failed}` });
       else {
         try {
-          const r = await pg.query(sql, [], { blob: new Blob([concat(data)]) });
-          reply = commandComplete(`COPY ${r.affectedRows ?? 0}`);
+          const notices: Uint8Array[] = [];
+          const r = await this.copyAsUser(pg, sql, new Blob([concat(data)]), (n) => notices.push(errorResponse({ ...n, severity: n.severity ?? "NOTICE" } as Fields, "N")));
+          reply = concat([...notices, commandComplete(`COPY ${r.affectedRows ?? 0}`)]);
         } catch (e) {
           const d = e as { message?: string; code?: string; detail?: string; hint?: string; where?: string; position?: string; severity?: string };
           reply = errorResponse({ message: d.message ?? String(e), code: d.code, detail: d.detail, hint: d.hint, where: d.where, position: d.position, severity: d.severity });
@@ -530,6 +571,31 @@ export class WireConn {
       return concat([reply, readyForQuery(st)]);
     });
     this.send(out);
+  }
+
+  /** Run the COPY as the client's own role. PGlite reads the data through a server-side path,
+   *  which needs pg_read_server_files; a role without it gets it for this one statement (granted
+   *  and revoked around it, inside the client's transaction if there is one, so a rollback takes
+   *  both back). Table privileges and row security are still checked as the client. */
+  private async copyAsUser(pg: PGlite, sql: string, blob: Blob, onNotice: (n: Fields) => void) {
+    let who: { s: string; c: string; can: boolean } | undefined;
+    try {
+      who = (await pg.query<{ s: string; c: string; can: boolean }>("select session_user::text s, current_user::text c, pg_has_role(current_user, 'pg_read_server_files', 'USAGE') can")).rows[0];
+    } catch {} // an aborted transaction: let the COPY itself report it
+    if (!who || who.can) return pg.query(sql, [], { blob, onNotice: onNotice as never });
+    const as = async () => {
+      await pg.exec(`SET SESSION AUTHORIZATION ${quoteIdent(who!.s)}`);
+      if (who!.c !== who!.s) await pg.exec(`SET ROLE ${quoteIdent(who!.c)}`);
+    };
+    await pg.exec(`SET SESSION AUTHORIZATION ${SUPERUSER}; GRANT pg_read_server_files TO ${quoteIdent(who.c)}`);
+    await as();
+    try {
+      return await pg.query(sql, [], { blob, onNotice: onNotice as never });
+    } finally {
+      // (inside an aborted transaction these fail; the client's rollback undoes the grant)
+      await pg.exec(`SET SESSION AUTHORIZATION ${SUPERUSER}; REVOKE pg_read_server_files FROM ${quoteIdent(who.c)}`).catch(() => {});
+      await as().catch(() => {});
+    }
   }
 
   /** The client went away: roll back what it left open, drop what it named. */

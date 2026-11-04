@@ -5,7 +5,7 @@
 # native: a real Postgres 18.6 on :6545 (the baseline: what fails here fails anywhere).
 # A test that runs past the timeout is killed and recorded as "hang"; the backend is restarted
 # (it recovers from its storage) and the run continues. Results: <outdir>/results.json, diffs/.
-import json, os, re, shutil, signal, subprocess, sys, time, urllib.request
+import json, os, re, shutil, signal, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPIKE = os.path.dirname(os.path.dirname(HERE))
@@ -15,7 +15,7 @@ mode, out = sys.argv[1], os.path.abspath(sys.argv[2])
 start_at = sys.argv[3] if len(sys.argv) > 3 else None
 env_file = open(os.path.join(SPIKE, "..", "..", ".env")).read()
 TOKEN = re.search(r"^PGDO_TOKEN=(.*)$", env_file, re.M).group(1).strip()
-TIMEOUT = 240 if mode != "do" else 420
+TIMEOUT = 90 if mode != "do" else 420
 port, password = {"local": (6544, "local"), "do": (6543, TOKEN), "native": (6545, "")}[mode]
 DB = "regression" if mode == "local" else os.environ.get("REGRESS_DB", "regression")
 
@@ -32,9 +32,7 @@ def start_local():
 
 def restart():
     if mode == "local": return start_local()
-    req = urllib.request.Request(f"https://pagedb-pg-spike.do-pool-lab.workers.dev/evict?db={DB}", headers={"Authorization": f"Bearer {TOKEN}"})
-    try: urllib.request.urlopen(req, timeout=60).read()
-    except Exception as e: print("  evict:", e)
+    subprocess.run(["curl", "-s", "-m", "60", "-H", f"Authorization: Bearer {TOKEN}", f"https://pagedb-pg-spike.do-pool-lab.workers.dev/evict?db={DB}"], capture_output=True)
     time.sleep(3)
 
 tests = []

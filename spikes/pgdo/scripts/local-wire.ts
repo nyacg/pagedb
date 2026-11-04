@@ -56,6 +56,11 @@ function host(name: string): WireHost {
       gate: new Gate(),
       pg: () => (pg ??= boot(name)),
       checkPassword: async (_u, p) => p === password,
+      restart: async () => {
+        const old = pg;
+        pg = undefined;
+        await (await old)?.close().catch(() => {});
+      },
       exec: async (bytes) =>
         (await pg!).execProtocolRaw(bytes).catch((e) => {
           // Postgres exited (a PGlite bug path): boot it again next time

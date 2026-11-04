@@ -125,6 +125,15 @@ export class PgObject extends DurableObject<Env> {
       },
       checkPassword: (_user, password) => sameSecret(password, this.env.PGDO_TOKEN),
       exec: (bytes, idle) => this.execRaw(bytes, idle),
+      restart: async () => {
+        const pg = this.pg;
+        running.delete(this);
+        this.pg = undefined;
+        this.fs = undefined;
+        this.gate.txOwner = null;
+        this.gate.sessionOwner = null;
+        await pg?.close().catch(() => {});
+      },
     });
   }
 
