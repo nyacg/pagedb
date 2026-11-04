@@ -3,17 +3,20 @@
 import "./no-node";
 import "./shims";
 import "./libs";
+import { contrib } from "./exts";
 import { DurableObject } from "cloudflare:workers";
 import { PGlite } from "@electric-sql/pglite";
 import pgliteWasm from "../vendor/pglite.wasm";
 import initdbWasm from "../vendor/initdb.wasm";
 import fsBundle from "../vendor/pglite.data";
 import { SqliteFS, type ImageIndex } from "./sqlitefs";
+import { CHECKS, runCheck } from "./compat";
+import { explain, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
 
 /** Template images (scripts/mkimage.mjs): pgspike/img/<name>.json (the index) and .blob (PGDATA). */
 const IMG = (name: string) => `pgspike/img/${name}`;
 
-interface Env { PG: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket }
+interface Env { PG: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string }
 
 export class PgObject extends DurableObject<Env> {
   private pg?: PGlite;
@@ -40,6 +43,7 @@ export class PgObject extends DurableObject<Env> {
       pgliteWasmModule: pgliteWasm,
       initdbWasmModule: initdbWasm,
       fsBundle: new Blob([fsBundle]),
+      extensions: { contrib },
       // A Durable Object has 128 MB in all: start the wasm heap at 32 MB (the binary is patched to
       // allow it); Postgres's own buffers are set small in the template's postgresql.conf.
       initialMemory: 32 * 1024 * 1024,
@@ -80,6 +84,23 @@ export class PgObject extends DurableObject<Env> {
     } catch (e) {
       return { error: String((e as Error).stack ?? e).slice(0, 2000), ...this.mem() };
     }
+  }
+
+  /** One statement with parameters (RPC). */
+  async q(sql: string, params: unknown[] = []) {
+    await this.ensure();
+    return (await this.run(() => this.pg!.query(sql, params))).r.rows;
+  }
+
+  /** Several statements as one transaction (RPC). */
+  async tx(stmts: Stmt[]) {
+    await this.ensure();
+    const { r } = await this.run(() => this.pg!.transaction(async (t) => {
+      const out: unknown[][] = [];
+      for (const s of stmts) out.push((await t.query(s.sql, s.params ?? [])).rows);
+      return out;
+    }));
+    return r;
   }
 
   /** n single-statement transactions (each synced to SQLite), for throughput. */
@@ -127,6 +148,10 @@ export class PgObject extends DurableObject<Env> {
   }
 }
 
+function doTarget(stub: DurableObjectStub<PgObject>, name: string): Target {
+  return { name, q: (sql, params) => stub.q(sql, params) as Promise<unknown[]>, tx: (stmts) => stub.tx(stmts) as Promise<unknown[][]> };
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -136,7 +161,24 @@ export default {
     if (url.pathname === "/sql") r = await stub.exec(req.method === "POST" ? await req.text() : (url.searchParams.get("q") ?? "select 1"), url.searchParams.get("image") ?? undefined);
     else if (url.pathname === "/bench") r = await stub.bench(url.searchParams.get("kind") ?? "update", Number(url.searchParams.get("n") ?? 200));
     else if (url.pathname === "/reset") r = await stub.reset();
-    else if (url.pathname === "/env") r = { jspi: { Suspending: typeof (WebAssembly as any).Suspending, promising: typeof (WebAssembly as any).promising }, typeReflection: typeof (WebAssembly as any).Function };
+    else if (url.pathname === "/vs") {
+      // Same workload on Neon and on a PgObject, timed in this Worker.
+      //   /vs?target=neon|do&op=read&n=100[&db=bench][&hint=enam]   /vs?target=…&setup=1
+      const which = url.searchParams.get("target") ?? "do";
+      const name = url.searchParams.get("db") ?? "bench";
+      const hint = url.searchParams.get("hint") as DurableObjectLocationHint | null;
+      const t: Target = which === "neon" ? neonTarget(env.NEON_DATABASE_URL) : doTarget(hint ? env.PG.get(env.PG.idFromName(name), { locationHint: hint }) : env.PG.getByName(name), `do:${name}`);
+      if (url.searchParams.has("compat")) {
+        const only = url.searchParams.get("compat");
+        const out = [];
+        for (const name of only ? only.split(",") : Object.keys(CHECKS)) out.push(await runCheck(t, name));
+        r = { target: t.name, checks: out };
+      } else if (url.searchParams.has("explain")) r = await explain(t, url.searchParams.get("explain")!, Number(url.searchParams.get("n") ?? 5));
+      else if (url.searchParams.has("setup")) {
+        for (const s of SETUP) await t.q(s.sql, s.params);
+        r = { ok: true, target: t.name, setupMs: Date.now() - t0 };
+      } else r = await runOps(t, url.searchParams.get("op") ?? "read", Number(url.searchParams.get("n") ?? 50));
+    } else if (url.pathname === "/env") r = { jspi: { Suspending: typeof (WebAssembly as any).Suspending, promising: typeof (WebAssembly as any).promising }, typeReflection: typeof (WebAssembly as any).Function };
     else if (url.pathname === "/evict") r = await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true }));
     else return new Response("pgdo spike: /sql?q=…[&image=hn150] | /bench?kind=update|read|tpcb&n=… | /evict | /reset   (&db=name)");
     return Response.json({ ...(r as object), workerMs: Date.now() - t0 });

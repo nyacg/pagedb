@@ -4,10 +4,18 @@
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/patch-pglite.mjs",
-    "vendor": "cp node_modules/@electric-sql/pglite/dist/initdb.wasm node_modules/@electric-sql/pglite/dist/pglite.data vendor/ && node scripts/patch-wasm-memory.mjs node_modules/@electric-sql/pglite/dist/pglite.wasm vendor/pglite.wasm 512 && node scripts/extract-libs.mjs",
+    "vendor": "cp node_modules/@electric-sql/pglite/dist/initdb.wasm node_modules/@electric-sql/pglite/dist/pglite.data vendor/ && node scripts/patch-wasm-memory.mjs node_modules/@electric-sql/pglite/dist/pglite.wasm vendor/pglite.wasm 512 && node scripts/extract-libs.mjs && node scripts/extract-exts.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },
-  "dependencies": { "@electric-sql/pglite": "0.5.15" },
-  "devDependencies": { "wrangler": "^4", "@cloudflare/workers-types": "^5.20261103.1", "typescript": "^5" }
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.15",
+    "@electric-sql/pglite-pgvector": "^0.0.16",
+    "@neondatabase/serverless": "^1.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261103.1",
+    "typescript": "^5",
+    "wrangler": "^4"
+  }
 }
