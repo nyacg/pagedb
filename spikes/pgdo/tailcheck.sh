@@ -3,7 +3,8 @@
 cd "$(dirname "$0")"
 (./deploy.sh tail --format json > /tmp/vf/pgtail.jsonl 2>/dev/null &)
 sleep 8
-curl -s -m 180 "$@" | head -c 400; echo
+TOKEN=$(grep -E '^PGDO_TOKEN=' ../../.env | cut -d= -f2-)
+curl -s -m 180 -H "Authorization: Bearer $TOKEN" "$@" | head -c 400; echo
 sleep 8
 pkill -f "wrangler tail"
 python3 - <<'PY'

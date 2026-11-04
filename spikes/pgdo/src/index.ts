@@ -1,6 +1,7 @@
 // Postgres in a Durable Object: PGlite (Postgres compiled to WebAssembly) with PGDATA in the
 // object's own SQLite (src/sqlitefs.ts). A new database starts from a template PGDATA in R2.
 import "./no-node";
+import "./clock";
 import "./shims";
 import "./libs";
 import { contrib } from "./exts";
@@ -11,6 +12,7 @@ import initdbWasm from "../vendor/initdb.wasm";
 import fsBundle from "../vendor/pglite.data";
 import { SqliteFS, type ImageIndex } from "./sqlitefs";
 import { CHECKS, runCheck } from "./compat";
+import { Gate, WireConn, type WireHost } from "./wire";
 import { explain, load, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
 
 /** Template images (scripts/mkimage.mjs): pgspike/img/<name>.json (the index) and .blob (PGDATA). */
@@ -18,13 +20,21 @@ const IMG = (name: string) => `pgspike/img/${name}`;
 
 /** Objects of one class can share an isolate (and its 128 MB): which isolate, and who's in it. */
 // PGlite's own start parameters (its defaultStartParams), to which we add memory settings.
-const START = ["--single", "-F", "-O", "-j", "-c", "search_path=public", "-c", "exit_on_error=false", "-c", "log_checkpoints=false", "-c", "max_worker_processes=0", "-c", "max_parallel_workers=0", "-c", "max_parallel_workers_per_gather=0", "-c", "io_method=sync", "-c", "max_parallel_maintenance_workers=0"];
+const START = ["--single", "-F", "-O", "-j", "-c", "search_path=public", "-c", "exit_on_error=false", "-c", "log_checkpoints=false", "-c", "max_worker_processes=0", "-c", "max_parallel_workers=0", "-c", "max_parallel_workers_per_gather=0", "-c", "io_method=sync", "-c", "max_parallel_maintenance_workers=0", "-c", "timezone=UTC"];
 // Shared memory is sized for max_connections backends; PGlite is one.
 const SMALL_SHMEM = ["-c", "max_connections=4", "-c", "max_wal_senders=0", "-c", "max_replication_slots=0", "-c", "max_prepared_transactions=0", "-c", "max_locks_per_transaction=64", "-c", "autovacuum_worker_slots=1"];
 let isolate: string | undefined; // named on first use (no randomness at global scope)
 const running = new Set<PgObject>();
 
-interface Env { PG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string }
+interface Env { PG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string; PGDO_TOKEN: string }
+
+/** Constant-time comparison of a presented secret with the expected one. */
+export async function sameSecret(given: string | null | undefined, expected: string | undefined) {
+  if (!given || !expected) return false;
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([crypto.subtle.digest("SHA-256", enc.encode(given)), crypto.subtle.digest("SHA-256", enc.encode(expected))]);
+  return crypto.subtle.timingSafeEqual(a, b);
+}
 
 export class PgObject extends DurableObject<Env> {
   pg?: PGlite;
@@ -62,26 +72,125 @@ export class PgObject extends DurableObject<Env> {
       startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=4MB", ...SMALL_SHMEM],
     });
     running.add(this);
+    this.writeExtraFiles();
     return st;
+  }
+
+  // ---------------------------------------------------------------- the wire protocol
+
+  /** Everything that touches Postgres goes through here: wire clients and the HTTP routes. */
+  private readonly gate = new Gate();
+  private wireHost?: WireHost;
+
+  /** A Postgres wire connection, carried over a WebSocket (scripts/pgdo-proxy.mjs bridges TCP). */
+  override async fetch(req: Request) {
+    if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("expected a websocket", { status: 426 });
+    const { 0: client, 1: server } = new WebSocketPair();
+    server.accept();
+    server.binaryType = "arraybuffer"; // the standard default (newer compatibility dates) is Blob
+    const send = (b: Uint8Array) => {
+      // keep each WebSocket message well under the 1 MiB limit; the client sees one byte stream
+      for (let i = 0; i < b.length; i += 1 << 19) server.send(b.subarray(i, i + (1 << 19)));
+    };
+    const conn = new WireConn(this.host(), send, () => {
+      try {
+        server.close(1000, "bye");
+      } catch {}
+    });
+    server.addEventListener("message", (e) => conn.feed(typeof e.data === "string" ? new TextEncoder().encode(e.data) : new Uint8Array(e.data as ArrayBuffer)));
+    server.addEventListener("close", () => void conn.end());
+    server.addEventListener("error", () => void conn.end());
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private host(): WireHost {
+    return (this.wireHost ??= {
+      gate: this.gate,
+      pg: async () => {
+        await this.ensure();
+        return this.pg!;
+      },
+      checkPassword: (_user, password) => sameSecret(password, this.env.PGDO_TOKEN),
+      exec: (bytes, idle) => this.execRaw(bytes, idle),
+    });
+  }
+
+  /** Raw protocol messages. A batch that read a page still in the template image is rolled back
+   *  and run again once the page is fetched, if it started outside a transaction block. */
+  private async execRaw(bytes: Uint8Array, idle: boolean) {
+    for (let round = 0; ; round++) {
+      const out = await this.pg!.execProtocolRaw(bytes).catch((e) => this.died(e));
+      if (!this.fs!.missing.size) return out;
+      if (!idle || round >= 80) {
+        this.fs!.missing.clear();
+        return out;
+      }
+      await this.pg!.exec("ROLLBACK").catch(() => {});
+      await this.fetchMissing();
+    }
+  }
+
+  /** Postgres exited (a PGlite bug path): forget the instance, so the next request boots it again
+   *  from SQLite (crash recovery), and fail this one. */
+  private died(e: unknown): never {
+    if ((e as { name?: string })?.name === "ExitStatus" || /exit\(/.test(String((e as Error)?.message))) {
+      running.delete(this);
+      this.pg = undefined;
+      this.fs = undefined;
+      this.gate.txOwner = null;
+      this.gate.sessionOwner = null;
+    }
+    throw e;
+  }
+
+  private fetchMissing() {
+    const image = this.ctx.storage.kv.get<string>("image") ?? "base";
+    return this.fs!.fetchMissing(async (offset, length) => (await (await this.env.BUCKET.get(`${IMG(image)}.blob`, { range: { offset, length } }))!.arrayBuffer()));
+  }
+
+  /** Files outside PGDATA that server-side COPY should see (pg_regress's data files), kept in
+   *  SQLite and written into the in-memory filesystem at every boot (RPC). An entry without
+   *  data is a directory. */
+  async putFiles(files: [string, string | null][]) {
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS extra_files (path TEXT PRIMARY KEY, data BLOB)");
+    for (const [path, b64] of files) this.ctx.storage.sql.exec("INSERT OR REPLACE INTO extra_files (path, data) VALUES (?, ?)", path, b64 === null ? null : Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+    this.writeExtraFiles();
+    return { files: files.length };
+  }
+
+  private writeExtraFiles() {
+    const FS = (this.pg as any)?.mod?.FS;
+    if (!FS) return;
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS extra_files (path TEXT PRIMARY KEY, data BLOB)");
+    for (const r of this.ctx.storage.sql.exec<{ path: string; data: ArrayBuffer | null }>("SELECT path, data FROM extra_files ORDER BY path")) {
+      if (r.data === null) FS.mkdirTree(r.path);
+      else {
+        FS.mkdirTree(r.path.slice(0, r.path.lastIndexOf("/")));
+        FS.writeFile(r.path, new Uint8Array(r.data));
+      }
+    }
   }
 
   /** Run SQL; a read of a block still in the template image fails the statement, so fetch what
    *  it was missing and run it again (rolled back first: the whole request retries). */
-  private async run<T>(f: () => Promise<T>) {
-    const image = this.ctx.storage.kv.get<string>("image") ?? "base";
-    let rounds = 0;
-    const t0 = Date.now();
-    for (;;) {
-      try {
-        const r = await f();
-        return { r, faultRounds: rounds, faultMs: rounds ? Date.now() - t0 : 0 };
-      } catch (e) {
-        if (!this.fs!.missing.size || rounds >= 80) throw e;
-        rounds++;
-        await this.pg!.exec("ROLLBACK").catch(() => {});
-        await this.fs!.fetchMissing(async (offset, length) => (await (await this.env.BUCKET.get(`${IMG(image)}.blob`, { range: { offset, length } }))!.arrayBuffer()));
+  private run<T>(f: () => Promise<T>) {
+    // in turn with wire clients (never inside one's transaction), with default session settings
+    return this.gate.run({}, async () => {
+      await this.gate.switchTo(this.pg!, null);
+      let rounds = 0;
+      const t0 = Date.now();
+      for (;;) {
+        try {
+          const r = await f();
+          return { r, faultRounds: rounds, faultMs: rounds ? Date.now() - t0 : 0 };
+        } catch (e) {
+          if (!this.fs!.missing.size || rounds >= 80) throw e;
+          rounds++;
+          await this.pg!.exec("ROLLBACK").catch(() => {});
+          await this.fetchMissing();
+        }
       }
-    }
+    });
   }
 
   /** This object's isolate and the Postgres instances running in it (RPC). */
@@ -216,12 +325,18 @@ function doTarget(stub: DurableObjectStub<PgObject>, name: string): Target & { s
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    // Postgres wire connections authenticate inside the protocol (password = the token).
+    if (url.pathname === "/wire") return env.PG.getByName(url.searchParams.get("db") || "postgres").fetch(req);
+    // Everything else runs arbitrary SQL (and some routes reach Neon): bearer token required.
+    const auth = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    if (!(await sameSecret(auth, env.PGDO_TOKEN))) return new Response("unauthorized", { status: 401 });
     const stub = env.PG.getByName(url.searchParams.get("db") ?? "spike");
     const t0 = Date.now();
     let r: unknown;
     if (url.pathname === "/sql") r = await stub.exec(req.method === "POST" ? await req.text() : (url.searchParams.get("q") ?? "select 1"), url.searchParams.get("image") ?? undefined);
     else if (url.pathname === "/bench") r = await stub.bench(url.searchParams.get("kind") ?? "update", Number(url.searchParams.get("n") ?? 200));
     else if (url.pathname === "/reset") r = await stub.reset();
+    else if (url.pathname === "/files") r = await stub.putFiles(await req.json());
     else if (url.pathname === "/config") r = await stub.configure({ cacheMB: Number(url.searchParams.get("cacheMB") ?? 4), sharedBuffers: url.searchParams.get("sharedBuffers") ?? "4MB" });
     else if (url.pathname === "/vs") {
       // Same workload on Neon and on a PgObject, timed in this Worker.

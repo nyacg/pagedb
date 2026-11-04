@@ -16,8 +16,13 @@ for (const f of readdirSync(dist).filter((f) => f.endsWith(".js"))) {
   // Side modules (plpgsql.so, …): Postgres dlopens them and Emscripten compiles their bytes. Swap in
   // the precompiled module for that library first (src/libs.ts, from scripts/extract-libs.mjs).
   out = out.replace(/loadWebAssemblyModule=\((\w+),(\w+),(\w+),(\w+),(\w+)\)=>\{(?!\1=globalThis)/g, (m, bin, flags, lib) => (l++, `${m}${bin}=globalThis.__pgSideModule?.(${lib})??${bin};`));
-  if (n || l) writeFileSync(p, out);
-  console.log(`${f}: ${n} addFunction, ${l} side-module loader patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
+  // Clocks: Workers freeze time while code runs, so a Postgres loop that waits for the clock to
+  // move (pg_sleep) never ends. Let the host substitute both clocks (src/clock.ts).
+  let c = 0;
+  out = out.replace("_emscripten_date_now=()=>Date.now()", () => (c++, "_emscripten_date_now=()=>(globalThis.__pgDateNow??Date.now)()"));
+  out = out.replace("_emscripten_get_now=()=>performance.now()", () => (c++, "_emscripten_get_now=()=>(globalThis.__pgNow??(()=>performance.now()))()"));
+  if (n || l || c) writeFileSync(p, out);
+  console.log(`${f}: ${n} addFunction, ${l} side-module loader, ${c} clocks patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
 }
 // Signature → module bytes, exactly as Emscripten builds them.
 const uleb = (e) => [e.length % 128 | 128, e.length >> 7, ...e];

@@ -1,12 +1,13 @@
 # Drive /load from many Worker invocations at once (a Worker holds ≤6 connections, so 5 clients each).
 #   python3 scripts/load.py <target do|neon> <invocations> <ops> <prefix> [hot]
-import json, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 U = "https://pagedb-pg-spike.do-pool-lab.workers.dev"
+TOKEN = re.search(r"^PGDO_TOKEN=(.*)$", open(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")).read(), re.M).group(1).strip()
 target, n, ops, prefix = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 hot = "".join("&hot=1" if a == "hot" else f"&{a}" for a in sys.argv[5:])  # hot | classes=8
 def one(i):
-    out = subprocess.run(["curl", "-s", "-m", "900", f"{U}/load?target={target}&clients=5&ops={ops}&prefix={prefix}&inv={i}{hot}"], capture_output=True, text=True).stdout
+    out = subprocess.run(["curl", "-s", "-m", "900", "-H", f"Authorization: Bearer {TOKEN}", f"{U}/load?target={target}&clients=5&ops={ops}&prefix={prefix}&inv={i}{hot}"], capture_output=True, text=True).stdout
     try:
         return json.loads(out)
     except ValueError:

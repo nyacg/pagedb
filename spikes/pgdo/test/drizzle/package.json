@@ -1,0 +1,19 @@
+{
+  "name": "pgdo-drizzle-test",
+  "private": true,
+  "type": "module",
+  "description": "Drizzle, unchanged, against Postgres in a Durable Object (through scripts/pgdo-proxy.mjs)",
+  "scripts": {
+    "migrate": "drizzle-kit migrate",
+    "app": "node --experimental-strip-types app.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.4",
+    "pg": "^8.23.1",
+    "postgres": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11"
+  }
+}
