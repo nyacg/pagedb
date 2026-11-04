@@ -1,6 +1,7 @@
 // Workers can't compile WebAssembly at runtime. Emscripten's addFunction does, for JS callbacks:
 // convertJsFunctionToWasm builds a tiny module whose bytes depend only on the signature. So:
-// 1. rewrite `new WebAssembly.Module(bytes)` there to `globalThis.__pgWasmShim(sig, bytes)`;
+// 1. rewrite `new WebAssembly.Module(bytes)` there to `globalThis.__pgWasmShim(sig, bytes)` (Node,
+//    with no shim installed, still compiles at runtime, so scripts/mkimage.mjs keeps working);
 // 2. emit vendor/shims/<sig>.wasm (the same bytes, precompiled at deploy) and src/shims.ts.
 //   node scripts/patch-pglite.mjs [extra sigs…]
 import { readFileSync, writeFileSync, readdirSync } from "node:fs";
@@ -10,10 +11,13 @@ for (const f of readdirSync(dist).filter((f) => f.endsWith(".js"))) {
   const p = `${dist}/${f}`;
   const s = readFileSync(p, "utf8");
   if (!s.includes("convertJsFunctionToWasm")) continue;
-  let n = 0;
-  const out = s.replace(re, (m, fn, sig, bytes, body, v, mod) => (n++, m.replace(`new WebAssembly.Module(${bytes})`, `globalThis.__pgWasmShim(${sig},${bytes})`)));
-  if (n) writeFileSync(p, out);
-  console.log(`${f}: ${n} patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
+  let n = 0, l = 0;
+  let out = s.replace(re, (m, fn, sig, bytes, body, v, mod) => (n++, m.replace(`new WebAssembly.Module(${bytes})`, `(globalThis.__pgWasmShim??((s,b)=>new WebAssembly.Module(b)))(${sig},${bytes})`)));
+  // Side modules (plpgsql.so, …): Postgres dlopens them and Emscripten compiles their bytes. Swap in
+  // the precompiled module for that library first (src/libs.ts, from scripts/extract-libs.mjs).
+  out = out.replace(/loadWebAssemblyModule=\((\w+),(\w+),(\w+),(\w+),(\w+)\)=>\{(?!\1=globalThis)/g, (m, bin, flags, lib) => (l++, `${m}${bin}=globalThis.__pgSideModule?.(${lib})??${bin};`));
+  if (n || l) writeFileSync(p, out);
+  console.log(`${f}: ${n} addFunction, ${l} side-module loader patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
 }
 // Signature → module bytes, exactly as Emscripten builds them.
 const uleb = (e) => [e.length % 128 | 128, e.length >> 7, ...e];

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/patch-pglite.mjs",
-    "vendor": "cp node_modules/@electric-sql/pglite/dist/initdb.wasm node_modules/@electric-sql/pglite/dist/pglite.data vendor/ && node scripts/patch-wasm-memory.mjs node_modules/@electric-sql/pglite/dist/pglite.wasm vendor/pglite.wasm 512",
+    "vendor": "cp node_modules/@electric-sql/pglite/dist/initdb.wasm node_modules/@electric-sql/pglite/dist/pglite.data vendor/ && node scripts/patch-wasm-memory.mjs node_modules/@electric-sql/pglite/dist/pglite.wasm vendor/pglite.wasm 512 && node scripts/extract-libs.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

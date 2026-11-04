@@ -5,6 +5,8 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": true,
   "observability": { "enabled": true },
+  // Big statements (a 1M-row insert, an index build) run long inside one request.
+  "limits": { "cpu_ms": 300000 },
   "durable_objects": { "bindings": [{ "name": "PG", "class_name": "PgObject" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PgObject"] }],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
