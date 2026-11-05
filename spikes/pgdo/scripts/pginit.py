@@ -1,6 +1,8 @@
 # pgbench -i for a database in a Durable Object, in chunks a request can finish (each chunk is one
 # INSERT … SELECT generate_series; the tables and primary keys are created first).
 #   python3 scripts/pginit.py <db> <scale> [rows per chunk] [first aid]
+# For a primary with page servers, it waits while the unshipped backlog is large (its local
+# SQLite holds what page servers don't have yet).
 import json, os, re, subprocess, sys, time
 U = "https://pagedb-pg-spike.do-pool-lab.workers.dev"
 TOKEN = re.search(r"^PGDO_TOKEN=(.*)$", open(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")).read(), re.M).group(1).strip()
@@ -9,8 +11,17 @@ chunk = int(sys.argv[3]) if len(sys.argv) > 3 else 500000
 start = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 total = 100000 * scale
 t0 = time.time()
+def backlog():
+    out = subprocess.run(["curl", "-s", "-m", "120", "-H", f"Authorization: Bearer {TOKEN}", f"{U}/pagestats?db={db}"], capture_output=True, text=True).stdout
+    try:
+        return json.loads(out)["local"]["unshipped"]
+    except Exception:
+        return 0
+
 for a in range(start, total + 1, chunk):
     b = min(total, a + chunk - 1)
+    while backlog() > 150000:
+        time.sleep(15)
     for attempt in range(5):
         out = subprocess.run(["curl", "-s", "-m", "900", "-H", f"Authorization: Bearer {TOKEN}", f"{U}/pginit?db={db}&scale={scale}&from={a}&to={b}"], capture_output=True, text=True).stdout
         try:

@@ -105,6 +105,7 @@ export class SqliteFS extends BaseFilesystem {
   private window = new Map<string, number>(); // blocks to fetch next time this file misses
   /** Per file: where the last remote fetch ended, and its size (scans continue from there). */
   private remoteNext = new Map<string, [number, number]>();
+  private remoteMisses = new Map<string, number>();
   private nextFd = 3;
   readonly stats = { reads: 0, readMisses: 0, rowsWritten: 0, flushes: 0, faults: 0, fetchedMB: 0, remoteFetches: 0, evicted: 0 };
   private readonly bs: number;
@@ -255,12 +256,20 @@ export class SqliteFS extends BaseFilesystem {
       if (this.mode.kind !== "local" && (this.mode.kind === "replica" || remoteBacked(p))) {
         // Random reads fetch just their block; a miss right where the last fetch ended is a scan,
         // and its window doubles (to a stripe).
+        // A file that keeps missing (a hot table being warmed) fetches whole stripes instead.
         const size = this.nodes.get(p)?.size ?? 0;
         const prev = this.remoteNext.get(p);
-        const w = prev && prev[0] === n0 ? Math.min(prev[1] * 4, SCAN_MAX) : 1;
-        const last = Math.min(Math.ceil(size / this.bs), n0 + w);
+        const misses = (this.remoteMisses.get(p) ?? 0) + 1;
+        this.remoteMisses.set(p, misses);
+        let first = n0, w: number;
+        if (prev && prev[0] === n0) w = Math.min(prev[1] * 4, SCAN_MAX);
+        else if (misses >= 16) {
+          first = n0 - (n0 % STRIPE);
+          w = STRIPE;
+        } else w = 1;
+        const last = Math.min(Math.ceil(size / this.bs), first + w);
         this.remoteNext.set(p, [last, w]);
-        for (let n = n0; n < last; n++) {
+        for (let n = first; n < last; n++) {
           const s = shardOf(p, n, this.mode.shards);
           (byShard.get(s) ?? byShard.set(s, []).get(s)!).push([p, n]);
         }
@@ -334,6 +343,16 @@ export class SqliteFS extends BaseFilesystem {
     this.unlink(path);
     this.flush();
     return true;
+  }
+
+  /** User-data blocks held here (a replica's working set, for warming its successor). */
+  localDataKeys(limit: number) {
+    const out: string[] = [];
+    for (const r of this.sql.exec<{ path: string; n: number }>("SELECT path, n FROM fs_block LIMIT ?", limit * 4)) {
+      if (evictable(r.path)) out.push(`${r.path}\0${r.n}`);
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   /** A whole file from local SQLite (for scanning WAL and the control file before boot). */

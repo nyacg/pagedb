@@ -66,6 +66,16 @@ export function dbStub(env: Env, name: string) {
   return (name.startsWith("big-") ? env.BIG : env.PG).getByName(name);
 }
 
+/** Whether a protocol response carries an "out of memory" error (SQLSTATE 53200). */
+function outOfMemory(r: Uint8Array) {
+  for (let i = 0; i + 5 <= r.length; ) {
+    const len = new DataView(r.buffer, r.byteOffset + i + 1, 4).getInt32(0);
+    if (r[i] === 69 /* E */ && new TextDecoder().decode(r.subarray(i + 5, i + 1 + len)).includes("C53200\0")) return true;
+    i += 1 + len;
+  }
+  return false;
+}
+
 /** Constant-time comparison of a presented secret with the expected one. */
 export async function sameSecret(given: string | null | undefined, expected: string | undefined) {
   if (!given || !expected) return false;
@@ -77,7 +87,7 @@ export async function sameSecret(given: string | null | undefined, expected: str
 export class PgObject extends DurableObject<Env> {
   /** Ceiling for the wasm heap (MB): past it a statement gets "out of memory" instead of taking
    *  the isolate down. Tenants share isolates 2–5 to one (128 MB), so theirs is small. */
-  protected maxMB = 48;
+  protected maxMB = 64;
   pg?: PGlite;
   private lastUse = Date.now();
   private faultRounds = 0;
@@ -109,6 +119,7 @@ export class PgObject extends DurableObject<Env> {
     const conf = this.ctx.storage.kv.get<{ cacheMB?: number; sharedBuffers?: string }>("conf") ?? {};
     const fs = (this.fs = this.makeFs(conf));
     const st: { image?: string; branchMs?: number; files?: number; lazy?: number; eagerMB?: number; restored?: number; recoveryBlocks?: number; bootRetries?: number; wal?: unknown; epoch?: number } = {};
+    if (this.ctx.storage.kv.get("retired")) throw new Error("this replica has been retired; reconnect");
     const replica = this.ctx.storage.kv.get<ReplicaInfo>("replica");
     if (replica) {
       // A replica: the primary's disk as of its newest epoch, leased so it stays readable.
@@ -252,8 +263,23 @@ export class PgObject extends DurableObject<Env> {
         return this.pg!;
       },
       checkPassword: (_user, password) => sameSecret(password, this.env.PGDO_TOKEN),
-      exec: (bytes, idle, parsed) => (this.used(), this.execRaw(bytes, idle, parsed)),
-      retry: (f, inTx) => this.retryQuery(f, inTx),
+      exec: async (bytes, idle, parsed) => {
+        this.used();
+        const out = await this.execRaw(bytes, idle, parsed);
+        await this.restartIfNeeded();
+        return out;
+      },
+      retry: async (f, inTx) => {
+        try {
+          return await this.retryQuery(f, inTx);
+        } catch (e) {
+          if (/out of memory/i.test(String((e as Error)?.message))) {
+            this.restartWhenIdle = true;
+            await this.restartIfNeeded();
+          }
+          throw e;
+        }
+      },
       readOnly: !!this.ctx.storage.kv.get("replica"),
       restart: async () => {
         const pg = this.pg;
@@ -280,6 +306,7 @@ export class PgObject extends DurableObject<Env> {
     for (let round = 0; ; round++) {
       const out = await pg.execProtocolRaw(bytes, { syncToFs: false }).catch((e) => this.died(e));
       const st = lastStatus(out);
+      if (outOfMemory(out)) this.restartWhenIdle = true;
       if (!this.fs!.missing.size || round >= 400) {
         this.fs!.missing.clear();
         if (guard && st === "T") await pg.exec("RELEASE SAVEPOINT pgdo_stmt").catch(() => {});
@@ -299,6 +326,22 @@ export class PgObject extends DurableObject<Env> {
       this.faultRounds++;
       await this.fetchMissing();
     }
+  }
+
+  /** Postgres ran out of memory: its heap can't shrink, so start a fresh one once nobody's in a
+   *  transaction (its data is all in SQLite). */
+  private restartWhenIdle = false;
+
+  private async restartIfNeeded() {
+    if (!this.restartWhenIdle || this.gate.txOwner || !this.pg) return;
+    this.restartWhenIdle = false;
+    const pg = this.pg;
+    running.delete(this);
+    this.pg = undefined;
+    this.fs?.flush();
+    this.fs = undefined;
+    this.gate.sessionOwner = null;
+    await pg.close().catch(() => {});
   }
 
   /** `f` (high-level PGlite calls) rerun after fetching any pages a read missed. */
@@ -423,11 +466,11 @@ export class PgObject extends DurableObject<Env> {
       });
       this.lastCheckpoint = { at: Date.now(), seq: this.fs?.flushSeq ?? 0 };
     }
-    if (fs.flushSeq > this.lastBarrierSeq) {
-      const barrier = await this.gate.run({}, async () => this.fs!.setBarrier());
-      this.lastBarrierSeq = barrier;
-      this.ctx.storage.kv.put("barrier", barrier);
-    }
+    // A snapshot point only when replicas need one, and only once the last one is entirely on
+    // the page servers: until then, every block it covers that's rewritten has to be held.
+    const wanted = this.epochWanted || [...this.ctx.storage.kv.list({ prefix: "rep:" })].length > 0;
+    const prev = this.ctx.storage.kv.get<number>("barrier") ?? 0;
+    if (wanted && fs.flushSeq > this.lastBarrierSeq && prev <= fs.shippedThrough()) await this.newBarrier();
     this.kickShip();
     const conf = this.ctx.storage.kv.get<{ localBlocks?: number }>("conf") ?? {};
     await this.gate.run({}, async () => this.fs?.evict(conf.localBlocks ?? LOCAL_BLOCKS));
@@ -440,8 +483,14 @@ export class PgObject extends DurableObject<Env> {
   /** Make `n` read replicas of this primary (RPC): slot i starts as generation 0. */
   async startReplicas(n: number) {
     const db = this.ctx.id.name!;
+    await this.freshEpoch();
     const out = [];
-    for (let slot = 0; slot < n; slot++) out.push(await replicaStub(this.env, db, slot, 0).startReplica({ primary: db, slot, gen: 0 }, this.ctx.storage.kv.get<string[]>("pages")!));
+    for (let slot = 0; slot < n; slot++) {
+      // continue the slot's generations (the current one hands its cache over and drains)
+      const cur = this.ctx.storage.kv.get<{ gen: number }>(`rep:${slot}`);
+      const gen = cur ? cur.gen + 1 : 0;
+      out.push(await replicaStub(this.env, db, slot, gen).startReplica({ primary: db, slot, gen }, this.ctx.storage.kv.get<string[]>("pages")!, cur?.gen));
+    }
     return out;
   }
 
@@ -460,19 +509,29 @@ export class PgObject extends DurableObject<Env> {
     return { slot: Number(k.slice(4)), gen: v.gen };
   }
 
+  pageList() {
+    return this.ctx.storage.kv.get<string[]>("pages") ?? [];
+  }
+
   replicaSlots() {
     return Object.fromEntries(this.ctx.storage.kv.list({ prefix: "rep:" }));
   }
 
   /** This object becomes a replica (RPC): boot at the primary's newest epoch, then register. */
-  async startReplica(info: ReplicaInfo, pages: string[]) {
+  async startReplica(info: ReplicaInfo, pages: string[], warmFrom?: number) {
+    this.ctx.storage.kv.delete("retired");
     this.ctx.storage.kv.put("replica", info);
     this.ctx.storage.kv.put("pages", pages);
     this.ctx.storage.kv.delete("draining");
     this.pageNames = pages;
     if (this.pg) await this.closePg();
     this.replicaAt = undefined;
-    const st = (await this.ensure()) as { epoch?: number };
+    const st = (await this.ensure()) as { epoch?: number; warmed?: number };
+    if (warmFrom !== undefined) {
+      // Take over warm: fetch what the outgoing replica had cached, as of this epoch.
+      const keys = await replicaStub(this.env, info.primary, info.slot, warmFrom).cachedKeys(20_000);
+      st.warmed = await this.fs!.ensureBlocks(keys, async (shard, k, at) => (await this.page(shard).get(k, at)) as [string, number, ArrayBuffer | null][]);
+    }
     await dbStub(this.env, info.primary).registerReplica(info.slot, info.gen, st?.epoch ?? 0);
     this.bootedAt = Date.now();
     this.alarmAt = Date.now() + 5_000;
@@ -491,16 +550,23 @@ export class PgObject extends DurableObject<Env> {
         await this.closePg();
         await this.page(0).release(this.ctx.id.name!);
         this.ctx.storage.kv.delete("replica"); // done until started again
+        this.ctx.storage.kv.put("retired", true); // and never a database of its own
         return false;
       }
       return true;
     }
     if (!this.replicaAt) return true;
+    // Only the slot's current replica refreshes; one that's been superseded drains.
+    const cur = ((await dbStub(this.env, info.primary).replicaSlots()) as Record<string, { gen: number }>)[`rep:${info.slot}`];
+    if (cur && cur.gen !== info.gen) {
+      this.ctx.storage.kv.put("draining", Date.now());
+      return true;
+    }
     await this.page(0).lease(this.ctx.id.name!, this.replicaAt.at, LEASE_MS);
     const latest = await this.page(0).latestEpoch();
     if (latest && latest.seq > this.replicaAt.at && Date.now() - this.bootedAt > REFRESH_MS) {
       const next = { ...info, gen: info.gen + 1 };
-      await replicaStub(this.env, info.primary, info.slot, next.gen).startReplica(next, this.ctx.storage.kv.get<string[]>("pages")!);
+      await replicaStub(this.env, info.primary, info.slot, next.gen).startReplica(next, this.ctx.storage.kv.get<string[]>("pages")!, info.gen);
       this.ctx.storage.kv.put("draining", Date.now());
     }
     return true;
@@ -517,8 +583,39 @@ export class PgObject extends DurableObject<Env> {
     });
   }
 
+  /** The user-data blocks this replica has cached (RPC, for its successor). */
+  cachedKeys(limit: number) {
+    return this.fs?.localDataKeys(limit) ?? [];
+  }
+
   replicaState() {
     return { replica: this.ctx.storage.kv.get("replica"), epoch: this.replicaAt?.at, draining: this.ctx.storage.kv.get("draining") ?? null, conns: this.gate.conns.size, running: !!this.pg };
+  }
+
+  private epochWanted = false;
+
+  private async newBarrier() {
+    const barrier = await this.gate.run({}, async () => this.fs!.setBarrier());
+    this.lastBarrierSeq = barrier;
+    this.ctx.storage.kv.put("barrier", barrier);
+    this.kickShip();
+    return barrier;
+  }
+
+  /** An epoch replicas can boot from, now (RPC): a snapshot point, shipped and published. */
+  async freshEpoch(timeoutMs = 120_000) {
+    await this.ensure();
+    this.epochWanted = true;
+    const barrier = (this.ctx.storage.kv.get<number>("barrier") ?? 0) > (this.fs?.shippedThrough() ?? 0) ? this.ctx.storage.kv.get<number>("barrier")! : await this.newBarrier();
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      this.kickShip();
+      await this.shipping;
+      const e = await this.page(0).latestEpoch();
+      if (e && e.seq >= barrier) return e.seq;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error("epoch not shipped in time");
   }
 
   /** Where things are (RPC): this primary's cache and queues, and each page server. */
@@ -858,6 +955,13 @@ export default {
     else if (url.pathname === "/files") r = await stub.putFiles(await req.json());
     else if (url.pathname === "/create") r = await stub.create(Number(url.searchParams.get("shards") ?? 4), url.searchParams.get("image") ?? undefined);
     else if (url.pathname === "/pagestats") r = await stub.pageStats();
+    else if (url.pathname === "/pagekill") {
+      // restart page server i of a primary (crash testing)
+      const names = (await stub.pageList()) as string[];
+      const i = Number(url.searchParams.get("i") ?? Math.floor(Math.random() * names.length));
+      await env.PAGE.getByName(names[i]).evict().catch(() => {});
+      r = { killed: names[i] };
+    }
     else if (url.pathname === "/replicas") r = url.searchParams.has("n") ? await stub.startReplicas(Number(url.searchParams.get("n"))) : { slots: await stub.replicaSlots() };
     else if (url.pathname === "/replica") {
       const [slot, gen] = [Number(url.searchParams.get("slot") ?? 0), Number(url.searchParams.get("gen") ?? 0)];

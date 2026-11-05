@@ -134,6 +134,11 @@ export class PgPage extends DurableObject {
     return { blocks: one("SELECT count(*) AS c FROM blk"), truncs: one("SELECT count(*) AS c FROM trunc"), nodes: one("SELECT count(*) AS c FROM node"), sqliteMB: +(this.sql.databaseSize / 1e6).toFixed(1) };
   }
 
+  /** Restart this page server (crash testing): memory is gone, SQLite stays. */
+  evict() {
+    this.ctx.abort("evict");
+  }
+
   async colo() {
     if (this.coloCache) return this.coloCache;
     const t = await (await fetch("https://cloudflare.com/cdn-cgi/trace")).text();
