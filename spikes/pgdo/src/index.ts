@@ -10,7 +10,9 @@ import { PGlite } from "@electric-sql/pglite";
 import pgliteWasm from "../vendor/pglite.wasm";
 import initdbWasm from "../vendor/initdb.wasm";
 import fsBundle from "../vendor/pglite.data";
-import { SqliteFS, type ImageIndex } from "./sqlitefs";
+import { SqliteFS, type ImageIndex, type ShipBatch } from "./sqlitefs";
+import { PgPage, type PutBatch } from "./pagedo";
+import { scanWal } from "./walscan";
 import { SMALL_SHMEM, START } from "./pgconfig";
 import { CHECKS, runCheck } from "./compat";
 import { Gate, lastStatus, WireConn, type WireHost } from "./wire";
@@ -24,18 +26,36 @@ const IMG = (name: string) => `pgspike/img/${name}`;
 let isolate: string | undefined; // named on first use (no randomness at global scope)
 const running = new Set<PgObject>();
 
-interface Env { PG: DurableObjectNamespace<PgObject>; BIG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string; PGDO_TOKEN: string }
+export { PgPage };
+
+interface Env { PG: DurableObjectNamespace<PgObject>; BIG: DurableObjectNamespace<PgObject>; PAGE: DurableObjectNamespace<PgPage>; REPA: DurableObjectNamespace<PgObject>; REPB: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string; PGDO_TOKEN: string }
 
 /** An object name in `ns` whose object runs in `colo`: Durable Objects can't be placed in a
  *  chosen data center, so try names until one lands there (placement sticks to the name). */
-export async function nearby(ns: DurableObjectNamespace<PgObject>, prefix: string, colo: string | undefined, tries = 12) {
+export async function nearby(ns: DurableObjectNamespace<PgObject> | DurableObjectNamespace<PgPage>, prefix: string, colo: string | undefined, tries = 12) {
   let best = `${prefix}-0`;
   for (let i = 0; i < tries; i++) {
     const name = `${prefix}-${i}`;
-    if ((await ns.getByName(name).colo()) === colo) return name;
+    if ((await (ns as DurableObjectNamespace<PgPage>).getByName(name).colo()) === colo) return name;
   }
   return best;
 }
+
+/** A primary's housekeeping cadence: snapshot points for replicas, eviction, shipping. */
+const TICK_MS = 5_000;
+/** A primary checkpoints at least this often while it's being written to, so crash recovery (and
+ *  a replica's boot) replays little WAL. */
+const CHECKPOINT_MS = 30_000;
+/** Local SQLite budget for a primary's cached pages (blocks of 8 KiB), unless configured. */
+const LOCAL_BLOCKS = (6 * 1024 * 1024 * 1024) / 8192;
+
+/** Replicas: how long a lease on an epoch lasts (renewed while in use), how stale a replica may
+ *  get before a fresh one takes over, and how long an old one serves its connections after. */
+const LEASE_MS = 60_000;
+const REFRESH_MS = 30_000;
+const DRAIN_MS = 60_000;
+
+type ReplicaInfo = { primary: string; slot: number; gen: number };
 
 /** Postgres is closed in an object nobody has used for this long (the object, and its storage, stay). */
 const IDLE_MS = 60_000;
@@ -66,42 +86,122 @@ export class PgObject extends DurableObject<Env> {
   private started?: { templateMs?: number; files?: number };
   private readonly instance = crypto.randomUUID().slice(0, 8);
 
-  /** Start Postgres: a new database is a branch of a template image (default "base", empty). */
-  private async ensure(image?: string) {
-    if (this.pg) return undefined;
+  /** Start Postgres: a new database is a branch of a template image (default "base", empty).
+   *  One boot at a time: concurrent callers (a request, the alarm) share it, so there's only ever
+   *  one filesystem object and one Postgres. */
+  private booting?: Promise<unknown>;
+  private ensure(image?: string): Promise<unknown> {
+    if (this.pg) return Promise.resolve(undefined);
+    return (this.booting ??= this.boot0(image).finally(() => (this.booting = undefined)));
+  }
+
+  /** A replica's epoch (it reads the primary's disk as of this flush). */
+  private replicaAt?: { shards: number; at: number };
+
+  private makeFs(conf: { cacheMB?: number }) {
+    const fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024);
+    if (this.replicaAt) fs.setReplica(this.replicaAt.shards, this.replicaAt.at);
+    return fs;
+  }
+
+  private async boot0(image?: string) {
     // Memory knobs (per database, for experiments): /config?db=…&cacheMB=1&sharedBuffers=2MB
     const conf = this.ctx.storage.kv.get<{ cacheMB?: number; sharedBuffers?: string }>("conf") ?? {};
-    const fs = (this.fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024));
-    const st: { image?: string; branchMs?: number; files?: number; lazy?: number; eagerMB?: number } = {};
-    if (fs.empty) {
+    const fs = (this.fs = this.makeFs(conf));
+    const st: { image?: string; branchMs?: number; files?: number; lazy?: number; eagerMB?: number; restored?: number; recoveryBlocks?: number; bootRetries?: number; wal?: unknown; epoch?: number } = {};
+    const replica = this.ctx.storage.kv.get<ReplicaInfo>("replica");
+    if (replica) {
+      // A replica: the primary's disk as of its newest epoch, leased so it stays readable.
+      const at = await this.page(0).acquire(this.ctx.id.name!, LEASE_MS);
+      if (at === null) throw new Error("the primary has no epoch yet");
+      const files = (await this.page(0).nodes(at)) as [string, number, number, number][];
+      fs.initReplica(this.ctx.storage.kv.get<string[]>("pages")!.length, at, files);
+      this.replicaAt = { shards: fs.shards, at };
+      this.ctx.storage.kv.put("pgdb", replica.primary); // the primary's disk already has its name
+      st.epoch = at;
+    } else if (fs.empty) {
       const t0 = Date.now();
       const name = image ?? "base";
       const index = (await (await this.env.BUCKET.get(`${IMG(name)}.json`))!.json()) as ImageIndex;
       const eager = new Uint8Array(await (await this.env.BUCKET.get(`${IMG(name)}.blob`, { range: { offset: 0, length: index.eagerEnd } }))!.arrayBuffer());
-      const r = this.ctx.storage.transactionSync(() => fs.initFromImage(index, eager));
+      const shards = this.ctx.storage.kv.get<string[]>("pages")?.length;
+      const r = this.ctx.storage.transactionSync(() => {
+        const r = fs.initFromImage(index, eager);
+        if (shards) fs.enablePrimary(shards); // the disk lives on page servers from here on
+        return r;
+      });
       this.ctx.storage.kv.put("image", name);
       Object.assign(st, { image: name, ...r, eagerMB: +(eager.length / 1e6).toFixed(1), branchMs: Date.now() - t0 });
     }
+    // A primary (or replica) may be missing blocks Postgres reads before anyone can retry it:
+    // catalogs and control files, and whatever crash recovery will replay WAL onto.
+    const remote = async (shard: number, keys: [string, number][], at: number) => (await this.page(shard).get(keys, at)) as [string, number, ArrayBuffer | null][];
+    if (fs.kind !== "local") {
+      st.restored = await fs.restoreLocal(remote);
+      let wal: ReturnType<typeof scanWal> = null;
+      try {
+        wal = scanWal((p) => fs.readLocal(p));
+      } catch (e) {
+        console.log("walscan:", String((e as Error)?.message ?? e));
+      }
+      if (wal) {
+        st.recoveryBlocks = await fs.ensureBlocks(wal.blocks, remote);
+        st.wal = { records: wal.records, blocks: wal.blocks.size, redo: wal.redo.toString(16), end: wal.end.toString(16) };
+      }
+    }
     // The database inside is called what clients connect to (current_database(), information_schema):
     // the first boot renames the image's "postgres" from template1, then reconnects.
-    const want = this.ctx.id.name && this.ctx.id.name.length < 64 ? this.ctx.id.name : "postgres";
+    const want = replica?.primary ?? (this.ctx.id.name && this.ctx.id.name.length < 64 ? this.ctx.id.name : "postgres");
     const have = this.ctx.storage.kv.get<string>("pgdb") ?? "postgres";
     if (have !== want) {
       const pg = await this.boot(fs, conf, "template1");
       await pg.exec(`ALTER DATABASE "${have.replace(/"/g, '""')}" RENAME TO "${want.replace(/"/g, '""')}"`);
       await pg.close();
       this.ctx.storage.kv.put("pgdb", want);
-      this.fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024);
+      this.fs = this.makeFs(conf);
     }
-    this.pg = await this.boot(this.fs!, conf, want);
+    // PGlite is one process: a lock file left behind is never a live postmaster's.
+    this.fs!.removeIfExists("/postmaster.pid");
+    // If recovery still reads a block that isn't here, fetch it and boot again.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        this.pg = await this.boot(this.fs!, conf, want);
+        break;
+      } catch (e) {
+        if (!this.fs!.missing.size || attempt >= 3) {
+          throw Object.assign(new Error(`${(e as Error).message} [boot ${JSON.stringify(st)}; still missing: ${[...this.fs!.missing].slice(0, 6).join(", ").replace(/\0/g, "#")}]`), { cause: e });
+        }
+        st.bootRetries = attempt + 1;
+        await this.fs!.fetchMissing(async () => new ArrayBuffer(0), remote);
+        this.fs = this.makeFs(conf);
+        this.fs.removeIfExists("/postmaster.pid");
+      }
+    }
     running.add(this);
     this.writeExtraFiles();
     return st;
   }
 
-  private boot(fs: SqliteFS, conf: { sharedBuffers?: string; maxMB?: number }, database: string) {
+  /** Postgres's recent stderr (startup failures say why here). */
+  private stderr: string[] = [];
+
+  private async boot(fs: SqliteFS, conf: { sharedBuffers?: string; maxMB?: number }, database: string) {
     (globalThis as { __pgMaxPages?: number }).__pgMaxPages = (conf.maxMB ?? this.maxMB) * 16; // 64 KiB pages
+    this.stderr = [];
+    try {
+      return await this.boot1(fs, conf, database);
+    } catch (e) {
+      throw Object.assign(new Error(`${(e as Error).message}: ${this.stderr.slice(-6).join(" | ").slice(0, 1500)}`), { cause: e });
+    }
+  }
+
+  private boot1(fs: SqliteFS, conf: { sharedBuffers?: string; maxMB?: number }, database: string) {
     return PGlite.create({
+      onStderr: (t: string) => {
+        this.stderr.push(t.trim());
+        if (this.stderr.length > 50) this.stderr.shift();
+        return true;
+      },
       fs,
       database,
       pgliteWasmModule: pgliteWasm,
@@ -113,7 +213,7 @@ export class PgObject extends DurableObject<Env> {
       // Objects share isolates (2–4 per 128 MB isolate under load), so keep each one small: the wasm
       // heap starts at 16 MB (the binary is patched to allow it); Postgres gets 4 MB of buffers.
       initialMemory: 16 * 1024 * 1024,
-      startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=4MB", "-c", "maintenance_work_mem=8MB", "-c", "temp_file_limit=2GB", ...SMALL_SHMEM],
+      startParams: [...START, ...(this.replicaAt ? ["-c", "default_transaction_read_only=on"] : []), "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=4MB", "-c", "maintenance_work_mem=8MB", "-c", "temp_file_limit=2GB", ...SMALL_SHMEM],
     });
   }
 
@@ -153,6 +253,8 @@ export class PgObject extends DurableObject<Env> {
       },
       checkPassword: (_user, password) => sameSecret(password, this.env.PGDO_TOKEN),
       exec: (bytes, idle, parsed) => (this.used(), this.execRaw(bytes, idle, parsed)),
+      retry: (f, inTx) => this.retryQuery(f, inTx),
+      readOnly: !!this.ctx.storage.kv.get("replica"),
       restart: async () => {
         const pg = this.pg;
         running.delete(this);
@@ -178,10 +280,13 @@ export class PgObject extends DurableObject<Env> {
     for (let round = 0; ; round++) {
       const out = await pg.execProtocolRaw(bytes, { syncToFs: false }).catch((e) => this.died(e));
       const st = lastStatus(out);
-      if (!this.fs!.missing.size || round >= 80) {
+      if (!this.fs!.missing.size || round >= 400) {
         this.fs!.missing.clear();
         if (guard && st === "T") await pg.exec("RELEASE SAVEPOINT pgdo_stmt").catch(() => {});
-        if (st !== "T") this.fs!.flush();
+        if (st !== "T") {
+          this.fs!.flush();
+          this.kickShip();
+        }
         return out;
       }
       if (idle) await pg.exec("ROLLBACK").catch(() => {});
@@ -193,6 +298,29 @@ export class PgObject extends DurableObject<Env> {
       for (const n of parsed) await pg.exec(`DEALLOCATE "${n.replace(/"/g, '""')}"`).catch(() => {});
       this.faultRounds++;
       await this.fetchMissing();
+    }
+  }
+
+  /** `f` (high-level PGlite calls) rerun after fetching any pages a read missed. */
+  private async retryQuery<T>(f: () => Promise<T>, inTx: boolean): Promise<T> {
+    const pg = this.pg!;
+    const guard = inTx && this.fs!.mayMiss;
+    if (guard) await pg.exec("SAVEPOINT pgdo_q").catch(() => {});
+    for (let round = 0; ; round++) {
+      try {
+        const r = await f();
+        if (guard) await pg.exec("RELEASE SAVEPOINT pgdo_q").catch(() => {});
+        return r;
+      } catch (e) {
+        if (!this.fs!.missing.size || round >= 400) {
+          this.fs!.missing.clear();
+          throw e;
+        }
+        if (guard) await pg.exec("ROLLBACK TO SAVEPOINT pgdo_q").catch(() => {});
+        else if (!inTx) await pg.exec("ROLLBACK").catch(() => {});
+        this.faultRounds++;
+        await this.fetchMissing();
+      }
     }
   }
 
@@ -211,7 +339,202 @@ export class PgObject extends DurableObject<Env> {
 
   private fetchMissing() {
     const image = this.ctx.storage.kv.get<string>("image") ?? "base";
-    return this.fs!.fetchMissing(async (offset, length) => (await (await this.env.BUCKET.get(`${IMG(image)}.blob`, { range: { offset, length } }))!.arrayBuffer()));
+    return this.fs!.fetchMissing(
+      async (offset, length) => (await (await this.env.BUCKET.get(`${IMG(image)}.blob`, { range: { offset, length } }))!.arrayBuffer()),
+      async (shard, keys, at) => (await this.page(shard).get(keys, at)) as [string, number, ArrayBuffer | null][],
+    );
+  }
+
+  // ---------------------------------------------------------------- page servers (primary mode)
+
+  private pageNames?: string[];
+  /** Page server `i` of this database. */
+  protected page(i: number) {
+    this.pageNames ??= this.ctx.storage.kv.get<string[]>("pages") ?? [];
+    return this.env.PAGE.getByName(this.pageNames[i]);
+  }
+
+  /** Create this database with its disk on `shards` page servers (RPC). Each server is picked to
+   *  run in this object's data center (see nearby). */
+  async create(shards: number, image?: string) {
+    if (this.ctx.storage.kv.get("pages") || this.ctx.storage.kv.get("image")) return { error: "exists" };
+    const colo = await this.colo();
+    const names: string[] = [];
+    for (let i = 0; i < shards; i++) names.push(await nearby(this.env.PAGE, `${this.ctx.id.name}#p${i}`, colo, 6));
+    this.ctx.storage.kv.put("pages", names);
+    this.pageNames = names;
+    const start = await this.ensure(image);
+    this.kickShip();
+    this.used();
+    const colos = await Promise.all(names.map((n) => this.env.PAGE.getByName(n).colo()));
+    return { start, colo, pages: names.map((n, i) => `${n}@${colos[i]}`) };
+  }
+
+  private shipping?: Promise<void>;
+  private keep = Number.MAX_SAFE_INTEGER;
+  private epochPublished = 0;
+  private lastBarrierSeq = 0;
+  private lastCheckpoint = { at: Date.now(), seq: 0 };
+
+  /** Send what page servers don't have yet, in the background (one loop at a time). */
+  private kickShip() {
+    if (this.fs?.kind !== "primary" || this.shipping) return;
+    this.shipping = this.shipLoop()
+      .catch((e) => console.log("ship:", String((e as Error)?.message ?? e)))
+      .finally(() => (this.shipping = undefined));
+  }
+
+  private async shipLoop() {
+    for (;;) {
+      const fs = this.fs;
+      if (!fs || fs.kind !== "primary") return;
+      const b = fs.shipBatch(1024);
+      if (b) {
+        const per = new Map<number, PutBatch>();
+        const of = (i: number) => per.get(i) ?? per.set(i, { blocks: [], truncs: [], nodes: [], keep: this.keep }).get(i)!;
+        for (const x of b.blocks) of(x.shard).blocks.push(x.row);
+        if (b.nodes.length) of(0).nodes.push(...b.nodes);
+        if (b.truncs.length) for (let i = 0; i < fs.shards; i++) of(i).truncs.push(...b.truncs);
+        await Promise.all([...per].map(([i, batch]) => this.page(i).put(batch)));
+        if (this.fs !== fs) return; // restarted meanwhile: the next loop starts over from SQLite
+        fs.shipped(b);
+        continue;
+      }
+      // Caught up: a snapshot point that's now entirely on the page servers is usable by replicas.
+      const barrier = this.ctx.storage.kv.get<number>("barrier") ?? 0;
+      if (barrier > this.epochPublished && barrier <= fs.shippedThrough()) {
+        await this.page(0).epoch(barrier);
+        this.epochPublished = barrier;
+      }
+      return;
+    }
+  }
+
+  /** A primary's periodic work: a snapshot point for replicas (if anything was written), shipping,
+   *  eviction past the local budget, and the oldest version replicas still read. */
+  private async tick() {
+    const fs = this.fs;
+    if (!fs || fs.kind !== "primary") return;
+    if (fs.flushSeq > this.lastCheckpoint.seq && Date.now() - this.lastCheckpoint.at > CHECKPOINT_MS) {
+      await this.gate.run({}, async () => {
+        if (!this.pg || this.gate.txOwner) return; // (the gate never runs this inside a client's transaction)
+        await this.retryQuery(() => this.pg!.exec("CHECKPOINT"), false);
+        this.fs?.flush();
+      });
+      this.lastCheckpoint = { at: Date.now(), seq: this.fs?.flushSeq ?? 0 };
+    }
+    if (fs.flushSeq > this.lastBarrierSeq) {
+      const barrier = await this.gate.run({}, async () => this.fs!.setBarrier());
+      this.lastBarrierSeq = barrier;
+      this.ctx.storage.kv.put("barrier", barrier);
+    }
+    this.kickShip();
+    const conf = this.ctx.storage.kv.get<{ localBlocks?: number }>("conf") ?? {};
+    await this.gate.run({}, async () => this.fs?.evict(conf.localBlocks ?? LOCAL_BLOCKS));
+    const floor = await this.page(0).keepFloor();
+    this.keep = floor === 0 ? 0 : floor; // 0: no epochs yet, prune nothing
+  }
+
+  // ---------------------------------------------------------------- replicas
+
+  /** Make `n` read replicas of this primary (RPC): slot i starts as generation 0. */
+  async startReplicas(n: number) {
+    const db = this.ctx.id.name!;
+    const out = [];
+    for (let slot = 0; slot < n; slot++) out.push(await replicaStub(this.env, db, slot, 0).startReplica({ primary: db, slot, gen: 0 }, this.ctx.storage.kv.get<string[]>("pages")!));
+    return out;
+  }
+
+  /** A replica is ready to serve (RPC): new read-only connections to this slot go to it. */
+  registerReplica(slot: number, gen: number, epoch: number) {
+    const cur = this.ctx.storage.kv.get<{ gen: number }>(`rep:${slot}`);
+    if (!cur || gen >= cur.gen) this.ctx.storage.kv.put(`rep:${slot}`, { gen, epoch, at: Date.now() });
+    return this.ctx.storage.kv.get(`rep:${slot}`);
+  }
+
+  /** Where a new read-only connection should go (RPC): a slot's current replica. */
+  pickReplica(): { slot: number; gen: number } | null {
+    const slots = [...this.ctx.storage.kv.list<{ gen: number }>({ prefix: "rep:" })];
+    if (!slots.length) return null;
+    const [k, v] = slots[Math.floor(Math.random() * slots.length)];
+    return { slot: Number(k.slice(4)), gen: v.gen };
+  }
+
+  replicaSlots() {
+    return Object.fromEntries(this.ctx.storage.kv.list({ prefix: "rep:" }));
+  }
+
+  /** This object becomes a replica (RPC): boot at the primary's newest epoch, then register. */
+  async startReplica(info: ReplicaInfo, pages: string[]) {
+    this.ctx.storage.kv.put("replica", info);
+    this.ctx.storage.kv.put("pages", pages);
+    this.ctx.storage.kv.delete("draining");
+    this.pageNames = pages;
+    if (this.pg) await this.closePg();
+    this.replicaAt = undefined;
+    const st = (await this.ensure()) as { epoch?: number };
+    await dbStub(this.env, info.primary).registerReplica(info.slot, info.gen, st?.epoch ?? 0);
+    this.bootedAt = Date.now();
+    this.alarmAt = Date.now() + 5_000;
+    await this.ctx.storage.setAlarm(this.alarmAt);
+    return { name: this.ctx.id.name, epoch: st?.epoch, boot: st };
+  }
+
+  private bootedAt = 0;
+
+  /** A replica's periodic work: keep its lease, and when it's stale hand over to a fresh one
+   *  (the other generation, in the other class) and drain. */
+  private async replicaTick(info: ReplicaInfo) {
+    const draining = this.ctx.storage.kv.get<number>("draining");
+    if (draining) {
+      if (this.gate.conns.size === 0 || Date.now() - draining > DRAIN_MS) {
+        await this.closePg();
+        await this.page(0).release(this.ctx.id.name!);
+        this.ctx.storage.kv.delete("replica"); // done until started again
+        return false;
+      }
+      return true;
+    }
+    if (!this.replicaAt) return true;
+    await this.page(0).lease(this.ctx.id.name!, this.replicaAt.at, LEASE_MS);
+    const latest = await this.page(0).latestEpoch();
+    if (latest && latest.seq > this.replicaAt.at && Date.now() - this.bootedAt > REFRESH_MS) {
+      const next = { ...info, gen: info.gen + 1 };
+      await replicaStub(this.env, info.primary, info.slot, next.gen).startReplica(next, this.ctx.storage.kv.get<string[]>("pages")!);
+      this.ctx.storage.kv.put("draining", Date.now());
+    }
+    return true;
+  }
+
+  private async closePg() {
+    await this.gate.run({}, async () => {
+      const pg = this.pg;
+      running.delete(this);
+      this.pg = undefined;
+      this.fs = undefined;
+      this.gate.sessionOwner = null;
+      await pg?.close().catch(() => {});
+    });
+  }
+
+  replicaState() {
+    return { replica: this.ctx.storage.kv.get("replica"), epoch: this.replicaAt?.at, draining: this.ctx.storage.kv.get("draining") ?? null, conns: this.gate.conns.size, running: !!this.pg };
+  }
+
+  /** Where things are (RPC): this primary's cache and queues, and each page server. */
+  async pageStats() {
+    await this.ensure();
+    const fs = this.fs!;
+    const n = this.ctx.storage.kv.get<string[]>("pages")?.length ?? 0;
+    const q = (sql: string) => this.ctx.storage.sql.exec<{ c: number }>(sql).toArray()[0]?.c ?? 0;
+    return {
+      fs: fs.snapshot(),
+      local: { blocks: q("SELECT count(*) AS c FROM fs_block"), unshipped: q("SELECT count(*) AS c FROM ship"), held: q("SELECT count(*) AS c FROM ship_hold"), sqliteMB: +(this.ctx.storage.sql.databaseSize / 1e6).toFixed(1) },
+      shippedThrough: fs.shippedThrough(),
+      barrier: this.ctx.storage.kv.get<number>("barrier") ?? 0,
+      epoch: n ? await this.page(0).latestEpoch() : null,
+      pages: await Promise.all(Array.from({ length: n }, (_, i) => this.page(i).stats())),
+    };
   }
 
   /** Files outside PGDATA that server-side COPY should see (pg_regress's data files), kept in
@@ -249,9 +572,10 @@ export class PgObject extends DurableObject<Env> {
       for (;;) {
         try {
           const r = await f();
+          this.kickShip();
           return { r, faultRounds: rounds, faultMs: rounds ? Date.now() - t0 : 0 };
         } catch (e) {
-          if (!this.fs!.missing.size || rounds >= 80) throw e;
+          if (!this.fs!.missing.size || rounds >= 400) throw e;
           rounds++;
           await this.pg!.exec("ROLLBACK").catch(() => {});
           await this.fetchMissing();
@@ -264,13 +588,32 @@ export class PgObject extends DurableObject<Env> {
   private used() {
     this.lastUse = Date.now();
     if (!this.alarmAt) {
-      this.alarmAt = this.lastUse + IDLE_MS;
+      this.alarmAt = this.lastUse + (this.fs?.kind === "primary" ? TICK_MS : IDLE_MS);
       void this.ctx.storage.setAlarm(this.alarmAt);
     }
   }
 
   override async alarm() {
     this.alarmAt = 0;
+    const replica = this.ctx.storage.kv.get<ReplicaInfo>("replica");
+    if (replica) {
+      const again = await this.replicaTick(replica).catch((e) => (console.log("replica tick:", String((e as Error)?.message ?? e)), true));
+      if (again) {
+        this.alarmAt = Date.now() + 5_000;
+        await this.ctx.storage.setAlarm(this.alarmAt);
+      }
+      return;
+    }
+    if (this.fs?.kind === "primary" || this.ctx.storage.kv.get("pages")) {
+      // a primary stays up while it's in use, ticking; its disk is on page servers anyway
+      await this.ensure();
+      await this.tick().catch((e) => console.log("tick:", String((e as Error)?.message ?? e)));
+      if (Date.now() - this.lastUse < 10 * 60_000 || this.fs?.shippedThrough() !== this.fs?.flushSeq) {
+        this.alarmAt = Date.now() + TICK_MS;
+        await this.ctx.storage.setAlarm(this.alarmAt);
+      }
+      return;
+    }
     const idle = Date.now() - this.lastUse;
     if (this.pg && idle >= IDLE_MS && this.gate.conns.size === 0) {
       // Nobody's here: give the memory back. The next request boots Postgres from SQLite again.
@@ -311,7 +654,7 @@ export class PgObject extends DurableObject<Env> {
   }
 
   /** Set memory knobs and restart Postgres with them (RPC). */
-  async configure(conf: { cacheMB?: number; sharedBuffers?: string }) {
+  async configure(conf: { cacheMB?: number; sharedBuffers?: string; localBlocks?: number }) {
     this.ctx.storage.kv.put("conf", conf);
     this.fs?.flush();
     await this.pg?.close().catch(() => {});
@@ -395,7 +738,7 @@ export class PgObject extends DurableObject<Env> {
 
   /** pgbench against database `db`, driven from this object (placed next to it by `nearby`). */
   async drive(db: string, opts: { clients: number; seconds: number; mode: string; scale: number }) {
-    return pgbench(() => WireClient.connect(dbStub(this.env, db), db, this.env.PGDO_TOKEN), opts);
+    return pgbench(async () => WireClient.connect(await wireStub(this.env, db), db, this.env.PGDO_TOKEN), opts);
   }
 
   /** Which data center this object runs in (egress colo of an outbound request). */
@@ -427,6 +770,9 @@ export class PgObject extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DROP TABLE IF EXISTS fs_meta");
     this.ctx.storage.kv.delete("image");
     this.ctx.storage.kv.delete("pgdb");
+    for (const t of ["ship", "ship_hold", "ship_node", "ship_trunc"]) this.ctx.storage.sql.exec(`DROP TABLE IF EXISTS ${t}`);
+    for (const k of ["pages", "barrier"]) this.ctx.storage.kv.delete(k);
+    this.pageNames = undefined;
     return { ok: true };
   }
 }
@@ -437,6 +783,27 @@ function neonUrl(base: string, db: string | null) {
   const u = new URL(base);
   u.pathname = `/${db}`;
   return u.toString();
+}
+
+/** The object a wire connection to `db` reaches: "<db>-ro" is one of the primary's replicas. */
+export async function wireStub(env: Env, db: string): Promise<{ fetch(r: Request): Promise<Response> }> {
+  if (!db.endsWith("-ro")) return dbStub(env, db);
+  const primary = db.slice(0, -3);
+  const pick = await dbStub(env, primary).pickReplica();
+  if (!pick) throw new Error("no replicas");
+  return replicaStub(env, primary, pick.slot, pick.gen);
+}
+
+/** Read replicas. Generations alternate between two classes, so a replica and the fresh one taking
+ *  over from it never share an isolate. */
+export class PgReplicaA extends PgObject {
+  protected override maxMB = 64;
+}
+export class PgReplicaB extends PgObject {
+  protected override maxMB = 64;
+}
+export function replicaStub(env: Env, primary: string, slot: number, gen: number) {
+  return (gen % 2 ? env.REPB : env.REPA).getByName(`${primary}~r${slot}g${gen}`);
 }
 
 /** A big database: its own class (so its own isolates) and room for a bigger heap. */
@@ -468,7 +835,17 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     // Postgres wire connections authenticate inside the protocol (password = the token).
-    if (url.pathname === "/wire") return dbStub(env, url.searchParams.get("db") || "postgres").fetch(req);
+    if (url.pathname === "/wire") {
+      const db = url.searchParams.get("db") || "postgres";
+      if (db.endsWith("-ro")) {
+        // a read replica of the primary: its current one for a random slot
+        const primary = db.slice(0, -3);
+        const pick = await dbStub(env, primary).pickReplica();
+        if (!pick) return new Response("no replicas", { status: 503 });
+        return replicaStub(env, primary, pick.slot, pick.gen).fetch(req);
+      }
+      return dbStub(env, db).fetch(req);
+    }
     // Everything else runs arbitrary SQL (and some routes reach Neon): bearer token required.
     const auth = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
     if (!(await sameSecret(auth, env.PGDO_TOKEN))) return new Response("unauthorized", { status: 401 });
@@ -479,7 +856,14 @@ export default {
     else if (url.pathname === "/bench") r = await stub.bench(url.searchParams.get("kind") ?? "update", Number(url.searchParams.get("n") ?? 200));
     else if (url.pathname === "/reset") r = await stub.reset();
     else if (url.pathname === "/files") r = await stub.putFiles(await req.json());
-    else if (url.pathname === "/config") r = await stub.configure({ cacheMB: Number(url.searchParams.get("cacheMB") ?? 4), sharedBuffers: url.searchParams.get("sharedBuffers") ?? "4MB" });
+    else if (url.pathname === "/create") r = await stub.create(Number(url.searchParams.get("shards") ?? 4), url.searchParams.get("image") ?? undefined);
+    else if (url.pathname === "/pagestats") r = await stub.pageStats();
+    else if (url.pathname === "/replicas") r = url.searchParams.has("n") ? await stub.startReplicas(Number(url.searchParams.get("n"))) : { slots: await stub.replicaSlots() };
+    else if (url.pathname === "/replica") {
+      const [slot, gen] = [Number(url.searchParams.get("slot") ?? 0), Number(url.searchParams.get("gen") ?? 0)];
+      r = await replicaStub(env, url.searchParams.get("db")!, slot, gen).replicaState();
+    }
+    else if (url.pathname === "/config") r = await stub.configure({ cacheMB: Number(url.searchParams.get("cacheMB") ?? 4), sharedBuffers: url.searchParams.get("sharedBuffers") ?? "4MB", ...(url.searchParams.has("localBlocks") ? { localBlocks: Number(url.searchParams.get("localBlocks")) } : {}) });
     else if (url.pathname === "/vs") {
       // Same workload on Neon and on a PgObject, timed in this Worker.
       //   /vs?target=neon|do&op=read&n=100[&db=bench][&hint=enam]   /vs?target=…&setup=1
@@ -537,10 +921,10 @@ export default {
         scale: Number(url.searchParams.get("scale") ?? 1),
       };
       if (url.searchParams.has("near")) {
-        const colo = await stub.colo();
+        const colo = await dbStub(env, db.replace(/-ro$/, "")).colo();
         const driver = await nearby(env.PG, `bench:${db}`, colo);
         r = { ...((await env.PG.getByName(driver).drive(db, opts)) as object), dbColo: colo, driverColo: await env.PG.getByName(driver).colo() };
-      } else r = await pgbench(() => WireClient.connect(dbStub(env, db), db, env.PGDO_TOKEN), opts);
+      } else r = await pgbench(async () => WireClient.connect(await wireStub(env, db), db, env.PGDO_TOKEN), opts);
     } else if (url.pathname === "/pginit") {
       // pgbench -i in pieces: /pginit?db=…&scale=…&from=1&to=500000 (from=1 also creates the tables)
       const scale = Number(url.searchParams.get("scale") ?? 1);

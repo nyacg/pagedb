@@ -35,6 +35,11 @@ export interface WireHost {
   /** `parsed`: statement names this batch Parses, which a retry must deallocate first (prepared
    *  statements survive rollbacks). */
   exec(bytes: Uint8Array, idle: boolean, parsed: string[]): Promise<Uint8Array>;
+  /** Run `f` (high-level PGlite calls), rerunning it if a read missed a page that isn't here yet
+   *  (inside a transaction block under a savepoint, so only `f`'s work is undone). */
+  retry?<T>(f: () => Promise<T>, inTx: boolean): Promise<T>;
+  /** A read replica: statements that would turn read-write transactions back on are refused. */
+  readOnly?: boolean;
   /** Throw the running Postgres away (it reported FATAL/PANIC); the next use boots it again. */
   restart(): Promise<void>;
   gate: Gate;
@@ -202,6 +207,8 @@ function readCstr(b: Uint8Array, at: number): [string, number] {
 
 const RESET_AUTH = /\b(?:reset\s+session\s+authorization|set\s+session\s+authorization\s+default)\b/i;
 // (psql accepts COPY … FROM STDOUT as a synonym)
+/** What would make a replica's session read-write again. */
+const READ_WRITE = /\bread\s+write\b|\bdefault_transaction_read_only\b|\btransaction_read_only\b/i;
 const COPY_STDIN = /^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/)*copy\b[\s\S]*?\bfrom\s+std(?:in|out)\b/i;
 /** COPY … FROM STDIN anywhere in a query (PGlite's raw protocol exits on it). */
 const COPY_STDIN_ANYWHERE = /\bcopy\b[^;]*?\bfrom\s+std(?:in|out)\b/i;
@@ -338,6 +345,17 @@ export class WireConn {
       this.hangup();
       return this.end();
     }
+    if (this.host.readOnly && (type === "Q" || type === "P")) {
+      const [sql] = type === "Q" ? readCstr(m, 5) : readCstr(m, readCstr(m, 5)[1]);
+      if (READ_WRITE.test(sql)) {
+        this.refused = errorResponse({ code: "25006", message: "this is a read-only replica" });
+        if (type === "Q") {
+          const e = this.refused;
+          this.refused = null;
+          return this.send(concat([e, readyForQuery(await this.status())]));
+        }
+      }
+    }
     if (type === "Q") {
       let [sql] = readCstr(m, 5);
       const fixed = this.fixReset(this.fixAuth(sql), true);
@@ -370,9 +388,11 @@ export class WireConn {
     const params = await gate.run(this, async () => {
       const pg = await this.host.pg();
       try {
-        await gate.switchTo(pg, this);
-        const r = await pg.query<{ name: string; setting: string }>("select name, setting from pg_settings where name = any($1)", [PARAMS_REPORTED]);
-        return r.rows;
+        const run = async () => {
+          await gate.switchTo(pg, this);
+          return (await pg.query<{ name: string; setting: string }>("select name, setting from pg_settings where name = any($1)", [PARAMS_REPORTED])).rows;
+        };
+        return this.host.retry ? await this.host.retry(run, false) : await run();
       } catch (e) {
         if (/FATAL|PANIC/.test(String((e as { severity?: string }).severity))) {
           await this.host.restart();
@@ -517,7 +537,8 @@ export class WireConn {
     const gate = this.host.gate;
     const r = await gate.run(this, async () => {
       const pg = await this.host.pg();
-      await gate.switchTo(pg, this);
+      if (this.host.retry && gate.txOwner !== this) await this.host.retry(() => gate.switchTo(pg, this), false);
+      else await gate.switchTo(pg, this);
       if (this.stale.length >= 16 && gate.txOwner !== this) {
         // the unnamed statements this connection has replaced (kept until here: still parsing)
         const drop = this.stale;
@@ -564,7 +585,8 @@ export class WireConn {
       else {
         try {
           const notices: Uint8Array[] = [];
-          const r = await this.copyAsUser(pg, sql, new Blob([concat(data)]), (n) => notices.push(errorResponse({ ...n, severity: n.severity ?? "NOTICE" } as Fields, "N")));
+          const run = () => this.copyAsUser(pg, sql, new Blob([concat(data)]), (n) => notices.push(errorResponse({ ...n, severity: n.severity ?? "NOTICE" } as Fields, "N")));
+          const r = this.host.retry ? await this.host.retry(run, pg.isInTransaction()) : await run();
           reply = concat([...notices, commandComplete(`COPY ${r.affectedRows ?? 0}`)]);
         } catch (e) {
           const d = e as { message?: string; code?: string; detail?: string; hint?: string; where?: string; position?: string; severity?: string };
