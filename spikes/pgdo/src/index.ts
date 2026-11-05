@@ -108,8 +108,9 @@ export class PgObject extends DurableObject<Env> {
   /** A replica's epoch (it reads the primary's disk as of this flush). */
   private replicaAt?: { shards: number; at: number };
 
-  private makeFs(conf: { cacheMB?: number }) {
+  private makeFs(conf: { cacheMB?: number; localBlocks?: number }) {
     const fs = new SqliteFS(this.ctx.storage.sql, (conf.cacheMB ?? 4) * 1024 * 1024);
+    fs.warmableBlocks = (conf.localBlocks ?? LOCAL_BLOCKS) / 4;
     if (this.replicaAt) fs.setReplica(this.replicaAt.shards, this.replicaAt.at);
     return fs;
   }
@@ -485,28 +486,33 @@ export class PgObject extends DurableObject<Env> {
     const db = this.ctx.id.name!;
     await this.freshEpoch();
     const out = [];
-    for (let slot = 0; slot < n; slot++) {
-      // continue the slot's generations (the current one hands its cache over and drains)
-      const cur = this.ctx.storage.kv.get<{ gen: number }>(`rep:${slot}`);
-      const gen = cur ? cur.gen + 1 : 0;
-      out.push(await replicaStub(this.env, db, slot, gen).startReplica({ primary: db, slot, gen }, this.ctx.storage.kv.get<string[]>("pages")!, cur?.gen));
-    }
+    for (let slot = 0; slot < n; slot++) out.push(await this.spawnReplica(slot));
     return out;
   }
 
+  /** Start the next generation of replica `slot` (RPC; also how a stale replica hands over):
+   *  an object placed in this primary's data center, warmed from the current one. */
+  async spawnReplica(slot: number) {
+    const db = this.ctx.id.name!;
+    const cur = this.ctx.storage.kv.get<{ gen: number; name?: string }>(`rep:${slot}`);
+    const gen = cur ? cur.gen + 1 : 0;
+    const name = await nearby(gen % 2 ? this.env.REPB : this.env.REPA, `${db}~r${slot}g${gen}`, await this.colo(), 6);
+    return replicaStub(this.env, gen, name).startReplica({ primary: db, slot, gen }, this.ctx.storage.kv.get<string[]>("pages")!, cur?.name);
+  }
+
   /** A replica is ready to serve (RPC): new read-only connections to this slot go to it. */
-  registerReplica(slot: number, gen: number, epoch: number) {
+  registerReplica(slot: number, gen: number, epoch: number, name: string) {
     const cur = this.ctx.storage.kv.get<{ gen: number }>(`rep:${slot}`);
-    if (!cur || gen >= cur.gen) this.ctx.storage.kv.put(`rep:${slot}`, { gen, epoch, at: Date.now() });
+    if (!cur || gen >= cur.gen) this.ctx.storage.kv.put(`rep:${slot}`, { gen, epoch, name, at: Date.now() });
     return this.ctx.storage.kv.get(`rep:${slot}`);
   }
 
   /** Where a new read-only connection should go (RPC): a slot's current replica. */
-  pickReplica(): { slot: number; gen: number } | null {
-    const slots = [...this.ctx.storage.kv.list<{ gen: number }>({ prefix: "rep:" })];
+  pickReplica(): { slot: number; gen: number; name: string } | null {
+    const slots = [...this.ctx.storage.kv.list<{ gen: number; name: string }>({ prefix: "rep:" })];
     if (!slots.length) return null;
     const [k, v] = slots[Math.floor(Math.random() * slots.length)];
-    return { slot: Number(k.slice(4)), gen: v.gen };
+    return { slot: Number(k.slice(4)), gen: v.gen, name: v.name };
   }
 
   pageList() {
@@ -518,7 +524,7 @@ export class PgObject extends DurableObject<Env> {
   }
 
   /** This object becomes a replica (RPC): boot at the primary's newest epoch, then register. */
-  async startReplica(info: ReplicaInfo, pages: string[], warmFrom?: number) {
+  async startReplica(info: ReplicaInfo, pages: string[], warmFrom?: string) {
     this.ctx.storage.kv.delete("retired");
     this.ctx.storage.kv.put("replica", info);
     this.ctx.storage.kv.put("pages", pages);
@@ -529,10 +535,10 @@ export class PgObject extends DurableObject<Env> {
     const st = (await this.ensure()) as { epoch?: number; warmed?: number };
     if (warmFrom !== undefined) {
       // Take over warm: fetch what the outgoing replica had cached, as of this epoch.
-      const keys = await replicaStub(this.env, info.primary, info.slot, warmFrom).cachedKeys(20_000);
+      const keys = await replicaStub(this.env, info.gen - 1, warmFrom).cachedKeys(20_000);
       st.warmed = await this.fs!.ensureBlocks(keys, async (shard, k, at) => (await this.page(shard).get(k, at)) as [string, number, ArrayBuffer | null][]);
     }
-    await dbStub(this.env, info.primary).registerReplica(info.slot, info.gen, st?.epoch ?? 0);
+    await dbStub(this.env, info.primary).registerReplica(info.slot, info.gen, st?.epoch ?? 0, this.ctx.id.name!);
     this.bootedAt = Date.now();
     this.alarmAt = Date.now() + 5_000;
     await this.ctx.storage.setAlarm(this.alarmAt);
@@ -565,8 +571,7 @@ export class PgObject extends DurableObject<Env> {
     await this.page(0).lease(this.ctx.id.name!, this.replicaAt.at, LEASE_MS);
     const latest = await this.page(0).latestEpoch();
     if (latest && latest.seq > this.replicaAt.at && Date.now() - this.bootedAt > REFRESH_MS) {
-      const next = { ...info, gen: info.gen + 1 };
-      await replicaStub(this.env, info.primary, info.slot, next.gen).startReplica(next, this.ctx.storage.kv.get<string[]>("pages")!, info.gen);
+      await dbStub(this.env, info.primary).spawnReplica(info.slot);
       this.ctx.storage.kv.put("draining", Date.now());
     }
     return true;
@@ -588,8 +593,13 @@ export class PgObject extends DurableObject<Env> {
     return this.fs?.localDataKeys(limit) ?? [];
   }
 
+  async replicaStateRpc() {
+    await this.colo();
+    return this.replicaState();
+  }
+
   replicaState() {
-    return { replica: this.ctx.storage.kv.get("replica"), epoch: this.replicaAt?.at, draining: this.ctx.storage.kv.get("draining") ?? null, conns: this.gate.conns.size, running: !!this.pg };
+    return { replica: this.ctx.storage.kv.get("replica"), epoch: this.replicaAt?.at, draining: this.ctx.storage.kv.get("draining") ?? null, conns: this.gate.conns.size, running: !!this.pg, colo: this.coloCache, fs: this.fs?.snapshot() };
   }
 
   private epochWanted = false;
@@ -888,7 +898,7 @@ export async function wireStub(env: Env, db: string): Promise<{ fetch(r: Request
   const primary = db.slice(0, -3);
   const pick = await dbStub(env, primary).pickReplica();
   if (!pick) throw new Error("no replicas");
-  return replicaStub(env, primary, pick.slot, pick.gen);
+  return replicaStub(env, pick.gen, pick.name);
 }
 
 /** Read replicas. Generations alternate between two classes, so a replica and the fresh one taking
@@ -899,8 +909,8 @@ export class PgReplicaA extends PgObject {
 export class PgReplicaB extends PgObject {
   protected override maxMB = 64;
 }
-export function replicaStub(env: Env, primary: string, slot: number, gen: number) {
-  return (gen % 2 ? env.REPB : env.REPA).getByName(`${primary}~r${slot}g${gen}`);
+export function replicaStub(env: Env, gen: number, name: string) {
+  return (gen % 2 ? env.REPB : env.REPA).getByName(name);
 }
 
 /** A big database: its own class (so its own isolates) and room for a bigger heap. */
@@ -939,7 +949,7 @@ export default {
         const primary = db.slice(0, -3);
         const pick = await dbStub(env, primary).pickReplica();
         if (!pick) return new Response("no replicas", { status: 503 });
-        return replicaStub(env, primary, pick.slot, pick.gen).fetch(req);
+        return replicaStub(env, pick.gen, pick.name).fetch(req);
       }
       return dbStub(env, db).fetch(req);
     }
@@ -964,8 +974,9 @@ export default {
     }
     else if (url.pathname === "/replicas") r = url.searchParams.has("n") ? await stub.startReplicas(Number(url.searchParams.get("n"))) : { slots: await stub.replicaSlots() };
     else if (url.pathname === "/replica") {
-      const [slot, gen] = [Number(url.searchParams.get("slot") ?? 0), Number(url.searchParams.get("gen") ?? 0)];
-      r = await replicaStub(env, url.searchParams.get("db")!, slot, gen).replicaState();
+      const slots = (await stub.replicaSlots()) as Record<string, { gen: number; name: string }>;
+      const cur = slots[`rep:${url.searchParams.get("slot") ?? 0}`];
+      r = cur ? await replicaStub(env, cur.gen, cur.name).replicaStateRpc() : { error: "no such slot" };
     }
     else if (url.pathname === "/config") r = await stub.configure({ cacheMB: Number(url.searchParams.get("cacheMB") ?? 4), sharedBuffers: url.searchParams.get("sharedBuffers") ?? "4MB", ...(url.searchParams.has("localBlocks") ? { localBlocks: Number(url.searchParams.get("localBlocks")) } : {}) });
     else if (url.pathname === "/vs") {

@@ -1,6 +1,7 @@
 # Postgres in a Durable Object: spike findings (Nov 3–4, 2026)
 
-**Verdict: it works as a drop-in Postgres, and it scales out well.**
+**Verdict: it works as a drop-in Postgres. It scales out across tenants, and one database can now
+outgrow its object: 15 GB on 16 page DOs, plus read replicas (section 7).**
 
 Postgres 18.6 (PGlite 0.5.15, compiled to WebAssembly) runs inside a Cloudflare Durable Object, with
 its data directory in the object's own SQLite. It speaks the Postgres wire protocol, so these work
@@ -11,8 +12,8 @@ against it unchanged:
 - Postgres's own regression suite.
 
 On that suite it passes **191 of 231** tests through the wire layer, PGlite in Node with no
-Workers (native 18.6: 231). In the Durable Object it passes **186**: the five extra failures are plan choices from a smaller
-`work_mem`, and two statements that hit the 128 MB isolate limit. Every failure is
+Workers (native 18.6: 231). In the Durable Object it passes **189**. The extra failures come from its memory cap (64 MB for a
+tenant's heap), which is what keeps one object from resetting the isolate it shares. Every failure is
 classified: one is the wire layer's (private statement names show in `pg_prepared_statements`),
 and the rest are PGlite or the platform.
 
@@ -348,9 +349,13 @@ The same runner was pointed at three backends:
 |---|---|---|---|
 | native Postgres 18.6 (the baseline: the method itself is sound) | 231 | 0 | 0 |
 | PGlite 0.5.15 + the wire layer, in Node (no Workers) | **191** | 34 | 6 |
-| the same in a Durable Object (SQLite storage, Workers) | **186** | 40 | 5 |
+| the same in a Durable Object (SQLite storage, Workers) | **189** | 38 | 4 |
 
-The Durable Object fails five tests that pass in Node. None is a correctness difference:
+(The earlier DO run, 186, differed from Node by query plans and two isolate resets. With the
+memory cap the resets are gone, and three tests now fail on the cap instead: `vacuum_parallel`
+can't map a shared memory segment, and `join_hash` and `tuplesort` take different memory paths.)
+
+Earlier, the Durable Object failed five tests that pass in Node. None was a correctness difference:
 - **Different but valid query plans** (`join`, `aggregates`, `incremental_sort`). The object
   starts Postgres with `work_mem=1MB` to fit four instances per isolate; stock is 4 MB.
 - **The 128 MB isolate limit** (`regex`: a deliberately huge regular expression; `sanity_check`: a
@@ -412,6 +417,93 @@ verification) on every index.
 | 3 min, evicts and out-of-memory kills (verified: Postgres restarts) | 35 (16 + 19) | 1,627 | 0 | all match | 3/3 ok | **consistent** |
 
 In both runs some transactions committed whose acknowledgment never arrived, because the kill came between commit and reply: 12 and 18 extra ledger rows. That's allowed; an acknowledged commit going missing is not, and none did.
+
+## 7. One database beyond one object: page servers and read replicas (Nov 4–5)
+
+One Durable Object has 128 MB of memory, 10 GB of SQLite and one core. To grow a single database
+past that while keeping exact Postgres semantics, storage is split from compute, as Neon does,
+on Durable Objects.
+
+### Architecture
+
+- **The primary DO** runs PGlite and the wire layer. Its own SQLite holds WAL, control files,
+  catalogs, the visibility and free-space maps, and a local page cache with a budget (6 GB by
+  default). Commits are durable there, so no safekeepers are needed.
+- **Every flush of its disk is numbered.** Changed blocks, file metadata and truncations are
+  queued and shipped in the background to **page DOs** (`src/pagedo.ts`, K per database, chosen
+  at creation). Blocks are spread over the page DOs in 1 MiB stripes by hash.
+- **Page DOs store versions.** A read "at S" returns the newest version with seq ≤ S, so the
+  shards together reconstruct the primary's disk exactly as of any retained flush.
+- **Eviction:** once a page DO has a user-relation block, the primary may evict it locally.
+  Catalogs and the visibility/free-space maps always stay local.
+- **Misses** fetch from the page DOs:
+  - a single block for random reads;
+  - whole stripes to warm a relation that fits the local budget;
+  - growing windows for scans.
+
+  Inside a transaction, a miss reruns just that statement under a savepoint (no PGlite rebuild
+  needed).
+- **Boot (and replica boot):**
+  1. restore what must be local;
+  2. **scan the WAL** from the checkpoint's redo point (`src/walscan.ts`) and prefetch every
+     block crash recovery will replay onto;
+  3. then start Postgres.
+- **Snapshot points** for replicas are set only while replicas exist, one outstanding at a time.
+  Until a point is fully shipped, versions it covers that get rewritten are held.
+- **Read replicas** (`PgReplicaA`/`B`, alternating so generations never share an isolate):
+  - each leases the newest fully-shipped snapshot point and boots on the disk as of it (crash
+    recovery on its own copy), read-only;
+  - every 30 s, the next generation takes over: it is warmed with its predecessor's working set
+    and placed in the primary's colo;
+  - `<db>-ro` connects to one.
+- **Placement is probed.** Durable Objects can't be placed in a chosen data center, so page DOs
+  and replicas are given names that land in the primary's colo (`nearby`).
+
+### Results
+
+| | |
+|---|---|
+| Out-of-memory statement (a 640 MB string) | an `out of memory` ERROR, not an isolate reset; Postgres restarts once idle (the heap can't shrink) |
+| DO-to-DO RPC, same colo | 5–13 ms p50 (8 KiB), 16–25 ms (1 MiB); objects sometimes land in LAX instead of SJC (+10 ms), hence probing |
+| **pgbench scale 1000 on one logical database** | **15 GB** (13 GB heap + 2.1 GB index) on 16 page DOs at about 1.0 GB each; the primary holds 6.9 GB locally (its budget); wasm heap 29 MB; 100M rows loaded in 83 min |
+| Crash test with page DOs (3 min, 4 shards, 16 MB local budget) | 31 kills (12 primary evicts, 12 out-of-memory resets, 7 page DO restarts): 0 acknowledged commits lost, balances match the ledger, amcheck ok |
+| pgbench invariants at scale 10 with a 40 MB local budget | sum(abalance) = sum(tbalance) = sum(bbalance) = sum(history.delta), before and after TPC-B; amcheck ok |
+| Replica consistency (ids committed in order on the primary, read on a replica every 2 s for 70 s) | always a gap-free prefix; staleness ≤ the 30 s refresh |
+| Replica read scaling, scale 10 (fits caches) | primary saturates at about 560 tps (select-only, 128 clients); **4 replicas: 1,888 tps** (3.3×) |
+| At 15 GB (uniform random over 13 GB) | primary about 30 tps select-only, 5–7 tps TPC-B; 4 replicas about 55 tps |
+
+### What limits it
+
+**One backend waits on every remote miss.** A point read over data that isn't cached costs 2–3
+dependent fault rounds, each about 30 ms (a 5–13 ms RPC plus rerunning the statement), and
+nothing else runs meanwhile.
+
+- **Data that fits the caches** behaves like a local database, and replicas scale reads.
+- **Uniform random access over 13 GB** is bound by round trips per backend.
+
+Ways to raise it:
+- bigger, longer-lived replica caches;
+- prefetching from WAL or index structure;
+- async faults (a PGlite rebuild with wasm exceptions and JSPI, so a read can wait without
+  rerunning the statement).
+
+Writes stay single-primary, and interactive transactions over the wire serialize (section 0).
+
+### Plan phases: built, not built
+
+- **Built:**
+  - Phase 0: memory caps, idle close, the big class, in-colo benchmarks;
+  - Phase 1: savepoint retry;
+  - Phase 2: page DOs, eviction, WAL-scan boot;
+  - Phase 3: checkpoints;
+  - Phase 4: replicas, warm handover, placement probing.
+- **Not built:**
+  - **Phase 5 (a directory plus splitting hot stripes).** The gate was measurements, and none
+    called for it: at 15 GB the 16 page DOs hold 1.0–1.09 GB each (the limit is 10 GB), and the
+    time per miss is dominated by the RPC hop, not shard saturation.
+  - **Phase 1 option A (the JSPI rebuild).** The current binary uses JS `invoke_*` trampolines
+    for setjmp/longjmp, so it needs a rebuild of PGlite and all side modules with wasm
+    exceptions. The savepoint path covers correctness; the rebuild is the next performance step.
 
 ## Earlier results
 

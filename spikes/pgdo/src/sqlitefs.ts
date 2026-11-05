@@ -106,6 +106,9 @@ export class SqliteFS extends BaseFilesystem {
   /** Per file: where the last remote fetch ended, and its size (scans continue from there). */
   private remoteNext = new Map<string, [number, number]>();
   private remoteMisses = new Map<string, number>();
+  /** Files up to this many blocks get warmed a stripe at a time; bigger ones (more than a quarter
+   *  of the local budget) fetch just the block a random read wants. */
+  warmableBlocks = (6 * 1024 * 1024 * 1024) / 8192 / 4;
   private nextFd = 3;
   readonly stats = { reads: 0, readMisses: 0, rowsWritten: 0, flushes: 0, faults: 0, fetchedMB: 0, remoteFetches: 0, evicted: 0 };
   private readonly bs: number;
@@ -263,7 +266,7 @@ export class SqliteFS extends BaseFilesystem {
         this.remoteMisses.set(p, misses);
         let first = n0, w: number;
         if (prev && prev[0] === n0) w = Math.min(prev[1] * 4, SCAN_MAX);
-        else if (misses >= 16) {
+        else if (misses >= 16 && this.relationBlocks(p) <= this.warmableBlocks) {
           first = n0 - (n0 % STRIPE);
           w = STRIPE;
         } else w = 1;
@@ -288,6 +291,14 @@ export class SqliteFS extends BaseFilesystem {
         for (let n = n0; n < last; n++) this.sql.exec("INSERT OR IGNORE INTO fs_block (path, n, data, shipped) VALUES (?, ?, ?, 2)", p, n, buf.subarray((n - n0) * this.bs, Math.min(buf.length, (n - n0 + 1) * this.bs)));
       }),
     );
+  }
+
+  /** A relation's size in blocks across its 1 GiB segment files (path, path.1, path.2, …). */
+  private relationBlocks(path: string) {
+    const base = path.replace(/\.\d+$/, "");
+    let total = Math.ceil((this.nodes.get(base)?.size ?? 0) / this.bs);
+    for (let i = 1; this.nodes.has(`${base}.${i}`); i++) total += Math.ceil(this.nodes.get(`${base}.${i}`)!.size / this.bs);
+    return total;
   }
 
   /** Fetch blocks from page servers into SQLite; returns the ones the template image has instead. */
