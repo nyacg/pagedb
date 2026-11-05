@@ -13,7 +13,8 @@ import fsBundle from "../vendor/pglite.data";
 import { SqliteFS, type ImageIndex } from "./sqlitefs";
 import { SMALL_SHMEM, START } from "./pgconfig";
 import { CHECKS, runCheck } from "./compat";
-import { Gate, WireConn, type WireHost } from "./wire";
+import { Gate, lastStatus, WireConn, type WireHost } from "./wire";
+import { bench as pgbench, initStatements, WireClient } from "./tpcb";
 import { explain, load, neonTarget, run as runOps, SETUP, type Stmt, type Target } from "./bench";
 
 /** Template images (scripts/mkimage.mjs): pgspike/img/<name>.json (the index) and .blob (PGDATA). */
@@ -23,7 +24,27 @@ const IMG = (name: string) => `pgspike/img/${name}`;
 let isolate: string | undefined; // named on first use (no randomness at global scope)
 const running = new Set<PgObject>();
 
-interface Env { PG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string; PGDO_TOKEN: string }
+interface Env { PG: DurableObjectNamespace<PgObject>; BIG: DurableObjectNamespace<PgObject>; [k: `PG${number}`]: DurableObjectNamespace<PgObject>; BUCKET: R2Bucket; NEON_DATABASE_URL: string; PGDO_TOKEN: string }
+
+/** An object name in `ns` whose object runs in `colo`: Durable Objects can't be placed in a
+ *  chosen data center, so try names until one lands there (placement sticks to the name). */
+export async function nearby(ns: DurableObjectNamespace<PgObject>, prefix: string, colo: string | undefined, tries = 12) {
+  let best = `${prefix}-0`;
+  for (let i = 0; i < tries; i++) {
+    const name = `${prefix}-${i}`;
+    if ((await ns.getByName(name).colo()) === colo) return name;
+  }
+  return best;
+}
+
+/** Postgres is closed in an object nobody has used for this long (the object, and its storage, stay). */
+const IDLE_MS = 60_000;
+
+/** A database's object: big databases ("big-…") get their own class, so they never share an
+ *  isolate with densely packed tenants. */
+export function dbStub(env: Env, name: string) {
+  return (name.startsWith("big-") ? env.BIG : env.PG).getByName(name);
+}
 
 /** Constant-time comparison of a presented secret with the expected one. */
 export async function sameSecret(given: string | null | undefined, expected: string | undefined) {
@@ -34,7 +55,13 @@ export async function sameSecret(given: string | null | undefined, expected: str
 }
 
 export class PgObject extends DurableObject<Env> {
+  /** Ceiling for the wasm heap (MB): past it a statement gets "out of memory" instead of taking
+   *  the isolate down. Tenants share isolates 2–5 to one (128 MB), so theirs is small. */
+  protected maxMB = 48;
   pg?: PGlite;
+  private lastUse = Date.now();
+  private faultRounds = 0;
+  private alarmAt = 0;
   private fs?: SqliteFS;
   private started?: { templateMs?: number; files?: number };
   private readonly instance = crypto.randomUUID().slice(0, 8);
@@ -72,7 +99,8 @@ export class PgObject extends DurableObject<Env> {
     return st;
   }
 
-  private boot(fs: SqliteFS, conf: { sharedBuffers?: string }, database: string) {
+  private boot(fs: SqliteFS, conf: { sharedBuffers?: string; maxMB?: number }, database: string) {
+    (globalThis as { __pgMaxPages?: number }).__pgMaxPages = (conf.maxMB ?? this.maxMB) * 16; // 64 KiB pages
     return PGlite.create({
       fs,
       database,
@@ -85,7 +113,7 @@ export class PgObject extends DurableObject<Env> {
       // Objects share isolates (2–4 per 128 MB isolate under load), so keep each one small: the wasm
       // heap starts at 16 MB (the binary is patched to allow it); Postgres gets 4 MB of buffers.
       initialMemory: 16 * 1024 * 1024,
-      startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=1MB", "-c", "maintenance_work_mem=4MB", ...SMALL_SHMEM],
+      startParams: [...START, "-c", `shared_buffers=${conf.sharedBuffers ?? "4MB"}`, "-c", "wal_buffers=64kB", "-c", "work_mem=4MB", "-c", "maintenance_work_mem=8MB", "-c", "temp_file_limit=2GB", ...SMALL_SHMEM],
     });
   }
 
@@ -124,7 +152,7 @@ export class PgObject extends DurableObject<Env> {
         return this.pg!;
       },
       checkPassword: (_user, password) => sameSecret(password, this.env.PGDO_TOKEN),
-      exec: (bytes, idle) => this.execRaw(bytes, idle),
+      exec: (bytes, idle, parsed) => (this.used(), this.execRaw(bytes, idle, parsed)),
       restart: async () => {
         const pg = this.pg;
         running.delete(this);
@@ -137,17 +165,33 @@ export class PgObject extends DurableObject<Env> {
     });
   }
 
-  /** Raw protocol messages. A batch that read a page still in the template image is rolled back
-   *  and run again once the page is fetched, if it started outside a transaction block. */
-  private async execRaw(bytes: Uint8Array, idle: boolean) {
+  /** Raw protocol messages. A read can miss a page that isn't here yet (a template image, or
+   *  another object); the statement then fails, the pages are fetched and it runs again:
+   *  - a batch that started outside a transaction block is rolled back and rerun whole;
+   *  - inside one, each batch runs under a savepoint, so only it is rolled back and rerun, and the
+   *    transaction carries on (if the miss ended the transaction, e.g. in COMMIT, it can't be).
+   *  Writes become durable when a transaction ends (the reply waits for SQLite only then). */
+  private async execRaw(bytes: Uint8Array, idle: boolean, parsed: string[]) {
+    const pg = this.pg!;
+    const guard = !idle && this.fs!.mayMiss;
+    if (guard) await pg.exec("SAVEPOINT pgdo_stmt").catch(() => {});
     for (let round = 0; ; round++) {
-      const out = await this.pg!.execProtocolRaw(bytes).catch((e) => this.died(e));
-      if (!this.fs!.missing.size) return out;
-      if (!idle || round >= 80) {
+      const out = await pg.execProtocolRaw(bytes, { syncToFs: false }).catch((e) => this.died(e));
+      const st = lastStatus(out);
+      if (!this.fs!.missing.size || round >= 80) {
         this.fs!.missing.clear();
+        if (guard && st === "T") await pg.exec("RELEASE SAVEPOINT pgdo_stmt").catch(() => {});
+        if (st !== "T") this.fs!.flush();
         return out;
       }
-      await this.pg!.exec("ROLLBACK").catch(() => {});
+      if (idle) await pg.exec("ROLLBACK").catch(() => {});
+      else if (guard && st !== "I") await pg.exec("ROLLBACK TO SAVEPOINT pgdo_stmt").catch(() => {});
+      else {
+        this.fs!.missing.clear(); // the transaction ended in the miss: report it
+        return out;
+      }
+      for (const n of parsed) await pg.exec(`DEALLOCATE "${n.replace(/"/g, '""')}"`).catch(() => {});
+      this.faultRounds++;
       await this.fetchMissing();
     }
   }
@@ -197,6 +241,7 @@ export class PgObject extends DurableObject<Env> {
    *  it was missing and run it again (rolled back first: the whole request retries). */
   private run<T>(f: () => Promise<T>) {
     // in turn with wire clients (never inside one's transaction), with default session settings
+    this.used();
     return this.gate.run({}, async () => {
       await this.gate.switchTo(this.pg!, null);
       let rounds = 0;
@@ -215,6 +260,34 @@ export class PgObject extends DurableObject<Env> {
     });
   }
 
+  /** Note activity, and make sure an alarm will come round to close Postgres once it's idle. */
+  private used() {
+    this.lastUse = Date.now();
+    if (!this.alarmAt) {
+      this.alarmAt = this.lastUse + IDLE_MS;
+      void this.ctx.storage.setAlarm(this.alarmAt);
+    }
+  }
+
+  override async alarm() {
+    this.alarmAt = 0;
+    const idle = Date.now() - this.lastUse;
+    if (this.pg && idle >= IDLE_MS && this.gate.conns.size === 0) {
+      // Nobody's here: give the memory back. The next request boots Postgres from SQLite again.
+      await this.gate.run({}, async () => {
+        const pg = this.pg;
+        running.delete(this);
+        this.pg = undefined;
+        this.fs = undefined;
+        this.gate.sessionOwner = null;
+        await pg?.close().catch(() => {});
+      });
+    } else if (this.pg) {
+      this.alarmAt = this.lastUse + IDLE_MS + 1000;
+      await this.ctx.storage.setAlarm(this.alarmAt);
+    }
+  }
+
   /** This object's isolate and the Postgres instances running in it (RPC). */
   where() {
     const heaps = [...running].map((o) => (o.pg as any)?.mod?.HEAPU8?.length ?? 0);
@@ -224,7 +297,7 @@ export class PgObject extends DurableObject<Env> {
   private mem() {
     const m = (this.pg as any)?.mod;
     const heap = m?.HEAPU8?.length ?? m?.wasmMemory?.buffer?.byteLength;
-    return { instance: this.instance, heapMB: heap ? +(heap / 1e6).toFixed(1) : null, sqliteMB: +(this.ctx.storage.sql.databaseSize / 1e6).toFixed(1), fs: this.fs?.snapshot() };
+    return { instance: this.instance, wireFaultRounds: this.faultRounds, heapMB: heap ? +(heap / 1e6).toFixed(1) : null, sqliteMB: +(this.ctx.storage.sql.databaseSize / 1e6).toFixed(1), fs: this.fs?.snapshot() };
   }
 
   async exec(sql: string, image?: string) {
@@ -297,6 +370,47 @@ export class PgObject extends DurableObject<Env> {
     }
   }
 
+  /** Round trips from this object to another one nearby, for 8 KiB and 1 MiB payloads (RPC). */
+  async rpcPing(n = 30) {
+    const other = this.env.PG.getByName(`${this.ctx.id.name ?? "x"}#ping`);
+    await other.echo(new Uint8Array(1)); // create it (next to us) before timing
+    const out: Record<string, unknown> = {};
+    for (const size of [8192, 1 << 20]) {
+      const b = new Uint8Array(size), t: number[] = [];
+      const t0 = Date.now();
+      for (let i = 0; i < n; i++) {
+        const s = Date.now();
+        await other.echo(b);
+        t.push(Date.now() - s);
+      }
+      t.sort((a, b) => a - b);
+      out[size === 8192 ? "8KiB" : "1MiB"] = { avgMs: +((Date.now() - t0) / n).toFixed(2), p50: t[Math.floor(n / 2)], p99: t[n - 1] };
+    }
+    return out;
+  }
+
+  echo(b: Uint8Array) {
+    return b.length;
+  }
+
+  /** pgbench against database `db`, driven from this object (placed next to it by `nearby`). */
+  async drive(db: string, opts: { clients: number; seconds: number; mode: string; scale: number }) {
+    return pgbench(() => WireClient.connect(dbStub(this.env, db), db, this.env.PGDO_TOKEN), opts);
+  }
+
+  /** Which data center this object runs in (egress colo of an outbound request). */
+  private coloCache?: string;
+  async colo() {
+    if (this.coloCache) return this.coloCache;
+    const t = await (await fetch("https://cloudflare.com/cdn-cgi/trace")).text();
+    return (this.coloCache = t.match(/colo=(\w+)/)?.[1]);
+  }
+
+  async colos() {
+    const other = this.env.PG.getByName(`${this.ctx.id.name ?? "x"}#ping`);
+    return { me: await this.colo(), ping: await other.colo() };
+  }
+
   /** Restart the object (its memory is gone; SQLite stays). */
   async evict() {
     this.fs?.flush();
@@ -325,6 +439,11 @@ function neonUrl(base: string, db: string | null) {
   return u.toString();
 }
 
+/** A big database: its own class (so its own isolates) and room for a bigger heap. */
+export class PgBig extends PgObject {
+  protected override maxMB = 80;
+}
+
 export class PgObject1 extends PgObject {}
 export class PgObject2 extends PgObject {}
 export class PgObject3 extends PgObject {}
@@ -349,11 +468,11 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     // Postgres wire connections authenticate inside the protocol (password = the token).
-    if (url.pathname === "/wire") return env.PG.getByName(url.searchParams.get("db") || "postgres").fetch(req);
+    if (url.pathname === "/wire") return dbStub(env, url.searchParams.get("db") || "postgres").fetch(req);
     // Everything else runs arbitrary SQL (and some routes reach Neon): bearer token required.
     const auth = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
     if (!(await sameSecret(auth, env.PGDO_TOKEN))) return new Response("unauthorized", { status: 401 });
-    const stub = env.PG.getByName(url.searchParams.get("db") ?? "spike");
+    const stub = dbStub(env, url.searchParams.get("db") ?? "spike");
     const t0 = Date.now();
     let r: unknown;
     if (url.pathname === "/sql") r = await stub.exec(req.method === "POST" ? await req.text() : (url.searchParams.get("q") ?? "select 1"), url.searchParams.get("image") ?? undefined);
@@ -406,7 +525,35 @@ export default {
       const only = url.searchParams.get("only"); // 0 read, 1 write, 2 txn, 3 jsonb
       r = { ...(await load(targets, ops, only === null ? undefined : Number(only))), initLat: initLat.sort((a, b) => a - b) };
       if (which === "do") (r as any).where = await Promise.all(targets.map((t) => (t as ReturnType<typeof doTarget>).stub.where().catch(() => null)));
-    } else if (url.pathname === "/env") r = { jspi: { Suspending: typeof (WebAssembly as any).Suspending, promising: typeof (WebAssembly as any).promising }, typeReflection: typeof (WebAssembly as any).Function };
+    } else if (url.pathname === "/tpcb") {
+      // pgbench's TPC-B (or select-only) from this Worker, next to the database:
+      //   /tpcb?db=…&clients=8&seconds=20&mode=tpcb|select&scale=1
+      // &near=1 drives it from an object in the database's own data center instead of this Worker.
+      const db = url.searchParams.get("db") ?? "pgbench";
+      const opts = {
+        clients: Number(url.searchParams.get("clients") ?? 4),
+        seconds: Number(url.searchParams.get("seconds") ?? 15),
+        mode: url.searchParams.get("mode") ?? "tpcb",
+        scale: Number(url.searchParams.get("scale") ?? 1),
+      };
+      if (url.searchParams.has("near")) {
+        const colo = await stub.colo();
+        const driver = await nearby(env.PG, `bench:${db}`, colo);
+        r = { ...((await env.PG.getByName(driver).drive(db, opts)) as object), dbColo: colo, driverColo: await env.PG.getByName(driver).colo() };
+      } else r = await pgbench(() => WireClient.connect(dbStub(env, db), db, env.PGDO_TOKEN), opts);
+    } else if (url.pathname === "/pginit") {
+      // pgbench -i in pieces: /pginit?db=…&scale=…&from=1&to=500000 (from=1 also creates the tables)
+      const scale = Number(url.searchParams.get("scale") ?? 1);
+      const from = Number(url.searchParams.get("from") ?? 1), to = Number(url.searchParams.get("to") ?? 100000 * scale);
+      const results = [];
+      for (const sql of initStatements(scale, from, to)) {
+        const x = (await stub.exec(sql)) as { error?: string };
+        results.push(x.error ? x.error.slice(0, 300) : "ok");
+        if (x.error) break;
+      }
+      r = { scale, from, to, results };
+    } else if (url.pathname === "/rpcping") r = { ...((await stub.rpcPing(Number(url.searchParams.get("n") ?? 30))) as object), colos: await stub.colos(), worker: (req as { cf?: { colo?: string } }).cf?.colo };
+    else if (url.pathname === "/env") r = { jspi: { Suspending: typeof (WebAssembly as any).Suspending, promising: typeof (WebAssembly as any).promising }, typeReflection: typeof (WebAssembly as any).Function };
     else if (url.pathname === "/evict") r = await stub.evict().then(() => ({ ok: true }), () => ({ ok: true, aborted: true }));
     else return new Response("pgdo spike: /sql?q=…[&image=hn150] | /bench?kind=update|read|tpcb&n=… | /evict | /reset   (&db=name)");
     return Response.json({ ...(r as object), workerMs: Date.now() - t0 });

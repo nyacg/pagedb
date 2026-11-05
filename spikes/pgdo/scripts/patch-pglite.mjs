@@ -21,8 +21,13 @@ for (const f of readdirSync(dist).filter((f) => f.endsWith(".js"))) {
   let c = 0;
   out = out.replace("_emscripten_date_now=()=>Date.now()", () => (c++, "_emscripten_date_now=()=>(globalThis.__pgDateNow??Date.now)()"));
   out = out.replace("_emscripten_get_now=()=>performance.now()", () => (c++, "_emscripten_get_now=()=>(globalThis.__pgNow??(()=>performance.now()))()"));
-  if (n || l || c) writeFileSync(p, out);
-  console.log(`${f}: ${n} addFunction, ${l} side-module loader, ${c} clocks patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
+  // Memory: PGlite lets the wasm heap grow to 2 GB, so a big statement grows it until the isolate
+  // (128 MB) is reset. With a host-chosen maximum, growth fails inside Postgres instead and the
+  // statement gets an ordinary "out of memory" ERROR.
+  let m = 0;
+  out = out.replace("initial:r.initialMemory?r.initialMemory/(64*1024):2048,maximum:32768}", () => (m++, "initial:r.initialMemory?r.initialMemory/(64*1024):2048,maximum:globalThis.__pgMaxPages??32768}"));
+  if (n || l || c || m) writeFileSync(p, out);
+  console.log(`${f}: ${n} addFunction, ${l} side-module loader, ${c} clocks, ${m} memory cap patched${s.includes("__pgWasmShim") ? " (already)" : ""}`);
 }
 // Signature → module bytes, exactly as Emscripten builds them.
 const uleb = (e) => [e.length % 128 | 128, e.length >> 7, ...e];

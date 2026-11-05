@@ -12,13 +12,15 @@
   "durable_objects": {
     "bindings": [
       { "name": "PG", "class_name": "PgObject" },
+      { "name": "BIG", "class_name": "PgBig" },
       { "name": "PG1", "class_name": "PgObject1" }, { "name": "PG2", "class_name": "PgObject2" }, { "name": "PG3", "class_name": "PgObject3" },
       { "name": "PG4", "class_name": "PgObject4" }, { "name": "PG5", "class_name": "PgObject5" }, { "name": "PG6", "class_name": "PgObject6" }, { "name": "PG7", "class_name": "PgObject7" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["PgObject"] },
-    { "tag": "v2", "new_sqlite_classes": ["PgObject1", "PgObject2", "PgObject3", "PgObject4", "PgObject5", "PgObject6", "PgObject7"] }
+    { "tag": "v2", "new_sqlite_classes": ["PgObject1", "PgObject2", "PgObject3", "PgObject4", "PgObject5", "PgObject6", "PgObject7"] },
+    { "tag": "v3", "new_sqlite_classes": ["PgBig"] }
   ],
   "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "pagedb" }],
   "rules": [

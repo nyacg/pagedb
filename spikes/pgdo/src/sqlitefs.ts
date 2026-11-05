@@ -74,6 +74,11 @@ export class SqliteFS extends BaseFilesystem {
     if (!this.nodes.has("/")) this.putNode("/", { mode: S_IFDIR | 0o700, size: 0, mtime: Date.now() });
   }
 
+  /** Whether a read can miss (blocks still in a template image, or held elsewhere). */
+  get mayMiss() {
+    return this.base.size > 0;
+  }
+
   get empty() {
     return this.nodes.size <= 1;
   }

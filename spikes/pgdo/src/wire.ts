@@ -32,7 +32,9 @@ export interface WireHost {
   checkPassword(user: string, password: string): Promise<boolean>;
   /** Run raw protocol messages (the host may retry them, e.g. after fetching lazy pages, when
    *  the batch started outside a transaction). */
-  exec(bytes: Uint8Array, idle: boolean): Promise<Uint8Array>;
+  /** `parsed`: statement names this batch Parses, which a retry must deallocate first (prepared
+   *  statements survive rollbacks). */
+  exec(bytes: Uint8Array, idle: boolean, parsed: string[]): Promise<Uint8Array>;
   /** Throw the running Postgres away (it reported FATAL/PANIC); the next use boots it again. */
   restart(): Promise<void>;
   gate: Gate;
@@ -181,7 +183,7 @@ function fatalIn(r: Uint8Array): boolean {
 }
 
 /** The transaction status in the last ReadyForQuery of a response, if any. */
-function lastStatus(r: Uint8Array): string | undefined {
+export function lastStatus(r: Uint8Array): string | undefined {
   const dv = new DataView(r.buffer, r.byteOffset, r.byteLength);
   let status: string | undefined;
   for (let i = 0; i + 5 <= r.length; ) {
@@ -238,6 +240,8 @@ export class WireConn {
   private unnamed = "";
   private unnamedCount = 0;
   private stale: string[] = [];
+  /** Names Parsed by the batch being collected. */
+  private batchParsed: string[] = [];
   private chain: Promise<void> = Promise.resolve();
   /** An error to return at the next Sync instead of running the batch (unsupported message). */
   private refused: Uint8Array | null = null;
@@ -477,7 +481,9 @@ export class WireConn {
         if (this.unnamed) this.stale.push(this.unnamed);
         this.unnamed = `_c${this.id}#${++this.unnamedCount}`;
       }
-      return msg("P", cstr(named(name)), cstr(sql), m.subarray(b));
+      const real = named(name);
+      this.batchParsed.push(real);
+      return msg("P", cstr(real), cstr(sql), m.subarray(b));
     }
     if (type === "B") {
       const [portal, a] = readCstr(m, 5);
@@ -499,7 +505,9 @@ export class WireConn {
 
   private async flushBatch(type: string) {
     const batch = concat(this.pending);
+    const parsed = this.batchParsed;
     this.pending = [];
+    this.batchParsed = [];
     if (this.refused && type !== "H") {
       const e = this.refused;
       this.refused = null;
@@ -517,7 +525,7 @@ export class WireConn {
         await pg.exec(drop.map((n) => `DEALLOCATE ${quoteIdent(n)};`).join(" ")).catch(() => {});
       }
       this.used = true;
-      const out = this.unrename(await this.host.exec(batch, gate.txOwner !== this));
+      const out = this.unrename(await this.host.exec(batch, gate.txOwner !== this, parsed));
       if (fatalIn(out)) {
         // the backend is done for: everyone reconnects to a fresh one, as after a backend exit
         await this.host.restart();
